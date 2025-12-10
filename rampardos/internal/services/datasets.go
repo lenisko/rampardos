@@ -210,7 +210,27 @@ func (dc *DatasetsController) CombineTiles() error {
 	if err != nil {
 		return fmt.Errorf("failed to get datasets: %w", err)
 	}
+	return dc.combineDatasets(datasets)
+}
 
+// CombineSelected combines specific datasets into a single mbtiles file
+func (dc *DatasetsController) CombineSelected(datasets []string) error {
+	// Validate all datasets exist
+	for _, name := range datasets {
+		sanitized, err := SanitizeName(name)
+		if err != nil {
+			return fmt.Errorf("invalid dataset name: %w", err)
+		}
+		sourcePath := filepath.Join(dc.listFolder, sanitized+".mbtiles")
+		if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+			return fmt.Errorf("dataset not found: %s", name)
+		}
+	}
+	return dc.combineDatasets(datasets)
+}
+
+// combineDatasets is the internal implementation for combining datasets
+func (dc *DatasetsController) combineDatasets(datasets []string) error {
 	combinedPath := filepath.Join(dc.folder, "Combined.mbtiles")
 
 	if len(datasets) == 0 {

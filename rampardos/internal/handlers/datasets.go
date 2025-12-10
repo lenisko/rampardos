@@ -132,10 +132,26 @@ func (h *DatasetsHandler) CancelDownload(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 }
 
+// CombineRequest represents the request body for combining datasets
+type CombineRequest struct {
+	Datasets []string `json:"datasets"`
+}
+
 // Combine handles POST /admin/api/datasets/combine
 func (h *DatasetsHandler) Combine(w http.ResponseWriter, r *http.Request) {
-	slog.Info("Combining mbtiles")
-	if err := h.datasetsController.CombineTiles(); err != nil {
+	var req CombineRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Datasets) < 2 {
+		http.Error(w, "At least 2 datasets required", http.StatusBadRequest)
+		return
+	}
+
+	slog.Info("Combining mbtiles", "datasets", req.Datasets)
+	if err := h.datasetsController.CombineSelected(req.Datasets); err != nil {
 		slog.Error("Combine failed", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
