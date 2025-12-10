@@ -14,7 +14,7 @@ A Go port of swifttileservercache with some new features - a caching proxy for t
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.25+
 - ~~ImageMagick (for image processing)~~
 - tippecanoe (for mbtiles operations (admin side))
 - fontnik/build-glyphs (for font processing (admin side))
@@ -45,8 +45,7 @@ go build -o rampardos ./cmd/server
 ## Running
 
 ```bash
-export TILE_SERVER_URL=http://localhost:8080
-./rampardos
+export TILE_SERVER_URL=http://localhost:8080 ./rampardos
 ```
 
 ## Docker
