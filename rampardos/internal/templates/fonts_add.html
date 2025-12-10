@@ -1,0 +1,16 @@
+{{template "base" .}}
+
+{{define "content"}}
+<h1 align="center">Add Font</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <form action="/admin/api/fonts/add" method="POST" enctype="multipart/form-data">
+        <div class="mb-3">
+            <label for="file" class="form-label">Font File (.ttf, .otf)</label>
+            <input type="file" class="form-control" id="file" name="file" accept=".ttf,.otf" required>
+        </div>
+        <button type="submit" class="btn btn-primary">Upload</button>
+        <a href="/admin/fonts" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{{end}}

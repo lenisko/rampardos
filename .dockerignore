@@ -1,0 +1,17 @@
+.DS_Store
+.git
+.github
+.gitignore
+.vscode
+.exampleimages
+bin/
+Cache/
+Templates/
+Markers/
+TileServer/
+Temp/
+docker-compose.*.yml
+*.md
+LICENSE
+grafana-dashboard.json
+Makefile

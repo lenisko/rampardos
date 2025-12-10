@@ -1,0 +1,20 @@
+{{template "base" .}}
+
+{{define "content"}}
+<h1 align="center">Stats</h1>
+<br>
+<br><h2 align="center">Tiles Cache Hit-Rate (since restart)</h2>
+{{range .TileHitRatios}}
+    <p align="center"><b>{{.Key}}</b>: {{.Value}}</p>
+{{end}}
+<br>
+<h2 align="center">Static Map Cache Hit-Rate (since restart)</h2>
+{{range .StaticMapHitRatios}}
+    <p align="center"><b>{{.Key}}</b>: {{.Value}}</p>
+{{end}}
+<br>
+<h2 align="center">Marker Cache Hit-Rate (since restart)</h2>
+{{range .MarkerHitRatios}}
+    <p align="center"><b>{{.Key}}</b>: {{.Value}}</p>
+{{end}}
+{{end}}

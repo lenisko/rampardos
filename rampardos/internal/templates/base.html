@@ -1,0 +1,127 @@
+{{define "base"}}
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+    <head>
+        <title>Rampardos{{if .PageName}} - {{.PageName}}{{end}}</title>
+
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.0.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" crossorigin="anonymous">
+        <link href="https://cdn.datatables.net/v/bs5/dt-2.3.5/b-3.2.5/r-3.0.7/datatables.min.css" rel="stylesheet" integrity="sha384-EBZbE4SUghmshvThXhOonXPjU3N441exgxS9TN6o3+rn9mPO2mcjmjUJvb5TjeSO" crossorigin="anonymous">
+        {{template "stylesheets" .}}
+
+        <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
+        <script src="https://cdn.datatables.net/v/bs5/dt-2.3.5/b-3.2.5/r-3.0.7/datatables.min.js" integrity="sha384-iYPi19tgn2gLNeKsyJbUw6kEGICMx1wmgAc4blFVpnIx3njUTIWMXc8tu8oy3bFe" crossorigin="anonymous"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.3/ace.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.3/mode-json.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+        {{template "scripts" .}}
+    </head>
+
+    <body>
+        <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+            <div class="container-fluid">
+                <a class="navbar-brand" href="/">Rampardos</a>
+                <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarText" aria-controls="navbarText" aria-expanded="false" aria-label="Toggle navigation">
+                    <span class="navbar-toggler-icon"></span>
+                </button>
+                <div class="collapse navbar-collapse" id="navbarText">
+                    <ul class="navbar-nav me-auto">
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "stats"}} active{{end}}" href="/admin/stats">Stats</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "datasets"}} active{{end}}" href="/admin/datasets">Datasets</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "styles"}} active{{end}}" href="/admin/styles">Styles</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "fonts"}} active{{end}}" href="/admin/fonts">Fonts</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "templates"}} active{{end}}" href="/admin/templates">Templates</a>
+                        </li>
+                    </ul>
+                <div class="navbar-nav flex-row gap-2 mt-3 mt-lg-0">
+                    <button id="themeToggle" class="btn btn-sm btn-outline-secondary" onclick="toggleTheme()" title="Toggle Light Mode">
+                        <i id="themeIcon" class="fas fa-sun"></i>
+                    </button>
+                    <button id="debugToggle" class="btn btn-sm {{if .DebugEnabled}}btn-warning{{else}}btn-outline-secondary{{end}}" onclick="toggleDebug()" title="Toggle Console Debug Logging">
+                        <i class="fas fa-bug"></i> <span id="debugStatus">Debug</span>
+                    </button>
+                </div>
+                </div>
+            </div>
+        </nav>
+        <script>
+            function updateDebugButton(enabled) {
+                var btn = document.getElementById('debugToggle');
+                var status = document.getElementById('debugStatus');
+                if (enabled) {
+                    btn.className = 'btn btn-sm btn-warning';
+                    status.textContent = 'Debug';
+                } else {
+                    btn.className = 'btn btn-sm btn-outline-secondary';
+                    status.textContent = 'Debug';
+                }
+            }
+
+            function toggleDebug() {
+                $.ajax({
+                    type: "POST",
+                    url: "/admin/api/settings/debug/toggle",
+                    success: function(response) {
+                        updateDebugButton(response.enabled);
+                    },
+                    error: function() {
+                        alert('Failed to toggle debug mode');
+                    }
+                });
+            }
+
+            function toggleTheme() {
+                var html = document.documentElement;
+                var icon = document.getElementById('themeIcon');
+                var isDark = html.getAttribute('data-bs-theme') === 'dark';
+                if (isDark) {
+                    html.setAttribute('data-bs-theme', 'light');
+                    icon.className = 'fas fa-moon';
+                    localStorage.setItem('theme', 'light');
+                } else {
+                    html.setAttribute('data-bs-theme', 'dark');
+                    icon.className = 'fas fa-sun';
+                    localStorage.setItem('theme', 'dark');
+                }
+                // Dispatch event for Ace editors to update theme
+                window.dispatchEvent(new CustomEvent('themeChanged', { detail: { dark: !isDark } }));
+            }
+
+            // Apply saved theme on load
+            (function() {
+                var savedTheme = localStorage.getItem('theme') || 'dark';
+                document.documentElement.setAttribute('data-bs-theme', savedTheme);
+                if (savedTheme === 'light') {
+                    document.getElementById('themeIcon').className = 'fas fa-moon';
+                }
+            })();
+        </script>
+        <br>
+        {{template "content" .}}
+        <br>
+    </body>
+</html>
+{{end}}
+
+{{define "stylesheets"}}
+<style>
+    table .btn-group { max-width: 120px; }
+    table .btn-group .btn { flex: 1; }
+    .dt-search { margin-bottom: 1rem; }
+    .dt-info, .dt-paging { margin-top: 1rem; }
+</style>
+{{end}}
+{{define "scripts"}}{{end}}
+{{define "content"}}{{end}}

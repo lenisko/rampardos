@@ -1,0 +1,69 @@
+{{template "base" .}}
+
+{{define "scripts"}}
+<script>
+    var ws;
+    
+    function downloadDataset() {
+        var name = $('#name').val();
+        var url = $('#url').val();
+        
+        if (!name || !url) {
+            alert('Please fill in all fields');
+            return false;
+        }
+        
+        $('#status').text('Connecting...');
+        $('#submit').prop('disabled', true);
+        
+        var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(protocol + '//' + window.location.host + '/admin/api/datasets/add');
+        
+        ws.onopen = function() {
+            $('#status').text('Downloading...');
+            ws.send(name + ';' + url);
+        };
+        
+        ws.onmessage = function(event) {
+            if (event.data === 'started') {
+                $('#status').html('<span class="text-success">Download started in background!</span>');
+                setTimeout(function() {
+                    window.location = '/admin/datasets';
+                }, 1500);
+            } else if (event.data.startsWith('error:')) {
+                $('#status').text('Error: ' + event.data.substring(6));
+                $('#submit').prop('disabled', false);
+            } else {
+                $('#status').text('Error: ' + event.data);
+                $('#submit').prop('disabled', false);
+            }
+        };
+        
+        ws.onerror = function() {
+            $('#status').text('Connection error');
+            $('#submit').prop('disabled', false);
+        };
+        
+        return false;
+    }
+</script>
+{{end}}
+
+{{define "content"}}
+<h1 align="center">Add Dataset</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <form onsubmit="return downloadDataset()">
+        <div class="mb-3">
+            <label for="name" class="form-label">Dataset Name</label>
+            <input type="text" class="form-control" id="name" name="name" required>
+        </div>
+        <div class="mb-3">
+            <label for="url" class="form-label">Download URL (.mbtiles)</label>
+            <input type="url" class="form-control" id="url" name="url" required>
+        </div>
+        <button type="submit" id="submit" class="btn btn-primary">Download</button>
+        <span id="status" class="ms-3"></span>
+    </form>
+</div>
+{{end}}

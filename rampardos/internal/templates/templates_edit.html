@@ -1,0 +1,532 @@
+{{template "base" .}}
+
+{{define "stylesheets"}}
+<style>
+    #preview {
+        display: block;
+        width: 100%;
+        height: auto;
+        padding: 0;
+    }
+    #preview-container {
+        position: relative;
+    }
+    /* Mobile layout */
+    @media (max-width: 1199px) {
+        .desktop-layout { display: none !important; }
+        .mobile-layout { display: block !important; }
+        #content-mobile { min-height: 300px; overflow: auto; padding: 0; }
+        #test-data-mobile { min-height: 100px; overflow: auto; padding: 0; }
+    }
+    @media (min-width: 1200px) {
+        .desktop-layout { display: flex !important; }
+        .mobile-layout { display: none !important; }
+    }
+    #preview-mobile {
+        display: block;
+        width: 100%;
+        height: auto;
+        padding: 0;
+    }
+    #preview-container-mobile {
+        position: relative;
+    }
+    #content {
+        min-height: 500px;
+        overflow: auto;
+        padding: 0;
+    }
+    #test-data {
+        min-height: 100px;
+        overflow: auto;
+        padding: 0;
+    }
+</style>
+{{end}}
+
+{{define "scripts"}}
+<script>
+    var requestId = 0
+    var testDataEditor
+    var contentEditor
+    var testDataEditorMobile
+    var contentEditorMobile
+    var templateName = '{{.TemplateName}}'
+    var isMobile = window.innerWidth < 1200
+
+    function getActiveEditors() {
+        if (isMobile) {
+            return { content: contentEditorMobile, testData: testDataEditorMobile }
+        }
+        return { content: contentEditor, testData: testDataEditor }
+    }
+
+    $(function() {
+        ace.config.set(
+            "basePath",
+            "https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.3/"
+        )
+
+        const JSONMode = ace.require("ace/mode/json").Mode
+        const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark'
+        const aceTheme = isDark ? 'ace/theme/monokai' : 'ace/theme/chrome'
+
+        // Desktop editors
+        testDataEditor = ace.edit("test-data")
+        testDataEditor.session.setMode(new JSONMode())
+        testDataEditor.setTheme(aceTheme)
+        testDataEditor.setOptions({ maxLines: Infinity })
+        testDataEditor.on('change', function() {
+            if (!isMobile) updatePreview(false)
+        })
+
+        contentEditor = ace.edit("content")
+        contentEditor.session.setMode(new JSONMode())
+        contentEditor.setTheme(aceTheme)
+        contentEditor.setOptions({ maxLines: Infinity, useWorker: false })
+        contentEditor.on('change', function() {
+            if (!isMobile) updatePreview(true)
+        })
+
+        // Mobile editors
+        testDataEditorMobile = ace.edit("test-data-mobile")
+        testDataEditorMobile.session.setMode(new JSONMode())
+        testDataEditorMobile.setTheme(aceTheme)
+        testDataEditorMobile.setOptions({ maxLines: Infinity })
+        testDataEditorMobile.on('change', function() {
+            if (isMobile) updatePreview(false)
+        })
+
+        contentEditorMobile = ace.edit("content-mobile")
+        contentEditorMobile.session.setMode(new JSONMode())
+        contentEditorMobile.setTheme(aceTheme)
+        contentEditorMobile.setOptions({ maxLines: Infinity, useWorker: false })
+        contentEditorMobile.on('change', function() {
+            if (isMobile) updatePreview(true)
+        })
+
+        let serverTestData = document.getElementById('server-test-data').value
+        if (serverTestData) {
+            testDataEditor.setValue(serverTestData, -1)
+            testDataEditorMobile.setValue(serverTestData, -1)
+        } else {
+            let oldTestData = window.localStorage.getItem("test-data-"+templateName)
+            if (oldTestData) {
+                testDataEditor.setValue(oldTestData, -1)
+                testDataEditorMobile.setValue(oldTestData, -1)
+            }
+        }
+
+        // Sync name inputs
+        $('#name, #name-mobile').on('input', function() {
+            var val = $(this).val()
+            $('#name').val(val)
+            $('#name-mobile').val(val)
+        })
+
+        // Listen for theme changes
+        window.addEventListener('themeChanged', function(e) {
+            var theme = e.detail.dark ? 'ace/theme/monokai' : 'ace/theme/chrome';
+            testDataEditor.setTheme(theme);
+            contentEditor.setTheme(theme);
+            testDataEditorMobile.setTheme(theme);
+            contentEditorMobile.setTheme(theme);
+        });
+
+        // Handle resize
+        window.addEventListener('resize', function() {
+            isMobile = window.innerWidth < 1200
+        });
+    });
+
+    function updatePreview(templateChanges) {
+        if (templateChanges) {
+            window.onbeforeunload = function() {
+                return 'Template has unsaved changes!'
+            }
+        }
+
+        const editors = getActiveEditors()
+        const testData = editors.testData.getValue()
+        if (!testData) { return }
+        const content = editors.content.getValue()
+        if (!content) { return }
+        // Keep localStorage as fallback for unsaved templates
+        if (!templateName) {
+            window.localStorage.setItem("test-data-"+templateName, testData)
+        }
+
+        const mode = content.includes('"grid"') ? 'MultiStaticMap' : 'StaticMap'
+        setPreviewState('loading')
+        let data
+        try {
+            data = JSON.stringify({template: content, context: JSON.parse(testData), mode})
+        } catch {
+            return showTextPreview('Failed to render preview:\nTest Data is invalid JSON!')
+        }
+        requestId += 1
+        let targetRequestId = requestId
+        // Wait 1s before sending preview request to allow pending saves to complete
+        setTimeout(function() {
+            if (targetRequestId !== requestId) return
+            setPreviewState('generating')
+            $.ajax({
+                type: "POST",
+                url: "/admin/api/templates/preview?pregenerate=true",
+                data: data,
+                contentType: "application/json",
+                success: function(id) {
+                    if (targetRequestId === requestId) {
+                        showPreview(id, mode)
+                    }
+                },
+                error: function(data, error, errorText) {
+                    if (targetRequestId === requestId) {
+                        showTextPreview('Failed to render preview:\n' + (data.responseJSON ? data.responseJSON.reason : errorText))
+                    }
+                }
+            })
+        }, 500)
+    }
+
+    function setPreviewState(state) {
+        var badge = $('#preview-badge, #preview-badge-mobile')
+        badge.removeClass('bg-secondary bg-warning bg-info bg-success bg-danger')
+        switch(state) {
+            case 'waiting':
+                badge.addClass('bg-secondary').html('<i class="fas fa-clock"></i> Waiting for input...')
+                break
+            case 'loading':
+                badge.addClass('bg-warning').html('<i class="fas fa-spinner fa-spin"></i> Loading...')
+                break
+            case 'generating':
+                badge.addClass('bg-info').html('<i class="fas fa-cog fa-spin"></i> Generating...')
+                break
+            case 'loaded':
+                badge.addClass('bg-success').html('<i class="fas fa-check"></i> Loaded')
+                break
+            case 'error':
+                badge.addClass('bg-danger').html('<i class="fas fa-exclamation-triangle"></i> Error')
+                break
+        }
+    }
+
+    function showTextPreview(text) {
+        setPreviewState('error')
+        $('#preview-error, #preview-error-mobile').html(text)
+        $('#preview-error, #preview-error-mobile').prop("rows", text.split(/\r\n|\r|\n/).length)
+        $('#preview-error, #preview-error-mobile').show()
+        $('#preview, #preview-mobile').hide()
+    }
+
+    function showPreview(id, mode) {
+        // Preload image before replacing
+        var newImg = new Image()
+        newImg.onload = function() {
+            $('#preview, #preview-mobile').prop("src", newImg.src)
+            $('#preview-error, #preview-error-mobile').hide()
+            $('#preview, #preview-mobile').show()
+            setPreviewState('loaded')
+        }
+        newImg.onerror = function() {
+            showTextPreview('Failed to load preview image')
+        }
+        newImg.src = '/' + mode.toLowerCase() + '/pregenerated/' + id
+    }
+
+    function showToast(message, isError) {
+        var toastEl = document.getElementById('toast-notification')
+        var toastBody = toastEl.querySelector('.toast-body')
+        toastBody.textContent = message
+        toastEl.classList.remove('text-bg-success', 'text-bg-danger')
+        toastEl.classList.add(isError ? 'text-bg-danger' : 'text-bg-success')
+        var toast = new bootstrap.Toast(toastEl)
+        toast.show()
+    }
+
+    function saveTestData() {
+        const editors = getActiveEditors()
+        const testData = editors.testData.getValue()
+        const name = $('#name').val() || $('#name-mobile').val()
+        if (!name) {
+            showToast('Please enter a template name first', true)
+            return
+        }
+        $.ajax({
+            type: "POST",
+            url: "/admin/api/templates/testdata",
+            data: JSON.stringify({name: name, testData: testData}),
+            contentType: "application/json",
+            success: function() {
+                showToast('Test data saved!', false)
+            },
+            error: function(data, error, errorText) {
+                showToast('Failed to save test data: ' + (data.responseJSON ? data.responseJSON.reason : errorText), true)
+            }
+        })
+    }
+
+    function validateMustacheTemplate(content) {
+        // Extract all mustache tags from the content
+        const mustacheTagRegex = /\{\{[#^/]?[\w.]+\}\}/g
+        const tags = content.match(mustacheTagRegex)
+        
+        if (!tags) {
+            return { valid: true }
+        }
+
+        // Try to parse the template with Mustache.js
+        try {
+            Mustache.parse(content)
+            return { valid: true }
+        } catch (e) {
+            return { valid: false, error: e.message }
+        }
+    }
+
+    function saveTemplate() {
+        const editors = getActiveEditors()
+        const content = editors.content.getValue()
+        const name = $('#name').val() || $('#name-mobile').val()
+        const oldName = templateName
+
+        // Validate Mustache syntax before saving
+        const validation = validateMustacheTemplate(content)
+        if (!validation.valid) {
+            alert('Invalid Mustache template syntax:\n\n' + validation.error + '\n\nPlease fix the template before saving.')
+            return false
+        }
+
+        data = JSON.stringify({template: content, name, oldName})
+        $.ajax({
+            type: "POST",
+            url: "/admin/api/templates/save",
+            data: data,
+            contentType: "application/json",
+            success: function(id) {
+                window.onbeforeunload = null
+                window.location = '/admin/templates'
+            },
+            error: function(data, error, errorText) {
+                alert('Failed to save Template: ' + (data.responseJSON ? data.responseJSON.reason : errorText))
+            }
+        })
+        return false
+    }
+</script>
+{{end}}
+
+{{define "content"}}
+<div class="toast-container position-fixed top-0 start-50 translate-middle-x p-3">
+    <div id="toast-notification" class="toast align-items-center text-bg-success border-0" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="d-flex">
+            <div class="toast-body"></div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+        </div>
+    </div>
+</div>
+<textarea id="server-test-data" style="display:none">{{.TestData}}</textarea>
+<h1 align="center">{{.PageName}}</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <div class="container-fluid">
+        <form onsubmit="return saveTemplate()">
+            <!-- Desktop Layout -->
+            <div class="row desktop-layout">
+                <div class="col">
+                    <div class="mb-3">
+                        <label class="form-label">Template Name</label>
+                        <input id="name" maxlength="50" type="text" class="form-control" name="name" value="{{.TemplateName}}" required>
+                    </div>
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <div>
+                                <span>Template Content</span>
+                                <button type="button" class="btn btn-outline-info btn-sm ms-2" data-bs-toggle="modal" data-bs-target="#syntaxModal"><i class="fas fa-code"></i> Syntax</button>
+                            </div>
+                            <button id="submit" type="submit" class="btn btn-primary btn-sm">Save Template</button>
+                        </div>
+                        <div id="content" class="form-control" name="content">{{.TemplateContent}}</div>
+                        <div class="d-flex justify-content-end mt-1">
+                            <button type="submit" class="btn btn-primary btn-sm">Save Template</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="mb-3">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <span>Test Data</span>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="saveTestData()">Save Test Data</button>
+                        </div>
+                        <div id="test-data" class="form-control" name="test-data"></div>
+                    </div>
+                    <div class="mb-3">
+                        <div class="mb-2">
+                            <span>Preview</span>
+                            <span id="preview-badge" class="badge bg-secondary ms-2"><i class="fas fa-clock"></i> Waiting for input...</span>
+                        </div>
+                        <div id="preview-container">
+                            <img id="preview" style="display: none" class="form-control">
+                            <textarea id="preview-error" rows="1" class="form-control" name="content" readonly>Enter Test Data to show preview!</textarea>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Mobile Layout -->
+            <div class="mobile-layout">
+                <div class="mb-3">
+                    <label class="form-label">Template Name</label>
+                    <input id="name-mobile" maxlength="50" type="text" class="form-control" name="name" value="{{.TemplateName}}" required>
+                </div>
+                <div class="mb-3">
+                    <div class="mb-2">
+                        <span>Preview</span>
+                        <span id="preview-badge-mobile" class="badge bg-secondary ms-2"><i class="fas fa-clock"></i> Waiting for input...</span>
+                    </div>
+                    <div id="preview-container-mobile">
+                        <img id="preview-mobile" style="display: none" class="form-control">
+                        <textarea id="preview-error-mobile" rows="1" class="form-control" readonly>Enter Test Data to show preview!</textarea>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <div>
+                            <span>Template Content</span>
+                            <button type="button" class="btn btn-outline-info btn-sm ms-2" data-bs-toggle="modal" data-bs-target="#syntaxModal"><i class="fas fa-code"></i> Syntax</button>
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-sm">Save Template</button>
+                    </div>
+                    <div id="content-mobile" class="form-control">{{.TemplateContent}}</div>
+                    <div class="d-flex justify-content-end mb-3">
+                        <button type="submit" class="btn btn-primary">Save Template</button>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center mb-1">
+                        <span>Test Data</span>
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="saveTestData()">Save Test Data</button>
+                    </div>
+                    <div id="test-data-mobile" class="form-control"></div>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Syntax Reference Modal -->
+<div class="modal fade" id="syntaxModal" tabindex="-1" aria-labelledby="syntaxModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="syntaxModalLabel"><i class="fas fa-code"></i> Jet Template Syntax Reference</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <table class="table table-sm table-bordered">
+                    <thead>
+                        <tr>
+                            <th>Feature</th>
+                            <th>Syntax</th>
+                            <th>Example</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Output Variable</td>
+                            <td><code>&#123;&#123; variable &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; name &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Field Access</td>
+                            <td><code>&#123;&#123; object.property &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; user.name &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Initialize Variable</td>
+                            <td><code>&#123;&#123; foo := value &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; count := 0 &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Assign Variable</td>
+                            <td><code>&#123;&#123; foo = value &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; count = count + 1 &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>If</td>
+                            <td><code>&#123;&#123; if condition &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; if active &#125;&#125;Yes&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>If/Else</td>
+                            <td><code>&#123;&#123; if cond &#125;&#125;...&#123;&#123; else &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; if ok &#125;&#125;A&#123;&#123; else &#125;&#125;B&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>If/Else If/Else</td>
+                            <td><code>&#123;&#123; if a &#125;&#125;...&#123;&#123; else if b &#125;&#125;...&#123;&#123; else &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; if x==1 &#125;&#125;A&#123;&#123; else if x==2 &#125;&#125;B&#123;&#123; else &#125;&#125;C&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Equality</td>
+                            <td><code>==</code>, <code>!=</code></td>
+                            <td><code>&#123;&#123; if type == "gym" &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Comparison</td>
+                            <td><code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, <code>&lt;=</code></td>
+                            <td><code>&#123;&#123; if count &gt; 0 &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Logical Operators</td>
+                            <td><code>&amp;&amp;</code>, <code>||</code>, <code>!</code></td>
+                            <td><code>&#123;&#123; if a &amp;&amp; !b &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Ternary</td>
+                            <td><code>&#123;&#123; cond ? valTrue : valFalse &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; active ? "yes" : "no" &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Range (Loop)</td>
+                            <td><code>&#123;&#123; range items &#125;&#125;&#123;&#123; . &#125;&#125;&#123;&#123; end &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; range users &#125;&#125;&#123;&#123; .name &#125;&#125;&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Range with Index</td>
+                            <td><code>&#123;&#123; range i, v := items &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; range i, u := users &#125;&#125;&#123;&#123; i &#125;&#125;:&#123;&#123; u.name &#125;&#125;&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Range with Else</td>
+                            <td><code>&#123;&#123; range items &#125;&#125;...&#123;&#123; else &#125;&#125;empty&#123;&#123; end &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; range results &#125;&#125;&#123;&#123; . &#125;&#125;&#123;&#123; else &#125;&#125;None&#123;&#123; end &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Index Access</td>
+                            <td><code>&#123;&#123; array[index] &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; items[0] &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>Arithmetic</td>
+                            <td><code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>, <code>%</code></td>
+                            <td><code>&#123;&#123; width * 2 &#125;&#125;</code></td>
+                        </tr>
+                        <tr>
+                            <td>String Concat</td>
+                            <td><code>&#123;&#123; str1 + str2 &#125;&#125;</code></td>
+                            <td><code>&#123;&#123; "Hello " + name &#125;&#125;</code></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p class="text-info mb-0">
+                    <i class="fas fa-info-circle"></i>
+                    <strong>Note:</strong> Full Jet syntax docs: <a href="https://github.com/CloudyKit/jet/blob/master/docs/syntax.md" target="_blank">github.com/CloudyKit/jet</a>
+                </p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+{{end}}

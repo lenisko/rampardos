@@ -1,0 +1,53 @@
+{{template "base" .}}
+
+{{define "scripts"}}
+<script>
+    var ws;
+    
+    function deleteDataset() {
+        var name = '{{.Name}}';
+        
+        $('#status').text('Connecting...');
+        $('#submit').prop('disabled', true);
+        
+        var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(protocol + '//' + window.location.host + '/admin/api/datasets/delete');
+        
+        ws.onopen = function() {
+            $('#status').text('Deleting...');
+            ws.send(name);
+        };
+        
+        ws.onmessage = function(event) {
+            if (event.data === 'deleted') {
+                $('#status').text('Combining tiles...');
+            } else if (event.data === 'ok') {
+                window.location = '/admin/datasets';
+            } else {
+                $('#status').text('Error: ' + event.data);
+                $('#submit').prop('disabled', false);
+            }
+        };
+        
+        ws.onerror = function() {
+            $('#status').text('Connection error');
+            $('#submit').prop('disabled', false);
+        };
+        
+        return false;
+    }
+</script>
+{{end}}
+
+{{define "content"}}
+<h1 align="center">Delete Dataset</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <p>Are you sure you want to delete dataset <strong>{{.Name}}</strong>?</p>
+    <form onsubmit="return deleteDataset()">
+        <button type="submit" id="submit" class="btn btn-danger">Delete</button>
+        <a href="/admin/datasets" class="btn btn-secondary">Cancel</a>
+        <span id="status" class="ms-3"></span>
+    </form>
+</div>
+{{end}}
