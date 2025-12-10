@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -86,7 +87,7 @@ func (h *DatasetsHandler) Download(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		path := h.datasetsController.GetListFolder() + sanitized + ".mbtiles"
+		path := filepath.Join(h.datasetsController.GetListFolder(), sanitized+".mbtiles")
 
 		// Start background download
 		if err := h.downloadManager.StartDownload(sanitized, url, path); err != nil {
