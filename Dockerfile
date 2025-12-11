@@ -54,10 +54,16 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # ================================
 # Final image
 # ================================
-FROM node:20-alpine
+FROM debian:bookworm-slim
 WORKDIR /app
 
-RUN apk add --no-cache sqlite-libs ca-certificates
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Copy tippecanoe binaries
 COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
