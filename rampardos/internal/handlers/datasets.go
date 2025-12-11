@@ -6,10 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
@@ -227,13 +229,12 @@ func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 }
 
-// findTileserverPID finds the PID of the tileserver process
+// findTileserverPID finds the PID of the tileserver process using pidof
 func findTileserverPID() (int, error) {
-	// Find process by command line: "node /usr/src/app/ -p 8080"
-	cmd := exec.Command("pgrep", "-f", "node /usr/src/app")
+	cmd := exec.Command("pidof", "node")
 	output, err := cmd.Output()
 	if err != nil {
-		return 0, fmt.Errorf("pgrep failed: %w", err)
+		return 0, fmt.Errorf("pidof failed: %w", err)
 	}
 
 	pidStr := strings.TrimSpace(string(output))
@@ -241,9 +242,9 @@ func findTileserverPID() (int, error) {
 		return 0, fmt.Errorf("tileserver process not found")
 	}
 
-	// Take first PID if multiple lines
-	lines := strings.Split(pidStr, "\n")
-	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	// Take first PID if multiple
+	pids := strings.Split(pidStr, " ")
+	pid, err := strconv.Atoi(pids[0])
 	if err != nil {
 		return 0, fmt.Errorf("invalid PID: %w", err)
 	}
@@ -253,12 +254,11 @@ func findTileserverPID() (int, error) {
 
 // sendSIGHUP sends SIGHUP signal to the given PID
 func sendSIGHUP(pid int) error {
-	cmd := exec.Command("kill", "-1", strconv.Itoa(pid))
-	output, err := cmd.CombinedOutput()
+	proc, err := os.FindProcess(pid)
 	if err != nil {
-		return fmt.Errorf("kill failed: %s - %w", string(output), err)
+		return fmt.Errorf("failed to find process: %w", err)
 	}
-	return nil
+	return proc.Signal(syscall.SIGHUP)
 }
 
 // Add handles POST /admin/api/datasets/add (file upload)
