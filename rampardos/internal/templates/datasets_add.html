@@ -4,6 +4,14 @@
 <script>
     var ws;
     
+    function fillOpenFreeMap() {
+        var url = '{{.OpenFreeMapURL}}';
+        var match = url.match(/\/(\d{8})_/);
+        var dateStr = match ? match[1] : '';
+        $('#name').val('openfreemap-' + dateStr);
+        $('#url').val(url);
+    }
+    
     function downloadDataset() {
         var name = $('#name').val();
         var url = $('#url').val();
@@ -56,7 +64,8 @@
     <form onsubmit="return downloadDataset()">
         <div class="mb-3">
             <label for="name" class="form-label">Dataset Name</label>
-            <input type="text" class="form-control" id="name" name="name" required>
+            <button type="button" class="btn btn-sm btn-outline-secondary ms-2" onclick="fillOpenFreeMap()">OpenFreeMap</button>
+            <input type="text" class="form-control mt-2" id="name" name="name" required>
         </div>
         <div class="mb-3">
             <label for="url" class="form-label">Download URL (.mbtiles)</label>

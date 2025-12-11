@@ -50,8 +50,9 @@ type DatasetsContext struct {
 // DatasetsAddContext is the template context for add dataset page
 type DatasetsAddContext struct {
 	BaseContext
-	PageID   string
-	PageName string
+	PageID         string
+	PageName       string
+	OpenFreeMapURL string
 }
 
 // DatasetsDeleteContext is the template context for delete dataset page
@@ -133,10 +134,12 @@ func (v *DatasetsView) Render(w http.ResponseWriter, r *http.Request) {
 
 // RenderAdd handles GET /admin/datasets/add
 func (v *DatasetsView) RenderAdd(w http.ResponseWriter, r *http.Request) {
+	openFreeMapURL, _ := v.openFreeMapService.GetLatestPlanetURL()
 	ctx := DatasetsAddContext{
-		BaseContext: NewBaseContext(),
-		PageID:      "datasets",
-		PageName:    "Add Dataset",
+		BaseContext:    NewBaseContext(),
+		PageID:         "datasets",
+		PageName:       "Add Dataset",
+		OpenFreeMapURL: openFreeMapURL,
 	}
 
 	v.templates.Render(w, "datasets_add.html", ctx)
