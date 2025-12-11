@@ -55,21 +55,21 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
 FROM debian:bookworm-slim
 WORKDIR /app
 
-# Install only runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsqlite3-0 ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js 20 runtime only
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# Install runtime dependencies + Node.js in single layer, then cleanup
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Copy tippecanoe binaries
 COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
-# Copy fontnik
-COPY --from=fontnik-build /fontnik /app/fontnik
+# Copy fontnik (only essential files)
+COPY --from=fontnik-build /fontnik/node_modules /app/fontnik/node_modules
+COPY --from=fontnik-build /fontnik/bin /app/fontnik/bin
 ENV PATH="/app/fontnik/node_modules/.bin:$PATH"
 
 # Copy Go binary
