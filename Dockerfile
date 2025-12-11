@@ -68,9 +68,8 @@ RUN apt-get update \
 # Copy tippecanoe binaries
 COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
-# Copy fontnik (only essential files)
-COPY --from=fontnik-build /fontnik/node_modules /app/fontnik/node_modules
-COPY --from=fontnik-build /fontnik/bin /app/fontnik/bin
+# Copy fontnik
+COPY --from=fontnik-build /fontnik /app/fontnik
 ENV PATH="/app/fontnik/node_modules/.bin:$PATH"
 
 # Copy Go binary
