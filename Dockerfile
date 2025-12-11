@@ -1,60 +1,81 @@
 # ================================
-# Build image
+# Build Go binary
 # ================================
-FROM golang:1.25 AS build
+FROM golang:1.25 AS go-build
 WORKDIR /build
 
-# Copy go mod files
 COPY rampardos/go.mod rampardos/go.sum ./
 RUN go mod download
 
-# Copy source code
 COPY rampardos/ .
-
-# Build
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o rampardos ./cmd/server
 
 # ================================
-# Run image
+# Build tippecanoe
+# ================================
+FROM debian:bookworm-slim AS tippecanoe-build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libsqlite3-dev zlib1g-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 -b 1.36.0 https://github.com/mapbox/tippecanoe.git \
+    && cd tippecanoe \
+    && make -j$(nproc) \
+    && make install \
+    && mkdir -p /tippecanoe-out \
+    && cp /usr/local/bin/tippecanoe* /tippecanoe-out/
+
+# ================================
+# Build fontnik
+# ================================
+FROM debian:bookworm-slim AS fontnik-build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential python3 git ca-certificates curl zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+    git clone --depth 1 -b fix-build-errors-node14 https://github.com/lenisko/node-fontnik.git /fontnik \
+    && cd /fontnik \
+    && mkdir .toolchain \
+    && CXXFLAGS="-Wno-error=maybe-uninitialized" npm install --build-from-source; \
+    else \
+    mkdir -p /fontnik && cd /fontnik && npm install fontnik@0.7.4; \
+    fi
+
+# ================================
+# Final image
 # ================================
 FROM debian:bookworm-slim
 WORKDIR /app
 
-# Install runtime dependencies
+# Install only runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libsqlite3-dev \
-    zlib1g-dev \
-    git \
-    curl \
-    nodejs \
-    npm \
-    ca-certificates \
+    libsqlite3-0 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install tippecanoe
-RUN git clone https://github.com/mapbox/tippecanoe.git -b 1.36.0 \
-    && cd tippecanoe \
-    && make -j \
-    && make install \
-    && cd .. \
-    && rm -rf tippecanoe
+# Install Node.js 20 runtime only
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install fontnik (arm64 needs custom build with relaxed compiler warnings)
-RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
-    git clone -b fix-build-errors-node14 https://github.com/lenisko/node-fontnik.git ./fontnik \
-    && cd fontnik \
-    && mkdir .toolchain \
-    && CXXFLAGS="-Wno-error=maybe-uninitialized" npm install --build-from-source \
-    && npm link; \
-    else \
-    npm install -g fontnik@0.7.4; \
-    fi
+# Copy tippecanoe binaries
+COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
-# Copy binary
-COPY --from=build /build/rampardos /app/rampardos
+# Copy fontnik
+COPY --from=fontnik-build /fontnik /app/fontnik
+ENV PATH="/app/fontnik/node_modules/.bin:$PATH"
 
-# Create cache directories (Templates is for user Jet templates, mounted or created at runtime)
+# Copy Go binary
+COPY --from=go-build /build/rampardos /app/rampardos
+
+# Create directories
 RUN mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable \
     TileServer/Fonts TileServer/Styles TileServer/Datasets Templates Markers Temp
 
