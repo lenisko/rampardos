@@ -88,6 +88,19 @@
             });
     }
 
+    function reloadTileserver() {
+        $('#reload-btn').prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Reloading...');
+        $.post('/admin/api/datasets/reload-tileserver')
+            .done(function() {
+                $('#reload-btn').prop('disabled', false).html('<i class="fas fa-sync"></i> Reload Tileserver');
+                alert('Tileserver reloaded successfully');
+            })
+            .fail(function(xhr) {
+                $('#reload-btn').prop('disabled', false).html('<i class="fas fa-sync"></i> Reload Tileserver');
+                alert('Reload failed: ' + xhr.responseText);
+            });
+    }
+
     function refreshDownloads() {
         $.get('/admin/api/datasets/downloads', function(data) {
             var hasActive = false;
@@ -208,9 +221,14 @@
     <div class="alert alert-secondary mt-4" role="alert">
         <div class="d-flex justify-content-between align-items-center">
             <span><i class="fas fa-layer-group"></i> Select datasets to combine, or click <i class="fas fa-check"></i> to activate a single one:</span>
-            <button id="combine-btn" class="btn btn-warning" onclick="combineSelected()" disabled>
-                <i class="fas fa-layer-group"></i> Combine Selected
-            </button>
+            <div>
+                <button id="reload-btn" class="btn btn-info me-2" onclick="reloadTileserver()">
+                    <i class="fas fa-sync"></i> Reload Tileserver
+                </button>
+                <button id="combine-btn" class="btn btn-warning" onclick="combineSelected()" disabled>
+                    <i class="fas fa-layer-group"></i> Combine Selected
+                </button>
+            </div>
         </div>
     </div>
     {{if .IsCombined}}

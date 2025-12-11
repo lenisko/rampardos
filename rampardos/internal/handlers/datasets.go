@@ -2,10 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -201,19 +204,61 @@ func (h *DatasetsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		conn.WriteMessage(websocket.TextMessage, []byte("deleted"))
-
-		// Combine tiles
-		slog.Info("Combining mbtiles")
-		if err := h.datasetsController.CombineTiles(); err != nil {
-			slog.Error("Combine failed", "error", err)
-			conn.WriteMessage(websocket.TextMessage, []byte("Combining mbtiles failed: "+err.Error()))
-			continue
-		}
-
-		slog.Info("Combine complete")
 		conn.WriteMessage(websocket.TextMessage, []byte("ok"))
 	}
+}
+
+// ReloadTileserver handles POST /admin/api/datasets/reload-tileserver
+func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Request) {
+	pid, err := findTileserverPID()
+	if err != nil {
+		slog.Error("Failed to find tileserver PID", "error", err)
+		http.Error(w, "Failed to find tileserver process: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := sendSIGHUP(pid); err != nil {
+		slog.Error("Failed to send SIGHUP to tileserver", "pid", pid, "error", err)
+		http.Error(w, "Failed to reload tileserver: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Tileserver reloaded", "pid", pid)
+	w.WriteHeader(http.StatusOK)
+}
+
+// findTileserverPID finds the PID of the tileserver process
+func findTileserverPID() (int, error) {
+	// Find process by command line: "node /usr/src/app/ -p 8080"
+	cmd := exec.Command("pgrep", "-f", "node /usr/src/app")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("pgrep failed: %w", err)
+	}
+
+	pidStr := strings.TrimSpace(string(output))
+	if pidStr == "" {
+		return 0, fmt.Errorf("tileserver process not found")
+	}
+
+	// Take first PID if multiple lines
+	lines := strings.Split(pidStr, "\n")
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return 0, fmt.Errorf("invalid PID: %w", err)
+	}
+
+	return pid, nil
+}
+
+// sendSIGHUP sends SIGHUP signal to the given PID
+func sendSIGHUP(pid int) error {
+	cmd := exec.Command("kill", "-1", strconv.Itoa(pid))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kill failed: %s - %w", string(output), err)
+	}
+	return nil
 }
 
 // Add handles POST /admin/api/datasets/add (file upload)

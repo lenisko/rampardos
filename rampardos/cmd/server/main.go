@@ -214,6 +214,7 @@ func main() {
 			r.Post("/datasets/downloads/{name}/cancel", datasetsHandler.CancelDownload)
 			r.Post("/datasets/combine", datasetsHandler.Combine)
 			r.Post("/datasets/{name}/activate", datasetsHandler.SetActive)
+			r.Post("/datasets/reload-tileserver", datasetsHandler.ReloadTileserver)
 
 			// Fonts
 			r.Post("/fonts/add", fontsHandler.Add)

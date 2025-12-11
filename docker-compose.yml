@@ -12,6 +12,7 @@ services:
     container_name: rampardos
     restart: unless-stopped
     tty: true
+    pid: "service:tileserver" # share PID namespace - required to get mbtiles reload working
     volumes:
       - ./Cache:/app/Cache
       - ./Templates:/app/Templates

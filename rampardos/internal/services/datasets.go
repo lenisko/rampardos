@@ -196,7 +196,7 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 		return fmt.Errorf("failed to delete dataset: %w", err)
 	}
 
-	return dc.CombineTiles()
+	return nil
 }
 
 // GetListFolder returns the list folder path
