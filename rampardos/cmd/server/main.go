@@ -113,8 +113,8 @@ func main() {
 	datasetsHandler := handlers.NewDatasetsHandler(datasetsController)
 	templatesHandler := handlers.NewTemplatesHandler(templatesController, staticMapHandler, multiStaticMapHandler)
 
-	// Initialize template renderer
-	templateRenderer, err := views.NewTemplateRendererFromDir("internal/templates")
+	// Initialize template renderer (uses embedded templates)
+	templateRenderer, err := views.NewTemplateRenderer()
 	if err != nil {
 		slog.Error("Failed to load templates", "error", err)
 		os.Exit(1)

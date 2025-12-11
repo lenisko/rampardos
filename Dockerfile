@@ -54,9 +54,6 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
 # Copy binary
 COPY --from=build /build/rampardos /app/rampardos
 
-# Copy HTML templates for admin UI
-COPY --from=build /build/internal/templates /app/internal/templates
-
 # Create cache directories (Templates is for user Jet templates, mounted or created at runtime)
 RUN mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable \
     TileServer/Fonts TileServer/Styles TileServer/Datasets Templates Markers Temp

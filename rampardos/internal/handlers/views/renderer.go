@@ -2,24 +2,23 @@ package views
 
 import (
 	"html/template"
+	"io/fs"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/templates"
 )
 
 // TemplateRenderer handles HTML template rendering
 // Each page template is parsed separately with base.html to avoid block name conflicts
 type TemplateRenderer struct {
-	dir       string
 	funcMap   template.FuncMap
 	templates map[string]*template.Template
 }
 
-// NewTemplateRendererFromDir creates a template renderer from a directory
-func NewTemplateRendererFromDir(dir string) (*TemplateRenderer, error) {
+// NewTemplateRenderer creates a template renderer from embedded templates
+func NewTemplateRenderer() (*TemplateRenderer, error) {
 	funcMap := template.FuncMap{
 		"eq": func(a, b any) bool {
 			return a == b
@@ -27,31 +26,31 @@ func NewTemplateRendererFromDir(dir string) (*TemplateRenderer, error) {
 	}
 
 	r := &TemplateRenderer{
-		dir:       dir,
 		funcMap:   funcMap,
 		templates: make(map[string]*template.Template),
 	}
 
-	// Read base template
-	basePath := filepath.Join(dir, "base.html")
-	baseContent, err := os.ReadFile(basePath)
+	// Read base template from embedded FS
+	baseContent, err := fs.ReadFile(templates.FS, "base.html")
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse each page template separately with base
-	entries, err := os.ReadDir(dir)
+	entries, err := fs.ReadDir(templates.FS, ".")
 	if err != nil {
 		return nil, err
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".html" || entry.Name() == "base.html" {
+		if entry.IsDir() || entry.Name() == "base.html" || entry.Name() == "embed.go" {
+			continue
+		}
+		if len(entry.Name()) < 5 || entry.Name()[len(entry.Name())-5:] != ".html" {
 			continue
 		}
 
-		pagePath := filepath.Join(dir, entry.Name())
-		pageContent, err := os.ReadFile(pagePath)
+		pageContent, err := fs.ReadFile(templates.FS, entry.Name())
 		if err != nil {
 			return nil, err
 		}
