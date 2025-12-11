@@ -1,7 +1,7 @@
 # ================================
 # Build Go binary
 # ================================
-FROM golang:1.25 AS go-build
+FROM golang:1.25-alpine AS go-build
 WORKDIR /build
 
 COPY rampardos/go.mod rampardos/go.sum ./
@@ -13,11 +13,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o rampardos ./cmd/server
 # ================================
 # Build tippecanoe
 # ================================
-FROM debian:bookworm-slim AS tippecanoe-build
+FROM alpine:3.20 AS tippecanoe-build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libsqlite3-dev zlib1g-dev git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache build-base sqlite-dev zlib-dev git bash
 
 RUN git clone --depth 1 -b 1.36.0 https://github.com/mapbox/tippecanoe.git \
     && cd tippecanoe \
@@ -27,7 +25,7 @@ RUN git clone --depth 1 -b 1.36.0 https://github.com/mapbox/tippecanoe.git \
     && cp /usr/local/bin/tippecanoe* /tippecanoe-out/
 
 # ================================
-# Build fontnik
+# Build fontnik (needs Debian for bash scripts)
 # ================================
 FROM debian:bookworm-slim AS fontnik-build
 
@@ -49,20 +47,17 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
     mkdir -p /fontnik && cd /fontnik && npm install fontnik@0.7.4; \
     fi
 
+# Strip node_modules
+RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "*.map" -o -name "LICENSE*" -o -name "README*" -o -name "CHANGELOG*" \) -delete \
+    && find /fontnik/node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" -o -name "example" -o -name "examples" \) -exec rm -rf {} + 2>/dev/null || true
+
 # ================================
 # Final image
 # ================================
-FROM debian:bookworm-slim
+FROM node:20-alpine
 WORKDIR /app
 
-# Install runtime dependencies + Node.js in single layer, then cleanup
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && apt-get purge -y curl \
-    && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+RUN apk add --no-cache sqlite-libs ca-certificates
 
 # Copy tippecanoe binaries
 COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
