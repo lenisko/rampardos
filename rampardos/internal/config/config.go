@@ -31,9 +31,6 @@ type Config struct {
 	RegenCacheMaxAge  *uint32
 	RegenCacheDelay   *uint32
 
-	// Graphics engine
-	LegacyGraphicsEngine bool // Use ImageMagick instead of native Go graphics
-
 	// Tileserver reload settings
 	TileServerContainer string // Docker container name for SIGHUP reload (empty = disabled)
 
@@ -71,8 +68,6 @@ func Load() *Config {
 		MarkerCacheDelay:  getEnvUint32("MARKER_CACHE_DELAY_SECONDS", 3600),
 		RegenCacheMaxAge:  getEnvUint32("REGENERATABLE_CACHE_MAX_AGE_MINUTES", 10080),
 		RegenCacheDelay:   getEnvUint32("REGENERATABLE_CACHE_DELAY_SECONDS", 3600),
-
-		LegacyGraphicsEngine: getEnvBool("LEGACY_GRAPHICS_ENGINE", false),
 
 		TileServerContainer: getEnv("TILESERVER_CONTAINER", ""),
 

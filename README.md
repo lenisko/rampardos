@@ -15,9 +15,8 @@ A Go port of swifttileservercache with some new features - a caching proxy for t
 ## Requirements
 
 - Go 1.25+
-- ~~ImageMagick (for image processing)~~
-- tippecanoe (for mbtiles operations (admin side))
-- fontnik/build-glyphs (for font processing (admin side))
+- tippecanoe (for mbtiles operations (admin utils))
+- fontnik/build-glyphs (for font processing (admin utils))
 
 ## Environment Variables
 

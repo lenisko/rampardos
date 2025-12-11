@@ -22,7 +22,6 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    imagemagick \
     build-essential \
     libsqlite3-dev \
     zlib1g-dev \

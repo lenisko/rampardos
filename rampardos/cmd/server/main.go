@@ -20,7 +20,6 @@ import (
 	custommw "github.com/lenisko/rampardos/internal/middleware"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
-	"github.com/lenisko/rampardos/internal/utils"
 )
 
 func main() {
@@ -101,14 +100,6 @@ func main() {
 
 	// Initialize cache index for fast cache lookups
 	services.InitGlobalCacheIndex()
-
-	// Set graphics engine mode
-	utils.UseLegacyGraphicsEngine = cfg.LegacyGraphicsEngine
-	if cfg.LegacyGraphicsEngine {
-		slog.Info("Using legacy ImageMagick graphics engine")
-	} else {
-		slog.Info("Using native Go graphics engine")
-	}
 
 	// Initialize cache cleaners
 	initCacheCleaners(cfg)
