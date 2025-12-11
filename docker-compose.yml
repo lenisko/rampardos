@@ -5,6 +5,7 @@ services:
     container_name: tileserver
     restart: unless-stopped
     tty: true
+    user: "${PUID:-0}:${PGID:-0}"
     volumes:
       - ./TileServer:/data
   rampardos:
@@ -12,6 +13,7 @@ services:
     container_name: rampardos
     restart: unless-stopped
     tty: true
+    user: "${PUID:-0}:${PGID:-0}"
     pid: "service:tileserver" # share PID namespace - required to get mbtiles reload working
     volumes:
       - ./Cache:/app/Cache
