@@ -1,0 +1,11 @@
+.DS_Store
+/.idea
+/Cache
+/Templates
+/Markers
+/TileServer
+/Temp
+docker-compose.*.yml
+bin/
+.env
+rampardos/rampardos.exe

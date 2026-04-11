@@ -1,0 +1,84 @@
+{{template "base" .}}
+
+{{define "scripts"}}
+<script>
+    $(document).ready(function() {
+        $('#table').DataTable({
+            ordering: true,
+            paging: true,
+            pageLength: 20,
+            drawCallback: function(settings) {
+                var wrapper = $(this).closest('.dt-container');
+                var singlePage = this.api().page.info().pages <= 1;
+                wrapper.find('.dt-paging').toggle(!singlePage);
+                wrapper.find('.dt-info').toggle(!singlePage);
+            },
+            dom: 'Bfrtip',
+            buttons: {
+                buttons: [{
+                    text: 'Add Template',
+                    className: 'btn-success',
+                    action: function () {
+                        window.location = '/admin/templates/add'
+                    }
+                }, {
+                    text: 'Convert Legacy Template',
+                    className: 'btn-info',
+                    action: function () {
+                        window.location = '/admin/convert'
+                    }
+                }],
+                dom: {
+                    button: {
+                        className: 'btn'
+                    }
+                }
+            }
+        })
+    })
+
+    function deleteTemplate(template) {
+        $.ajax({
+            type: "DELETE",
+            url: "/admin/api/templates/delete/" + template,
+            success: function(id) {
+                window.location.reload()
+            },
+            error: function(data, error, errorText) {
+                showToast('Failed to delete Template: ' + (data.responseJSON ? data.responseJSON.reason : errorText), 'danger')
+            }
+        })
+        return false
+    }
+</script>
+{{end}}
+
+{{define "content"}}
+<h1 align="center">Templates</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <table style="width:100%;" id="table" class="table table-striped table-bordered dt-responsive nowrap">
+        <thead>
+            <tr>
+                <th>Template</th>
+                <th style="width: 100px">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Templates}}
+            <tr>
+                <td style="vertical-align:middle">
+                    {{.}}
+                </td>
+                <td style="vertical-align:middle">
+                    <div style="display: flex" class="btn-group" role="group">
+                        <a style="flex: 1" role="button" class="btn btn-primary" href="/admin/templates/edit/{{.}}">Edit</a>
+                        <button style="flex: 1" role="button" class="btn btn-danger" onclick="deleteTemplate('{{.}}')">Delete</button>
+                    </div>
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+{{end}}

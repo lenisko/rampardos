@@ -1,0 +1,276 @@
+{{template "base" .}} {{define "stylesheets"}}
+<style>
+  #leaf-input,
+  #quicktemplate-output {
+    min-height: 400px;
+    overflow: auto;
+    padding: 0;
+    font-family: monospace;
+  }
+  .editor-container {
+    border: 1px solid #ced4da;
+    border-radius: 0.25rem;
+  }
+</style>
+{{end}} {{define "scripts"}}
+<script>
+  var leafEditor, qtEditor;
+  var convertTimeout = null;
+
+  $(function () {
+    ace.config.set(
+      "basePath",
+      "/static/js/"
+    );
+
+    const JSONMode = ace.require("ace/mode/json").Mode;
+    const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    const aceTheme = isDark ? 'ace/theme/monokai' : 'ace/theme/chrome';
+
+    leafEditor = ace.edit("leaf-input");
+    leafEditor.session.setMode(new JSONMode());
+    leafEditor.setTheme(aceTheme);
+    leafEditor.setOptions({
+      maxLines: Infinity,
+      minLines: 20,
+      useWorker: false,
+    });
+    leafEditor.on("change", function () {
+      scheduleConvert();
+    });
+
+    qtEditor = ace.edit("quicktemplate-output");
+    qtEditor.session.setMode(new JSONMode());
+    qtEditor.setTheme(aceTheme);
+    qtEditor.setOptions({
+      maxLines: Infinity,
+      minLines: 20,
+      readOnly: true,
+      useWorker: false,
+    });
+    qtEditor.setReadOnly(true);
+
+    // Set placeholder
+    leafEditor.setValue(
+      '{\n  "example": "#(variable)",\n  "conditional": "#if(show != nil):visible#else:hidden#endif",\n  "loop": "#for(item in items):#(item.name),#endfor"\n}',
+      -1
+    );
+
+    // Listen for theme changes
+    window.addEventListener('themeChanged', function(e) {
+      var theme = e.detail.dark ? 'ace/theme/monokai' : 'ace/theme/chrome';
+      leafEditor.setTheme(theme);
+      qtEditor.setTheme(theme);
+    });
+  });
+
+  function scheduleConvert() {
+    if (convertTimeout) {
+      clearTimeout(convertTimeout);
+    }
+    convertTimeout = setTimeout(doConvert, 1000);
+  }
+
+  function doConvert() {
+    const leafTemplate = leafEditor.getValue();
+    if (!leafTemplate.trim()) {
+      qtEditor.setValue("", -1);
+      return;
+    }
+
+    $.ajax({
+      type: "POST",
+      url: "/admin/api/convert/leaf-to-jet",
+      data: JSON.stringify({ template: leafTemplate }),
+      contentType: "application/json",
+      success: function (response) {
+        qtEditor.setValue(response.result, -1);
+        updateValidationStatus(true, "Converted");
+      },
+      error: function (data, error, errorText) {
+        qtEditor.setValue(
+          "Error: " +
+            (data.responseJSON ? data.responseJSON.reason : errorText),
+          -1
+        );
+        updateValidationStatus(false, "Conversion failed");
+      },
+    });
+  }
+
+  function updateValidationStatus(valid, message) {
+    const badge = $("#validation-badge");
+    if (valid) {
+      badge.removeClass("bg-danger").addClass("bg-success");
+      badge.html('<i class="fas fa-check"></i> ' + message);
+    } else {
+      badge.removeClass("bg-success").addClass("bg-danger");
+      badge.html('<i class="fas fa-times"></i> ' + message);
+    }
+  }
+
+  function copyToClipboard() {
+    const text = qtEditor.getValue();
+    const btn = $("#copy-btn");
+    
+    // Try modern clipboard API first, fallback to execCommand
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () {
+        btn.text("Copied!");
+        setTimeout(function () { btn.text("Copy to Clipboard"); }, 2000);
+      }).catch(function() {
+        fallbackCopy(text, btn);
+      });
+    } else {
+      fallbackCopy(text, btn);
+    }
+  }
+  
+  function fallbackCopy(text, btn) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand("copy");
+      btn.text("Copied!");
+      setTimeout(function () { btn.text("Copy to Clipboard"); }, 2000);
+    } catch (err) {
+      btn.text("Copy failed");
+      setTimeout(function () { btn.text("Copy to Clipboard"); }, 2000);
+    }
+    document.body.removeChild(textarea);
+  }
+
+</script>
+{{end}} {{define "content"}}
+<h1 align="center">Convert Leaf to Jet</h1>
+<br />
+<div style="width: 90%; margin-left: 5%; margin-right: 5%">
+  <div class="container-fluid">
+    <div class="row">
+      <div class="col-md-6">
+        <div class="mb-3">
+          <label class="form-label"><strong>Leaf Template (Input)</strong></label>
+          <div id="leaf-input" class="editor-container"></div>
+          <small class="form-text text-muted">
+            Paste your Leaf template here. Conversion happens automatically
+            after 1 second.
+          </small>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="mb-3">
+          <div class="d-flex justify-content-between align-items-center mb-1">
+            <div>
+              <label class="form-label mb-0"><strong>Jet Template (Output)</strong></label>
+              <span id="validation-badge" class="badge bg-secondary ms-2">Waiting for input...</span>
+            </div>
+            <button
+              id="copy-btn"
+              type="button"
+              class="btn btn-primary btn-sm"
+              onclick="copyToClipboard()"
+            >
+              Copy to Clipboard
+            </button>
+          </div>
+          <div id="quicktemplate-output" class="editor-container"></div>
+        </div>
+      </div>
+    </div>
+    <div class="row mt-4">
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header">
+            <strong>Syntax Reference</strong>
+          </div>
+          <div class="card-body">
+            <table class="table table-sm table-bordered">
+              <thead>
+                <tr>
+                  <th>Feature</th>
+                  <th>Leaf Syntax</th>
+                  <th>Jet Syntax</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Variable</td>
+                  <td><code>#(variable)</code></td>
+                  <td><code>&#123;&#123; variable &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Nested Property</td>
+                  <td><code>#(object.property)</code></td>
+                  <td><code>&#123;&#123; object.property &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>If (not nil)</td>
+                  <td><code>#if(var != nil):...#endif</code></td>
+                  <td><code>&#123;&#123; if var != nil &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>If/Else If/Else</td>
+                  <td><code>#if(a):A#elseif(b):B#else:C#endif</code></td>
+                  <td><code>&#123;&#123; if a &#125;&#125;A&#123;&#123; else if b &#125;&#125;B&#123;&#123; else &#125;&#125;C&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Equality Check</td>
+                  <td><code>#if(type == "gym"):...#endif</code></td>
+                  <td><code>&#123;&#123; if type == "gym" &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Boolean AND/OR</td>
+                  <td><code>#if(a != nil &amp;&amp; b):...#endif</code></td>
+                  <td><code>&#123;&#123; if a != nil &amp;&amp; b &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Loop</td>
+                  <td><code>#for(item in items):...#endfor</code></td>
+                  <td><code>&#123;&#123; range i, item := items &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Loop with Index</td>
+                  <td><code>#for(item in items):#if(index != 0):,#endif#(item)#endfor</code></td>
+                  <td><code>&#123;&#123; range i, item := items &#125;&#125;&#123;&#123; if i != 0 &#125;&#125;,&#123;&#123; end &#125;&#125;&#123;&#123; item &#125;&#125;&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Array Index Access</td>
+                  <td><code>#index(array, 0)</code></td>
+                  <td><code>&#123;&#123; index(array, 0) &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Parse JSON String</td>
+                  <td>N/A</td>
+                  <td><code>&#123;&#123; json(stringVar) &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>Inline Value</td>
+                  <td><code>"url": "#(imgUrl)"</code></td>
+                  <td><code>"url": "&#123;&#123; imgUrl &#125;&#125;"</code></td>
+                </tr>
+                <tr>
+                  <td>Conditional Value</td>
+                  <td>N/A</td>
+                  <td><code>&#123;&#123; if cond &#125;&#125;A&#123;&#123; else &#125;&#125;B&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="text-info mb-0">
+              <i class="fas fa-info-circle"></i>
+              <strong>Note:</strong> Jet complete syntax docs are <a href="https://github.com/CloudyKit/jet/blob/master/docs/syntax.md" target="_blank">here.</a>
+            </p>
+            <p class="text-warning mb-0 mt-2">
+              <i class="fas fa-exclamation-triangle"></i>
+              <strong>Tip:</strong> If a variable contains a JSON string (e.g. <code>poly_path</code>), use <code>json(poly_path)</code> to parse it before iterating: <code>&#123;&#123; range i, item := json(poly_path) &#125;&#125;</code>
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{{end}}

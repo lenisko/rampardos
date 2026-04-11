@@ -1,0 +1,25 @@
+{{template "base" .}}
+
+{{define "content"}}
+<h1 align="center">Add Local Style</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <form action="/admin/api/styles/local/add" method="POST" enctype="multipart/form-data">
+        <div class="mb-3">
+            <label for="id" class="form-label">Style ID</label>
+            <input type="text" class="form-control" id="id" name="id" required>
+        </div>
+        <div class="mb-3">
+            <label for="name" class="form-label">Style Name</label>
+            <input type="text" class="form-control" id="name" name="name" required>
+        </div>
+        <div class="mb-3">
+            <label for="zip" class="form-label">Style ZIP File</label>
+            <input type="file" class="form-control" id="zip" name="zip" accept=".zip" required>
+            <small class="form-text text-muted">ZIP should contain style.json, sprite.json, sprite.png, sprite@2x.json, sprite@2x.png</small>
+        </div>
+        <button type="submit" class="btn btn-primary">Upload</button>
+        <a href="/admin/styles" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{{end}}

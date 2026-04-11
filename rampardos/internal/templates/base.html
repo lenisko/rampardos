@@ -1,0 +1,176 @@
+{{define "base"}}
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+    <head>
+        <title>Rampardos{{if .PageName}} - {{.PageName}}{{end}}</title>
+
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+<link rel="stylesheet" href="/static/css/fontawesome.min.css">
+        <link rel="stylesheet" href="/static/css/bootstrap.min.css">
+        <link rel="stylesheet" href="/static/css/datatables.min.css">
+        {{template "stylesheets" .}}
+
+        <script src="/static/js/jquery.min.js"></script>
+        <script src="/static/js/bootstrap.bundle.min.js"></script>
+        <script src="/static/js/datatables.min.js"></script>
+        <script src="/static/js/ace.min.js"></script>
+        <script src="/static/js/mode-json.min.js"></script>
+        <script src="/static/js/theme-monokai.min.js"></script>
+        <script src="/static/js/theme-chrome.min.js"></script>
+        <script src="/static/js/chart.umd.min.js"></script>
+        {{template "scripts" .}}
+    </head>
+
+    <body>
+        <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+            <div class="container-fluid">
+                <a class="navbar-brand d-flex align-items-center" href="/">Rampardos</a>
+                <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarText" aria-controls="navbarText" aria-expanded="false" aria-label="Toggle navigation">
+                    <span class="navbar-toggler-icon"></span>
+                </button>
+                <div class="collapse navbar-collapse" id="navbarText">
+                    <ul class="navbar-nav me-auto">
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "datasets"}} active{{end}}" href="/admin/datasets">Datasets</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "styles"}} active{{end}}" href="/admin/styles">Styles</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "fonts"}} active{{end}}" href="/admin/fonts">Fonts</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link{{if eq .PageID "templates"}} active{{end}}" href="/admin/templates">Templates</a>
+                        </li>
+                    </ul>
+                <div class="navbar-nav flex-row gap-2 mt-3 mt-lg-0">
+                    <button id="themeToggle" class="btn btn-sm btn-outline-secondary" onclick="toggleTheme()" title="Toggle Light Mode">
+                        <i id="themeIcon" class="fas fa-sun"></i>
+                    </button>
+                    <button id="debugToggle" class="btn btn-sm {{if .DebugEnabled}}btn-warning{{else}}btn-outline-secondary{{end}}" onclick="toggleDebug()" title="Toggle Console Debug Logging">
+                        <i class="fas fa-bug"></i> <span id="debugStatus">Debug</span>
+                    </button>
+                </div>
+                </div>
+            </div>
+        </nav>
+        <script>
+            function updateDebugButton(enabled) {
+                var btn = document.getElementById('debugToggle');
+                var status = document.getElementById('debugStatus');
+                if (enabled) {
+                    btn.className = 'btn btn-sm btn-warning';
+                    status.textContent = 'Debug';
+                } else {
+                    btn.className = 'btn btn-sm btn-outline-secondary';
+                    status.textContent = 'Debug';
+                }
+            }
+
+            function toggleDebug() {
+                $.ajax({
+                    type: "POST",
+                    url: "/admin/api/settings/debug/toggle",
+                    success: function(response) {
+                        updateDebugButton(response.enabled);
+                    },
+                    error: function() {
+                        showToast('Failed to toggle debug mode', 'danger');
+                    }
+                });
+            }
+
+            function toggleTheme() {
+                var html = document.documentElement;
+                var icon = document.getElementById('themeIcon');
+                var isDark = html.getAttribute('data-bs-theme') === 'dark';
+                if (isDark) {
+                    html.setAttribute('data-bs-theme', 'light');
+                    icon.className = 'fas fa-moon';
+                    localStorage.setItem('theme', 'light');
+                } else {
+                    html.setAttribute('data-bs-theme', 'dark');
+                    icon.className = 'fas fa-sun';
+                    localStorage.setItem('theme', 'dark');
+                }
+                // Dispatch event for Ace editors to update theme
+                window.dispatchEvent(new CustomEvent('themeChanged', { detail: { dark: !isDark } }));
+            }
+
+            // Apply saved theme on load
+            (function() {
+                var savedTheme = localStorage.getItem('theme') || 'dark';
+                document.documentElement.setAttribute('data-bs-theme', savedTheme);
+                if (savedTheme === 'light') {
+                    document.getElementById('themeIcon').className = 'fas fa-moon';
+                }
+            })();
+
+            // Global toast notification
+            function showToast(message, type) {
+                var toastEl = document.getElementById('global-toast');
+                var toastBody = toastEl.querySelector('.toast-body');
+                toastBody.textContent = message;
+                toastEl.classList.remove('text-bg-success', 'text-bg-danger', 'text-bg-warning', 'text-bg-info');
+                toastEl.classList.add('text-bg-' + (type || 'danger'));
+                var toast = new bootstrap.Toast(toastEl, { delay: type === 'success' ? 3000 : 5000 });
+                toast.show();
+            }
+
+            // Global confirm dialog
+            var confirmCallback = null;
+            function showConfirm(message, callback) {
+                confirmCallback = callback;
+                document.getElementById('confirm-message').textContent = message;
+                new bootstrap.Modal(document.getElementById('confirm-modal')).show();
+            }
+            function confirmYes() {
+                bootstrap.Modal.getInstance(document.getElementById('confirm-modal')).hide();
+                if (confirmCallback) confirmCallback();
+            }
+        </script>
+        <div class="toast-container position-fixed top-0 start-50 translate-middle-x p-3">
+            <div id="global-toast" class="toast align-items-center border-0" role="alert" aria-live="assertive" aria-atomic="true">
+                <div class="d-flex">
+                    <div class="toast-body"></div>
+                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                </div>
+            </div>
+        </div>
+        <!-- Confirm Modal -->
+        <div class="modal fade" id="confirm-modal" tabindex="-1">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title"><i class="fas fa-question-circle"></i> Confirm</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p id="confirm-message"></p>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-danger" onclick="confirmYes()">Confirm</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <br>
+        {{template "content" .}}
+        <br>
+    </body>
+</html>
+{{end}}
+
+{{define "stylesheets"}}
+<style>
+    table .btn-group { max-width: 120px; }
+    table .btn-group .btn { flex: 1; }
+    .dt-search { margin-bottom: 1rem; }
+    .dt-info, .dt-paging { margin-top: 1rem; }
+</style>
+{{end}}
+{{define "scripts"}}{{end}}
+{{define "content"}}{{end}}

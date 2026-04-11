@@ -1,0 +1,105 @@
+{{template "base" .}}
+
+{{define "scripts"}}
+<script>
+    $(document).ready(function() {
+        $('#table').DataTable({
+            ordering: true,
+            paging: true,
+            pageLength: 20,
+            drawCallback: function(settings) {
+                var wrapper = $(this).closest('.dt-container');
+                var singlePage = this.api().page.info().pages <= 1;
+                wrapper.find('.dt-paging').toggle(!singlePage);
+                wrapper.find('.dt-info').toggle(!singlePage);
+            },
+            dom: 'Bfrtip',
+            buttons: {
+                buttons: [{
+                    text: 'Add Font',
+                    className: 'btn-success',
+                    action: function () {
+                        window.location = '/admin/fonts/add'
+                    }
+                }],
+                dom: {
+                    button: {
+                        className: 'btn'
+                    }
+                }
+            }
+        })
+    })
+
+    function deleteFont(name) {
+        $.ajax({
+            type: "DELETE",
+            url: "/admin/api/fonts/delete/" + name,
+            success: function() {
+                window.location.reload()
+            },
+            error: function(data, error, errorText) {
+                showToast('Failed to delete Font: ' + (data.responseJSON ? data.responseJSON.reason : errorText), 'danger')
+            }
+        })
+        return false
+    }
+
+    $(document).ready(function() {
+        $('.font-sample').each(function() {
+            var el = $(this);
+            var fontName = el.data('font');
+            
+            document.fonts.load('18px "' + fontName + '"').then(function(fonts) {
+                if (fonts.length > 0) {
+                    el.css({'font-family': '"' + fontName + '", sans-serif', 'font-size': '18px'});
+                    el.text('Sample Text');
+                } else {
+                    el.addClass('text-muted').text('Missing ttf sample');
+                }
+            }).catch(function() {
+                el.addClass('text-muted').text('Missing ttf sample');
+            });
+        });
+    });
+</script>
+{{end}}
+
+{{define "content"}}
+<style>
+{{range .Fonts}}
+@font-face {
+    font-family: 'preview-{{.}}';
+    src: url('/admin/api/fonts/file/{{.}}');
+}
+{{end}}
+</style>
+<h1 align="center">Fonts</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <table style="width:100%;" id="table" class="table table-striped table-bordered dt-responsive nowrap">
+        <thead>
+            <tr>
+                <th>Font</th>
+                <th>Sample</th>
+                <th style="width: 100px">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {{range .Fonts}}
+            <tr>
+                <td style="vertical-align:middle">
+                    {{.}}
+                </td>
+                <td style="vertical-align:middle">
+                    <span class="font-sample" data-font="preview-{{.}}">Loading...</span>
+                </td>
+                <td style="vertical-align:middle">
+                    <button role="button" class="btn btn-danger" onclick="deleteFont('{{.}}')">Delete</button>
+                </td>
+            </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+{{end}}

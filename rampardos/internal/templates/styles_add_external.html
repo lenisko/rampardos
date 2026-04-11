@@ -1,0 +1,52 @@
+{{template "base" .}}
+
+{{define "scripts"}}
+<script>
+    function addExternalStyle() {
+        var data = {
+            id: $('#id').val(),
+            name: $('#name').val(),
+            url: $('#url').val(),
+            external: true
+        };
+        
+        $.ajax({
+            type: "POST",
+            url: "/admin/api/styles/external/add",
+            data: JSON.stringify(data),
+            contentType: "application/json",
+            success: function() {
+                window.location = '/admin/styles'
+            },
+            error: function(data, error, errorText) {
+                showToast('Failed to add Style: ' + (data.responseJSON ? data.responseJSON.reason : errorText), 'danger')
+            }
+        })
+        return false
+    }
+</script>
+{{end}}
+
+{{define "content"}}
+<h1 align="center">Add External Style</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <form onsubmit="return addExternalStyle()">
+        <div class="mb-3">
+            <label for="id" class="form-label">Style ID</label>
+            <input type="text" class="form-control" id="id" name="id" required>
+        </div>
+        <div class="mb-3">
+            <label for="name" class="form-label">Style Name</label>
+            <input type="text" class="form-control" id="name" name="name" required>
+        </div>
+        <div class="mb-3">
+            <label for="url" class="form-label">Tile URL Template</label>
+            <input type="text" class="form-control" id="url" name="url" placeholder="https://example.com/{z}/{x}/{y}.png" required>
+            <small class="form-text text-muted">Use {z}, {x}, {y}, {scale}, {@scale}, {format} as placeholders</small>
+        </div>
+        <button type="submit" class="btn btn-primary">Add</button>
+        <a href="/admin/styles" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{{end}}

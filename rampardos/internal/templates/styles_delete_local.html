@@ -1,0 +1,31 @@
+{{template "base" .}}
+
+{{define "scripts"}}
+<script>
+    function deleteLocalStyle() {
+        $.ajax({
+            type: "DELETE",
+            url: "/admin/api/styles/local/{{.ID}}",
+            success: function() {
+                window.location = '/admin/styles'
+            },
+            error: function(data, error, errorText) {
+                showToast('Failed to delete Style: ' + (data.responseJSON ? data.responseJSON.reason : errorText), 'danger')
+            }
+        })
+        return false
+    }
+</script>
+{{end}}
+
+{{define "content"}}
+<h1 align="center">Delete Local Style</h1>
+<br>
+<div style="width:90%; margin-left: 5%; margin-right: 5%">
+    <p>Are you sure you want to delete style <strong>{{.ID}}</strong>?</p>
+    <form onsubmit="return deleteLocalStyle()">
+        <button type="submit" class="btn btn-danger">Delete</button>
+        <a href="/admin/styles" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{{end}}
