@@ -1,6 +1,6 @@
 services:
   rampardos:
-    image: ghcr.io/jfberry/rampardos:latest
+    image: ghcr.io/lenisko/rampardos:latest
     container_name: rampardos
     restart: unless-stopped
     tty: true

@@ -62,7 +62,7 @@ RUN npm install --omit=optional \
 # ================================
 # Build Go binary
 # ================================
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS rampardos-build
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS rampardos-build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -152,7 +152,7 @@ EXPOSE 9000
 COPY <<'EOF' /app/entrypoint.sh
 #!/bin/sh
 rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
-Xvfb :0 -screen 0 1024x768x24 -nolisten tcp &
+Xvfb :0 -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
 sleep 0.5
 exec /app/rampardos "$@"
 EOF
