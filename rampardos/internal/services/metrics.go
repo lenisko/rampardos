@@ -107,7 +107,7 @@ func newMetricsManager() *MetricsManager {
 			Name:    "rampardos_request_duration_seconds",
 			Help:    "Request duration in seconds",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0},
-		}, []string{"type", "cached"}),
+		}, []string{"type", "style", "cached"}),
 
 		requestsInFlight: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_requests_in_flight",
@@ -308,7 +308,7 @@ func (m *MetricsManager) RecordRequest(reqType, style string, cached bool, durat
 		m.cacheMissTotal.WithLabelValues(reqType).Inc()
 	}
 
-	m.requestDuration.WithLabelValues(reqType, cachedStr).Observe(duration)
+	m.requestDuration.WithLabelValues(reqType, style, cachedStr).Observe(duration)
 }
 
 // IncrementInFlight increments the in-flight counter for a request type
