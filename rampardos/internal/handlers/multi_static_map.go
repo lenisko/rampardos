@@ -207,7 +207,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	h.statsController.StaticMapServed(true, path, "multi")
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
-	if skipCache {
+	if skipCache && r.URL.Query().Get("pregenerate") != "true" {
 		slog.Debug("Served multi-static map (nocache)", "maps", mapCount, "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)
