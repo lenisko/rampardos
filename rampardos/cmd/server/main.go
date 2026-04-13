@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -310,6 +312,32 @@ func main() {
 	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
 		http.Redirect(w, req, "/admin/stats", http.StatusFound)
 	})
+
+	// Handle SIGHUP for graceful reload (templates, renderer pools, tile cache).
+	// Triggered via: docker kill -s HUP <container> or kill -HUP <pid>
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			slog.Info("SIGHUP received, reloading...")
+
+			// Reload templates from disk
+			if err := services.GlobalJetRenderer.LoadTemplatesFromDisk(); err != nil {
+				slog.Error("Failed to reload templates", "error", err)
+			} else {
+				slog.Info("Templates reloaded")
+			}
+
+			// Reload renderer pools (picks up new styles, refreshes mbtiles)
+			reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
+				slog.Error("Failed to reload renderer", "error", err)
+			} else {
+				slog.Info("Renderer pools reloaded")
+			}
+			cancel()
+		}
+	}()
 
 	// Start server
 	addr := cfg.Hostname + ":" + cfg.Port
