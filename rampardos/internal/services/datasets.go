@@ -173,8 +173,7 @@ func (dc *DatasetsController) GetDatasets() ([]string, error) {
 		if entry.IsDir() {
 			continue
 		}
-		if strings.HasSuffix(entry.Name(), ".mbtiles") {
-			name := strings.TrimSuffix(entry.Name(), ".mbtiles")
+		if name, ok := strings.CutSuffix(entry.Name(), ".mbtiles"); ok {
 			datasets = append(datasets, name)
 		}
 	}
@@ -202,9 +201,9 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 	if err != nil {
 		return fmt.Errorf("invalid dataset name: %w", err)
 	}
-	
+
 	path := filepath.Join(dc.listFolder, sanitized+".mbtiles")
-	
+
 	// Check if file exists before attempting deletion
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		// File doesn't exist, but we should still clean up any orphaned entries
@@ -221,7 +220,7 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 	dc.mu.Lock()
 	// Remove from uncombined markers
 	delete(dc.uncombined, sanitized)
-	
+
 	// Check if this was the active dataset
 	wasActive := dc.activeDataset == sanitized
 	dc.mu.Unlock()
@@ -240,13 +239,13 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 		} else {
 			slog.Info("Removed Combined.mbtiles symlink for deleted active dataset", "name", sanitized)
 		}
-		
+
 		// Update state
 		dc.mu.Lock()
 		dc.activeDataset = ""
 		dc.isCombined = false
 		dc.mu.Unlock()
-		
+
 		// Reload tileserver to reflect changes
 		dc.reloadAfterDatasetChange()
 	}

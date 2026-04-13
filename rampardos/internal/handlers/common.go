@@ -21,6 +21,34 @@ func ensureDir(dir string) {
 	knownDirs.Store(dir, struct{}{})
 }
 
+// atomicWriteFile writes data to a temporary file then renames it to
+// the target path. os.Rename is atomic on POSIX, so readers never see
+// a partially-written file. This prevents corruption when multiple
+// goroutines race to generate the same cached file.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	ensureDir(filepath.Dir(path))
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	f.Close()
+	if err := os.Chmod(tmp, perm); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // serveFile serves a file with cache headers
 func serveFile(w http.ResponseWriter, r *http.Request, path string) {
 	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
@@ -39,9 +67,9 @@ func handlePregenerateResponse(w http.ResponseWriter, r *http.Request, path stri
 	if regeneratable {
 		regeneratablePath := fmt.Sprintf("Cache/Regeneratable/%s.json", filepath.Base(path))
 		if _, err := os.Stat(regeneratablePath); os.IsNotExist(err) {
-			ensureDir(filepath.Dir(regeneratablePath))
-			jsonData, _ := json.Marshal(data)
-			os.WriteFile(regeneratablePath, jsonData, 0644)
+			if jsonData, err := json.Marshal(data); err == nil {
+				atomicWriteFile(regeneratablePath, jsonData, 0644)
+			}
 		}
 	}
 

@@ -89,10 +89,7 @@ func (ft *FileToucher) runOnce() {
 
 	// Process in batches
 	for i := 0; i < len(currentQueue); i += touchBatchSize {
-		end := i + touchBatchSize
-		if end > len(currentQueue) {
-			end = len(currentQueue)
-		}
+		end := min(i+touchBatchSize, len(currentQueue))
 		batch := currentQueue[i:end]
 
 		for _, path := range batch {

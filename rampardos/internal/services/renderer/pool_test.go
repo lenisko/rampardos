@@ -32,10 +32,8 @@ func TestPoolServialisesRequests(t *testing.T) {
 	// return the canned payload.
 	var wg sync.WaitGroup
 	errs := make(chan error, 20)
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 20 {
+		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			payload, err := pool.dispatch(ctx, []byte(`{"zoom":14}`))
@@ -47,7 +45,7 @@ func TestPoolServialisesRequests(t *testing.T) {
 				errs <- errPayload(payload)
 				return
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -77,7 +75,7 @@ func TestPoolRecyclesAfterLifetime(t *testing.T) {
 	defer pool.close()
 
 	pids := map[int]bool{}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_, err := pool.dispatch(ctx, []byte(`{}`))
 		cancel()

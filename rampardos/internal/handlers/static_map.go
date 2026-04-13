@@ -19,6 +19,7 @@ import (
 	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/services/renderer"
 	"github.com/lenisko/rampardos/internal/utils"
+	"golang.org/x/sync/singleflight"
 )
 
 // stylesControllerGetExternal is the subset of StylesController used by
@@ -35,6 +36,7 @@ type StaticMapHandler struct {
 	statsController   *services.StatsController
 	stylesController  stylesControllerGetExternal
 	sphericalMercator *utils.SphericalMercator
+	sfg               singleflight.Group // dedup concurrent generates for same path
 
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
@@ -134,23 +136,27 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 	h.handlePregeneratedRequest(w, r, id)
 }
 
-// GenerateStaticMap generates a static map (used by MultiStaticMapHandler)
+// GenerateStaticMap generates a static map (used by MultiStaticMapHandler).
+// Concurrent requests for the same map are deduplicated via singleflight.
 func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap) error {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
-	// Check if already exists
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
 
-	// Check if base exists
-	baseExists := false
-	if _, err := os.Stat(basePath); err == nil {
-		baseExists = true
-	}
-
-	return h.generateStaticMap(ctx, path, basePath, baseExists, staticMap)
+	_, err, _ := h.sfg.Do(path, func() (any, error) {
+		if _, err := os.Stat(path); err == nil {
+			return nil, nil
+		}
+		baseExists := false
+		if _, err := os.Stat(basePath); err == nil {
+			baseExists = true
+		}
+		return nil, h.generateStaticMap(ctx, path, basePath, baseExists, staticMap)
+	})
+	return err
 }
 
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
@@ -211,22 +217,31 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Check if base exists (use cache index first)
-	baseExists := false
-	if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(basePath) {
-		baseExists = true
-	} else if _, err := os.Stat(basePath); err == nil {
-		baseExists = true
-		if services.GlobalCacheIndex != nil {
-			services.GlobalCacheIndex.AddStaticMap(basePath)
+	// Deduplicate concurrent requests for the same static map via
+	// singleflight. Two poracle webhooks for the same spawn arriving
+	// simultaneously will only generate once.
+	_, genErr, _ := h.sfg.Do(path, func() (any, error) {
+		// Double-check cache inside singleflight.
+		if _, err := os.Stat(path); err == nil {
+			return nil, nil
 		}
-	}
 
-	// Generate
-	if err := h.generateStaticMap(r.Context(), path, basePath, baseExists, staticMap); err != nil {
-		slog.Error("Failed to generate static map", "error", err)
+		baseExists := false
+		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(basePath) {
+			baseExists = true
+		} else if _, err := os.Stat(basePath); err == nil {
+			baseExists = true
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.AddStaticMap(basePath)
+			}
+		}
+		return nil, h.generateStaticMap(r.Context(), path, basePath, baseExists, staticMap)
+	})
+
+	if genErr != nil {
+		slog.Error("Failed to generate static map", "error", genErr)
 		services.GlobalMetrics.RecordError("staticmap", "generation_failed")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, genErr.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -324,7 +339,7 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 			if err != nil {
 				return err
 			}
-			return os.WriteFile(path, data, 0644)
+			return atomicWriteFile(path, data, 0644)
 		}
 		return nil
 	}
@@ -398,7 +413,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 	}
 
 	ensureDir(filepath.Dir(basePath))
-	if err := os.WriteFile(basePath, encoded, 0o644); err != nil {
+	if err := atomicWriteFile(basePath, encoded, 0o644); err != nil {
 		return fmt.Errorf("write base path: %w", err)
 	}
 	return nil
@@ -466,7 +481,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 			}()
 		}
 	}
-	for j := 0; j < totalTiles; j++ {
+	for range totalTiles {
 		slot := <-results
 		if slot.err != nil {
 			return fmt.Errorf("failed to generate tile: %w", slot.err)
