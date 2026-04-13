@@ -91,11 +91,11 @@
         $('#reload-btn').prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Reloading...');
         $.post('/admin/api/datasets/reload-tileserver')
             .done(function() {
-                $('#reload-btn').prop('disabled', false).html('<i class="fas fa-sync"></i> Reload Tileserver');
+                $('#reload-btn').prop('disabled', false).html('<i class="fas fa-sync"></i> Reload Styles');
                 showToast('Tileserver reloaded successfully', 'success');
             })
             .fail(function(xhr) {
-                $('#reload-btn').prop('disabled', false).html('<i class="fas fa-sync"></i> Reload Tileserver');
+                $('#reload-btn').prop('disabled', false).html('<i class="fas fa-sync"></i> Reload Styles');
                 showToast('Reload failed: ' + xhr.responseText, 'danger');
             });
     }
@@ -226,7 +226,7 @@
             <span><i class="fas fa-layer-group"></i> Select datasets to combine, or click <i class="fas fa-check"></i> to activate a single one:</span>
             <div>
                 <button id="reload-btn" class="btn btn-info me-2" onclick="reloadTileserver()">
-                    <i class="fas fa-sync"></i> Reload Tileserver
+                    <i class="fas fa-sync"></i> Reload Styles
                 </button>
                 <button id="combine-btn" class="btn btn-warning" onclick="combineSelected()" disabled>
                     <i class="fas fa-layer-group"></i> Combine Selected

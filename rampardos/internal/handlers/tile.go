@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -13,19 +14,20 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 )
 
 // TileHandler handles tile requests
 type TileHandler struct {
-	tileServerURL    string
+	renderer         renderer.Renderer
 	statsController  *services.StatsController
-	stylesController *services.StylesController
+	stylesController stylesControllerGetExternal
 }
 
 // NewTileHandler creates a new tile handler
-func NewTileHandler(tileServerURL string, statsController *services.StatsController, stylesController *services.StylesController) *TileHandler {
+func NewTileHandler(r renderer.Renderer, statsController *services.StatsController, stylesController *services.StylesController) *TileHandler {
 	return &TileHandler{
-		tileServerURL:    tileServerURL,
+		renderer:         r,
 		statsController:  statsController,
 		stylesController: stylesController,
 	}
@@ -89,31 +91,40 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 		return &TileResult{Path: path, Cached: true}, nil
 	}
 
-	// Build tile URL
-	var tileURL string
+	// External styles: download from remote URL template.
 	if extStyle := h.stylesController.GetExternalStyle(style); extStyle != nil {
 		scaleString := ""
 		if scale != 1 {
 			scaleString = fmt.Sprintf("@%dx", scale)
 		}
-		tileURL = extStyle.URL
+		tileURL := extStyle.URL
 		tileURL = strings.ReplaceAll(tileURL, "{z}", strconv.Itoa(z))
 		tileURL = strings.ReplaceAll(tileURL, "{x}", strconv.Itoa(x))
 		tileURL = strings.ReplaceAll(tileURL, "{y}", strconv.Itoa(y))
 		tileURL = strings.ReplaceAll(tileURL, "{scale}", strconv.FormatUint(uint64(scale), 10))
 		tileURL = strings.ReplaceAll(tileURL, "{@scale}", scaleString)
 		tileURL = strings.ReplaceAll(tileURL, "{format}", string(format))
-	} else {
-		scaleString := ""
-		if scale != 1 {
-			scaleString = fmt.Sprintf("@%dx", scale)
+
+		if err := services.DownloadFile(ctx, tileURL, path, "image", 0); err != nil {
+			return nil, fmt.Errorf("failed to load tile: %s (%w)", tileURL, err)
 		}
-		tileURL = fmt.Sprintf("%s/styles/%s/%d/%d/%d%s.%s", h.tileServerURL, style, z, x, y, scaleString, format)
+		h.statsController.TileServed(true, path, style)
+		return &TileResult{Path: path, Cached: false}, nil
 	}
 
-	// Download tile (0 = use client default timeout)
-	if err := services.DownloadFile(ctx, tileURL, path, "image", 0); err != nil {
-		return nil, fmt.Errorf("failed to load tile: %s (%w)", tileURL, err)
+	// Local styles: render in-process via the Renderer.
+	encoded, err := h.renderer.Render(ctx, renderer.Request{
+		StyleID: style,
+		Z:       z, X: x, Y: y,
+		Scale:  scale,
+		Format: format,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to render tile %s/%d/%d/%d: %w", style, z, x, y, err)
+	}
+	ensureDir(filepath.Dir(path))
+	if err := os.WriteFile(path, encoded, 0o644); err != nil {
+		return nil, fmt.Errorf("write tile cache: %w", err)
 	}
 
 	h.statsController.TileServed(true, path, style)

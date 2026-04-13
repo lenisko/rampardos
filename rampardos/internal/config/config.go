@@ -8,16 +8,22 @@ import (
 
 // Config holds application configuration
 type Config struct {
-	TileServerURL  string
 	Port           string
 	Hostname       string
 	RequestTimeout time.Duration
 
+	// Renderer settings
+	RendererBackend        string        // "node-pool"
+	RendererNodeBinary     string        // path to node
+	RendererWorkerScript   string        // path to render-worker.js
+	RendererPoolSize       int           // concurrent workers per style
+	RendererRenderTimeout  time.Duration // per-render deadline
+	RendererWorkerLifetime int           // renders per worker before recycle
+	RendererStartupTimeout time.Duration // max handshake wait
+
 	// HTTP client settings
-	HTTPMaxConns           int
-	HTTPTileserverMaxConns int
-	HTTPTimeout            time.Duration // General HTTP timeout (0 = unlimited)
-	HTTPTileserverTimeout  time.Duration // Tileserver-specific timeout
+	HTTPMaxConns  int
+	HTTPTimeout   time.Duration // General HTTP timeout (0 = unlimited)
 
 	// Cache settings
 	TileCacheMaxAge      *uint32
@@ -35,15 +41,6 @@ type Config struct {
 	RegenCacheMaxAge     *uint32
 	RegenCacheDelay      *uint32
 	RegenCacheDropAfter  *uint32
-
-	// Tileserver reload settings
-	TileServerContainer string // Docker container name for SIGHUP reload (empty = disabled)
-
-	// Tileserver health monitor settings
-	TileServerMonitorEnabled   bool
-	TileServerMonitorInterval  time.Duration
-	TileServerMonitorTimeout   time.Duration
-	TileServerMonitorThreshold int
 
 	// Image processing settings
 	DefaultImageFormat   string // "png", "jpeg", or "webp" (default: png)
@@ -69,15 +66,20 @@ type Config struct {
 // Load loads configuration from environment variables
 func Load() *Config {
 	cfg := &Config{
-		TileServerURL:  getEnv("TILE_SERVER_URL", ""),
 		Port:           getEnv("PORT", "9000"),
 		Hostname:       getEnv("HOSTNAME", "0.0.0.0"),
 		RequestTimeout: getEnvDuration("REQUEST_TIMEOUT", 10*time.Second),
 
-		HTTPMaxConns:           getEnvInt("HTTP_MAX_CONNS", 100),
-		HTTPTileserverMaxConns: getEnvInt("HTTP_TILESERVER_MAX_CONNS", 10),
-		HTTPTimeout:            getEnvSeconds("HTTP_TIMEOUT_SECONDS", 15), // 0 = unlimited
-		HTTPTileserverTimeout:  getEnvSeconds("HTTP_TILESERVER_TIMEOUT_SECONDS", 90),
+		RendererBackend:        getEnv("RENDERER_BACKEND", "node-pool"),
+		RendererNodeBinary:     getEnv("RENDERER_NODE_BINARY", "node"),
+		RendererWorkerScript:   getEnv("RENDERER_WORKER_SCRIPT", "/app/render-worker/render-worker.js"),
+		RendererPoolSize:       getEnvInt("RENDERER_POOL_SIZE", 0),
+		RendererRenderTimeout:  getEnvSeconds("RENDERER_TIMEOUT_SECONDS", 15),
+		RendererWorkerLifetime: getEnvInt("RENDERER_WORKER_LIFETIME", 500),
+		RendererStartupTimeout: getEnvSeconds("RENDERER_STARTUP_TIMEOUT_SECONDS", 10),
+
+		HTTPMaxConns: getEnvInt("HTTP_MAX_CONNS", 100),
+		HTTPTimeout:  getEnvSeconds("HTTP_TIMEOUT_SECONDS", 15), // 0 = unlimited
 
 		TileCacheMaxAge:      getEnvUint32("TILE_CACHE_MAX_AGE_MINUTES", 10080),
 		TileCacheDelay:       getEnvUint32("TILE_CACHE_DELAY_SECONDS", 3600),
@@ -94,13 +96,6 @@ func Load() *Config {
 		RegenCacheMaxAge:     getEnvUint32("REGENERATABLE_CACHE_MAX_AGE_MINUTES", 10080),
 		RegenCacheDelay:      getEnvUint32("REGENERATABLE_CACHE_DELAY_SECONDS", 3600),
 		RegenCacheDropAfter:  getEnvUint32("REGENERATABLE_CACHE_DROP_AFTER_MINUTES", 129600),
-
-		TileServerContainer: getEnv("TILESERVER_CONTAINER", ""),
-
-		TileServerMonitorEnabled:   getEnvBool("TILESERVER_MONITOR_ENABLED", false),
-		TileServerMonitorInterval:  getEnvSeconds("TILESERVER_MONITOR_INTERVAL_SECONDS", 30),
-		TileServerMonitorTimeout:   getEnvSeconds("TILESERVER_MONITOR_TIMEOUT_SECONDS", 10),
-		TileServerMonitorThreshold: getEnvInt("TILESERVER_MONITOR_THRESHOLD", 3),
 
 		DefaultImageFormat:   getEnv("DEFAULT_IMAGE_FORMAT", "png"),
 		OverrideClientFormat: getEnvBool("OVERRIDE_CLIENT_FORMAT", false),

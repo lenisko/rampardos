@@ -1,13 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -21,6 +23,7 @@ import (
 	custommw "github.com/lenisko/rampardos/internal/middleware"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 	"github.com/lenisko/rampardos/internal/static"
 )
 
@@ -30,10 +33,6 @@ func main() {
 
 	// Initialize runtime settings (includes logging setup)
 	services.InitGlobalRuntimeSettings(false)
-	if cfg.TileServerURL == "" {
-		slog.Error("TILE_SERVER_URL environment not set. Exiting...")
-		os.Exit(1)
-	}
 
 	slog.Info("Configuration loaded", "timeout", cfg.RequestTimeout, "debug", false)
 
@@ -86,23 +85,60 @@ func main() {
 
 	statsController := services.NewStatsController(fileToucher)
 	fontsController := services.NewFontsController("TileServer/Fonts", "Temp")
-	stylesController := services.NewStylesController(cfg.TileServerURL, externalStyles, "TileServer/Styles", fontsController)
+	stylesController := services.NewStylesController(externalStyles, "TileServer/Styles", fontsController)
 
-	// Create tileserver reload function (sends SIGHUP to docker container)
-	var reloadTileserver func() error
-	if cfg.TileServerContainer != "" {
-		containerName := cfg.TileServerContainer
-		reloadTileserver = func() error {
-			cmd := exec.Command("docker", "kill", "-s", "HUP", containerName)
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("docker kill failed: %s - %w", string(output), err)
-			}
-			return nil
+	// Initialize the renderer (spawns Node worker pools).
+	rendererCfg := renderer.Config{
+		Backend:        cfg.RendererBackend,
+		NodeBinary:     cfg.RendererNodeBinary,
+		WorkerScript:   cfg.RendererWorkerScript,
+		PoolSize:       cfg.RendererPoolSize,
+		RenderTimeout:  cfg.RendererRenderTimeout,
+		WorkerLifetime: cfg.RendererWorkerLifetime,
+		StartupTimeout: cfg.RendererStartupTimeout,
+		StylesDir:      absPath("TileServer/Styles"),
+		FontsDir:       absPath("TileServer/Fonts"),
+		MbtilesFile:    absPath("TileServer/Datasets/Combined.mbtiles"),
+		// DiscoverStyles re-scans the disk each time it's called, so
+		// new style directories added after startup are picked up on
+		// ReloadStyles (admin "Reload Styles" button or dataset change).
+		DiscoverStyles: func() ([]string, error) {
+			return stylesController.GetLocalStyleIDs()
+		},
+	}
+	localStyleIDs, _ := rendererCfg.DiscoverStyles()
+	renderEngine, err := renderer.NewNodePoolRenderer(rendererCfg, renderer.DefaultSpawnFactory(rendererCfg))
+	if err != nil {
+		slog.Error("Failed to initialise renderer", "error", err)
+		os.Exit(1)
+	}
+	defer renderEngine.Close()
+
+	// Canary render: ensures the pool is live before we bind HTTP port.
+	if len(localStyleIDs) > 0 {
+		canaryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := renderEngine.Render(canaryCtx, renderer.Request{
+			StyleID: localStyleIDs[0],
+			Z: 0, X: 0, Y: 0,
+			Scale:  1,
+			Format: models.ImageFormatPNG,
+		}); err != nil {
+			slog.Error("Startup canary render failed", "error", err)
+			os.Exit(1)
 		}
-		slog.Info("Tileserver reload enabled", "container", cfg.TileServerContainer)
+		slog.Info("Renderer canary passed", "style", localStyleIDs[0])
 	}
 
+	// Dataset reload callback: rebuild pools and drop the tile cache.
+	reloadTileserver := func() error {
+		reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
+			return fmt.Errorf("renderer reload: %w", err)
+		}
+		return nil
+	}
 	datasetsController := services.NewDatasetsController("TileServer/Datasets", reloadTileserver)
 	templatesController := services.NewTemplatesController("Templates")
 
@@ -124,24 +160,13 @@ func main() {
 	// Initialize cache cleaners
 	initCacheCleaners(cfg)
 
-	// Initialize tileserver health monitor
-	if cfg.TileServerMonitorEnabled {
-		monitor := services.NewTileserverMonitor(
-			cfg.TileServerURL,
-			cfg.TileServerMonitorInterval,
-			cfg.TileServerMonitorTimeout,
-			cfg.TileServerMonitorThreshold,
-		)
-		monitor.Start()
-	}
-
 	// Initialize handlers
-	tileHandler := handlers.NewTileHandler(cfg.TileServerURL, statsController, stylesController)
-	staticMapHandler := handlers.NewStaticMapHandler(cfg.TileServerURL, tileHandler, statsController, stylesController)
+	tileHandler := handlers.NewTileHandler(renderEngine, statsController, stylesController)
+	staticMapHandler := handlers.NewStaticMapHandler(renderEngine, tileHandler, statsController, stylesController)
 	multiStaticMapHandler := handlers.NewMultiStaticMapHandler(staticMapHandler, statsController)
 	stylesHandler := handlers.NewStylesHandler(stylesController)
 	fontsHandler := handlers.NewFontsHandler(fontsController)
-	datasetsHandler := handlers.NewDatasetsHandler(datasetsController)
+	datasetsHandler := handlers.NewDatasetsHandler(datasetsController, renderEngine)
 	templatesHandler := handlers.NewTemplatesHandler(templatesController, staticMapHandler, multiStaticMapHandler)
 
 	// Initialize template renderer (uses embedded templates)
@@ -325,4 +350,16 @@ func initCacheCleaners(cfg *config.Config) {
 		cleaner := services.NewCacheCleaner("Cache/Regeneratable", cfg.RegenCacheMaxAge, cfg.RegenCacheDelay, cfg.RegenCacheDropAfter)
 		cleaner.Start()
 	}
+}
+
+// absPath converts a relative path to absolute based on the process's
+// working directory. The renderer passes these paths to Node worker
+// subprocesses via CLI args and style.json rewriting, so they must be
+// absolute — relative paths would break if the worker's cwd differs.
+func absPath(rel string) string {
+	abs, err := filepath.Abs(rel)
+	if err != nil {
+		return rel // best-effort fallback
+	}
+	return abs
 }

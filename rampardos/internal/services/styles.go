@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/lenisko/rampardos/internal/models"
@@ -15,7 +14,6 @@ import (
 
 // StylesController manages map styles
 type StylesController struct {
-	tileServerURL   string
 	folder          string
 	fontsController *FontsController
 
@@ -24,12 +22,11 @@ type StylesController struct {
 }
 
 // NewStylesController creates a new styles controller
-func NewStylesController(tileServerURL string, externalStyles []models.Style, folder string, fontsController *FontsController) *StylesController {
+func NewStylesController(externalStyles []models.Style, folder string, fontsController *FontsController) *StylesController {
 	os.MkdirAll(folder, 0755)
 	os.MkdirAll(filepath.Join(folder, "External"), 0755)
 
 	sc := &StylesController{
-		tileServerURL:   tileServerURL,
 		folder:          folder,
 		fontsController: fontsController,
 		externalStyles:  make(map[string]models.Style),
@@ -83,7 +80,7 @@ func (sc *StylesController) saveExternalStyles() error {
 
 // GetStyles returns all available styles
 func (sc *StylesController) GetStyles(ctx context.Context) ([]models.Style, error) {
-	localStyles, err := sc.loadLocalStyles(ctx)
+	localStyles, err := sc.GetLocalStyles()
 	if err != nil {
 		return nil, err
 	}
@@ -253,49 +250,6 @@ func (sc *StylesController) analyzeAvailableIcons(id string) []string {
 	return icons
 }
 
-func (sc *StylesController) loadLocalStyles(ctx context.Context) ([]models.Style, error) {
-	// Try to fetch from tileserver
-	url := fmt.Sprintf("%s/styles.json", sc.tileServerURL)
-	resp, err := HTTPGet(ctx, url, 0)
-	if err != nil {
-		// Fall back to local files
-		return sc.loadLocalStylesFromDisk()
-	}
-	defer resp.Body.Close()
-
-	var styles []models.Style
-	if err := json.NewDecoder(resp.Body).Decode(&styles); err != nil {
-		return sc.loadLocalStylesFromDisk()
-	}
-
-	return styles, nil
-}
-
-func (sc *StylesController) loadLocalStylesFromDisk() ([]models.Style, error) {
-	entries, err := os.ReadDir(sc.folder)
-	if err != nil {
-		return nil, err
-	}
-
-	var styles []models.Style
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		if entry.Name() == "styles.json" {
-			continue
-		}
-
-		id := strings.TrimSuffix(entry.Name(), ".json")
-		styles = append(styles, models.Style{
-			ID:   id,
-			Name: id,
-		})
-	}
-
-	return styles, nil
-}
-
 // GetExternalStyle returns an external style by name
 func (sc *StylesController) GetExternalStyle(name string) *models.Style {
 	sc.mu.RLock()
@@ -328,11 +282,6 @@ func (sc *StylesController) DeleteExternalStyle(id string) error {
 	sc.mu.Unlock()
 
 	return sc.saveExternalStyles()
-}
-
-// GetTileServerURL returns the tile server URL
-func (sc *StylesController) GetTileServerURL() string {
-	return sc.tileServerURL
 }
 
 // AddLocalStyle adds a local style from a ZIP file
@@ -450,6 +399,19 @@ func (sc *StylesController) DeleteLocalStyle(id string) error {
 
 	slog.Info("Deleted local style", "id", id)
 	return nil
+}
+
+// GetLocalStyleIDs returns the IDs of all local styles.
+func (sc *StylesController) GetLocalStyleIDs() ([]string, error) {
+	styles, err := sc.GetLocalStyles()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(styles))
+	for _, s := range styles {
+		ids = append(ids, s.ID)
+	}
+	return ids, nil
 }
 
 // GetLocalStyles returns only local styles (directories in styles folder)

@@ -1,21 +1,19 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 )
 
 var upgrader = websocket.Upgrader{
@@ -35,12 +33,14 @@ var upgrader = websocket.Upgrader{
 type DatasetsHandler struct {
 	datasetsController *services.DatasetsController
 	downloadManager    *services.DownloadManager
+	renderer           renderer.Renderer
 }
 
 // NewDatasetsHandler creates a new datasets handler
-func NewDatasetsHandler(datasetsController *services.DatasetsController) *DatasetsHandler {
+func NewDatasetsHandler(datasetsController *services.DatasetsController, r renderer.Renderer) *DatasetsHandler {
 	h := &DatasetsHandler{
 		datasetsController: datasetsController,
+		renderer:           r,
 	}
 
 	// Create download manager with completion callback
@@ -216,53 +216,19 @@ func (h *DatasetsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // ReloadTileserver handles POST /admin/api/datasets/reload-tileserver
 func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Request) {
-	pid, err := findTileserverPID()
-	if err != nil {
-		slog.Error("Failed to find tileserver PID", "error", err)
-		http.Error(w, "Failed to find tileserver process: "+err.Error(), http.StatusInternalServerError)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := h.renderer.ReloadStyles(ctx); err != nil {
+		slog.Error("Renderer reload failed", "error", err)
+		http.Error(w, "Failed to reload renderer: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	if err := sendSIGHUP(pid); err != nil {
-		slog.Error("Failed to send SIGHUP to tileserver", "pid", pid, "error", err)
-		http.Error(w, "Failed to reload tileserver: "+err.Error(), http.StatusInternalServerError)
-		return
+	if cleaner := services.GetCacheCleaner("Tile"); cleaner != nil {
+		cleaner.ScheduleDropAll()
 	}
-
-	slog.Info("Tileserver reloaded", "pid", pid)
+	slog.Info("Renderer reloaded")
 	w.WriteHeader(http.StatusOK)
-}
-
-// findTileserverPID finds the PID of the tileserver process using pidof
-func findTileserverPID() (int, error) {
-	cmd := exec.Command("pidof", "node")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("pidof failed: %w", err)
-	}
-
-	pidStr := strings.TrimSpace(string(output))
-	if pidStr == "" {
-		return 0, fmt.Errorf("tileserver process not found")
-	}
-
-	// Take first PID if multiple
-	pids := strings.Split(pidStr, " ")
-	pid, err := strconv.Atoi(pids[0])
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID: %w", err)
-	}
-
-	return pid, nil
-}
-
-// sendSIGHUP sends SIGHUP signal to the given PID
-func sendSIGHUP(pid int) error {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process: %w", err)
-	}
-	return proc.Signal(syscall.SIGHUP)
 }
 
 // Add handles POST /admin/api/datasets/add (file upload)
