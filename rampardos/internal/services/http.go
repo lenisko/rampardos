@@ -15,22 +15,14 @@ import (
 
 // HTTPService handles all HTTP client operations
 type HTTPService struct {
-	generalClient    *http.Client
-	tileserverClient *http.Client
-	downloadClient   *http.Client // For large file downloads (no overall timeout)
-	tileserverHost   string
+	generalClient  *http.Client
+	downloadClient *http.Client // For large file downloads (no overall timeout)
 }
 
 var globalHTTPService *HTTPService
 
 // InitHTTPService initializes the global HTTP service with config
 func InitHTTPService(cfg *config.Config) {
-	tileserverURL, _ := url.Parse(cfg.TileServerURL)
-	tileserverHost := ""
-	if tileserverURL != nil {
-		tileserverHost = tileserverURL.Host
-	}
-
 	globalHTTPService = &HTTPService{
 		generalClient: &http.Client{
 			Timeout: cfg.HTTPTimeout, // 0 = unlimited
@@ -38,15 +30,6 @@ func InitHTTPService(cfg *config.Config) {
 				MaxIdleConns:        cfg.HTTPMaxConns,
 				MaxIdleConnsPerHost: cfg.HTTPMaxConns,
 				MaxConnsPerHost:     cfg.HTTPMaxConns,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-		tileserverClient: &http.Client{
-			Timeout: cfg.HTTPTileserverTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        cfg.HTTPTileserverMaxConns,
-				MaxIdleConnsPerHost: cfg.HTTPTileserverMaxConns,
-				MaxConnsPerHost:     cfg.HTTPTileserverMaxConns,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
@@ -60,15 +43,11 @@ func InitHTTPService(cfg *config.Config) {
 				IdleConnTimeout:       90 * time.Second,
 			},
 		},
-		tileserverHost: tileserverHost,
 	}
 }
 
-// getClient returns the appropriate client based on the host
-func (s *HTTPService) getClient(host string) *http.Client {
-	if host == s.tileserverHost {
-		return s.tileserverClient
-	}
+// getClient returns the appropriate client for the given host.
+func (s *HTTPService) getClient(_ string) *http.Client {
 	return s.generalClient
 }
 
