@@ -21,7 +21,7 @@ GIT_COMMIT=$(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
 LDFLAGS=-ldflags="-w -s -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=$(GIT_COMMIT)"
 
 # Docker
-DOCKER_IMAGE=ghcr.io/jfberry/rampardos
+DOCKER_IMAGE=ghcr.io/lenisko/rampardos
 DOCKER_TAG=latest
 DOCKER_PLATFORMS=linux/amd64,linux/arm64
 

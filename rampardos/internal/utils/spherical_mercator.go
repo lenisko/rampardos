@@ -50,7 +50,7 @@ func NewSphericalMercator() *SphericalMercator {
 	}
 
 	size := tileSize
-	for i := 0; i < 30; i++ {
+	for i := range 30 {
 		sm.bc[i] = size / 360
 		sm.cc[i] = size / (2 * math.Pi)
 		sm.zc[i] = size / 2

@@ -108,8 +108,7 @@ func (tc *TemplatesController) GetTemplateVersions(name string) ([]int64, error)
 		if entry.IsDir() {
 			continue
 		}
-		if strings.HasPrefix(entry.Name(), prefix) {
-			timestampStr := strings.TrimPrefix(entry.Name(), prefix)
+		if timestampStr, ok := strings.CutPrefix(entry.Name(), prefix); ok {
 			var timestamp int64
 			if _, err := fmt.Sscanf(timestampStr, "%d", &timestamp); err == nil {
 				versions = append(versions, timestamp)

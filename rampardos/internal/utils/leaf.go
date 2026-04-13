@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -248,9 +249,7 @@ func (r *LeafRenderer) processForLoops(template string) string {
 				// Create a new context with the loop variable
 				oldContext := r.context
 				r.context = make(map[string]any)
-				for k, v := range oldContext {
-					r.context[k] = v
-				}
+				maps.Copy(r.context, oldContext)
 				r.context[itemName] = item
 				r.context["index"] = idx
 
@@ -327,15 +326,15 @@ func (r *LeafRenderer) evaluateCondition(condition string) bool {
 	}
 
 	// Handle != nil check
-	if strings.HasSuffix(condition, " != nil") {
-		varName := strings.TrimSuffix(condition, " != nil")
+	if before, ok := strings.CutSuffix(condition, " != nil"); ok {
+		varName := before
 		value := r.getValue(varName)
 		return value != nil
 	}
 
 	// Handle == nil check
-	if strings.HasSuffix(condition, " == nil") {
-		varName := strings.TrimSuffix(condition, " == nil")
+	if before, ok := strings.CutSuffix(condition, " == nil"); ok {
+		varName := before
 		value := r.getValue(varName)
 		return value == nil
 	}

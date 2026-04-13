@@ -101,29 +101,35 @@ func DownloadFile(ctx context.Context, fromURL, toPath, expectedType string, tim
 		}
 	}
 
-	// Ensure directory exists
+	// Write to a temp file then rename atomically, so concurrent
+	// readers never see a partially-downloaded file.
 	dir := filepath.Dir(toPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	file, err := os.Create(toPath)
+	file, err := os.CreateTemp(filepath.Dir(toPath), filepath.Base(toPath)+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
 
+	tmpName := file.Name()
 	written, err := io.Copy(file, resp.Body)
+	file.Close()
 	if err != nil {
-		os.Remove(toPath)
+		os.Remove(tmpName)
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
 	if written == 0 {
-		os.Remove(toPath)
+		os.Remove(tmpName)
 		return fmt.Errorf("failed to load file. Got empty data")
 	}
 
+	if err := os.Rename(tmpName, toPath); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
 	return nil
 }
 

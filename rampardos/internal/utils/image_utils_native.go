@@ -290,22 +290,20 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 	return saveImage(path, dc.Image())
 }
 
-// GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go
+// GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go.
+//
+// This matches ImageMagick's -append/+append behaviour used by the
+// original Swift implementation: each image in a grid group is
+// sequentially appended to the cumulative result, and images are
+// scaled to match the append dimension (height for +append/right,
+// width for -append/bottom) so the seams align cleanly.
 func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path string) error {
-	// First pass: load all images and calculate total dimensions
-	type gridImage struct {
-		img       image.Image
-		direction models.CombineDirection
-	}
-
-	var rows [][]gridImage
-	totalHeight := 0
-	maxRowWidth := 0
+	// Build each grid group as a composite image, then combine groups.
+	var groupImages []image.Image
+	var groupDirections []models.CombineDirection
 
 	for _, grid := range multiStaticMap.Grid {
-		var rowImages []gridImage
-		rowWidth := 0
-		rowHeight := 0
+		var composite image.Image
 
 		for _, m := range grid.Maps {
 			mapPath := m.Map.Path()
@@ -314,75 +312,88 @@ func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path str
 				return fmt.Errorf("failed to load map %s: %w", mapPath, err)
 			}
 
-			rowImages = append(rowImages, gridImage{img, m.Direction})
-
-			if m.Direction == models.CombineDirectionBottom {
-				if img.Bounds().Dx() > rowWidth {
-					rowWidth = img.Bounds().Dx()
-				}
-				rowHeight += img.Bounds().Dy()
-			} else {
-				rowWidth += img.Bounds().Dx()
-				if img.Bounds().Dy() > rowHeight {
-					rowHeight = img.Bounds().Dy()
-				}
+			if m.Direction == models.CombineDirectionFirst || composite == nil {
+				// First image in the group — this is the anchor.
+				composite = img
+				continue
 			}
+
+			composite = appendImages(composite, img, m.Direction)
 		}
 
-		rows = append(rows, rowImages)
-		if grid.Direction == models.CombineDirectionBottom {
-			totalHeight += rowHeight
-			if rowWidth > maxRowWidth {
-				maxRowWidth = rowWidth
-			}
-		} else {
-			if rowHeight > totalHeight {
-				totalHeight = rowHeight
-			}
-			maxRowWidth += rowWidth
+		if composite != nil {
+			groupImages = append(groupImages, composite)
+			groupDirections = append(groupDirections, grid.Direction)
 		}
 	}
 
-	// Create final image
-	result := image.NewRGBA(image.Rect(0, 0, maxRowWidth, totalHeight))
+	if len(groupImages) == 0 {
+		return fmt.Errorf("no images to combine")
+	}
 
-	// Second pass: draw images
-	currentY := 0
-	currentX := 0
-
-	for gridIdx, grid := range multiStaticMap.Grid {
-		rowImages := rows[gridIdx]
-		rowX := currentX
-		rowY := currentY
-		rowHeight := 0
-
-		for _, gi := range rowImages {
-			bounds := gi.img.Bounds()
-
-			draw.Draw(result, image.Rect(rowX, rowY, rowX+bounds.Dx(), rowY+bounds.Dy()),
-				gi.img, image.Point{}, draw.Src)
-
-			if gi.direction == models.CombineDirectionBottom {
-				rowY += bounds.Dy()
-				if bounds.Dy() > rowHeight {
-					rowHeight = bounds.Dy()
-				}
-			} else {
-				rowX += bounds.Dx()
-				if bounds.Dy() > rowHeight {
-					rowHeight = bounds.Dy()
-				}
-			}
+	// Combine all grid groups together.
+	result := groupImages[0]
+	for i := 1; i < len(groupImages); i++ {
+		dir := groupDirections[i]
+		if dir == models.CombineDirectionFirst {
+			dir = models.CombineDirectionRight
 		}
-
-		if grid.Direction == models.CombineDirectionBottom {
-			currentY += rowHeight
-		} else {
-			currentX = rowX
-		}
+		result = appendImages(result, groupImages[i], dir)
 	}
 
 	return saveImage(path, result)
+}
+
+// appendImages combines two images in the given direction, scaling the
+// smaller image to match the larger's dimension along the append axis.
+// This matches ImageMagick's +append (right) and -append (bottom).
+func appendImages(base, addition image.Image, direction models.CombineDirection) image.Image {
+	baseW := base.Bounds().Dx()
+	baseH := base.Bounds().Dy()
+	addW := addition.Bounds().Dx()
+	addH := addition.Bounds().Dy()
+
+	switch direction {
+	case models.CombineDirectionRight:
+		// Horizontal append: scale addition to match base's height.
+		targetH := baseH
+		if addH != targetH && addH > 0 {
+			scaledW := addW * targetH / addH
+			addition = scaleImage(addition, scaledW, targetH)
+			addW = scaledW
+			addH = targetH
+		}
+		combined := image.NewRGBA(image.Rect(0, 0, baseW+addW, targetH))
+		draw.Draw(combined, image.Rect(0, 0, baseW, baseH), base, image.Point{}, draw.Src)
+		draw.Draw(combined, image.Rect(baseW, 0, baseW+addW, addH), addition, image.Point{}, draw.Src)
+		return combined
+
+	case models.CombineDirectionBottom:
+		// Vertical append: scale addition to match base's width.
+		targetW := baseW
+		if addW != targetW && addW > 0 {
+			scaledH := addH * targetW / addW
+			addition = scaleImage(addition, targetW, scaledH)
+			addW = targetW
+			addH = scaledH
+		}
+		combined := image.NewRGBA(image.Rect(0, 0, targetW, baseH+addH))
+		draw.Draw(combined, image.Rect(0, 0, baseW, baseH), base, image.Point{}, draw.Src)
+		draw.Draw(combined, image.Rect(0, baseH, addW, baseH+addH), addition, image.Point{}, draw.Src)
+		return combined
+
+	default:
+		// CombineDirectionFirst or unknown — treat as right.
+		return appendImages(base, addition, models.CombineDirectionRight)
+	}
+}
+
+// scaleImage resizes an image to the target dimensions using high-quality
+// CatmullRom interpolation.
+func scaleImage(src image.Image, width, height int) image.Image {
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+	return dst
 }
 
 // loadImage loads an image from a file
@@ -415,36 +426,50 @@ func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, 
 	return img, err
 }
 
-// saveImage saves an image to a file
+// saveImage saves an image to a file atomically. It writes to a
+// temporary file then renames, so concurrent readers never see a
+// partially-encoded image.
 func saveImage(path string, img image.Image) error {
-	f, err := os.Create(path)
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	ext := strings.ToLower(filepath.Ext(path))
+	var encodeErr error
 	switch ext {
 	case ".jpg", ".jpeg":
 		quality := 90
 		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
 			quality = services.GlobalImageSettings.ImageQuality
 		}
-		return jpeg.Encode(f, img, &jpeg.Options{Quality: quality})
+		encodeErr = jpeg.Encode(f, img, &jpeg.Options{Quality: quality})
 	case ".webp":
 		quality := 90
 		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
 			quality = services.GlobalImageSettings.ImageQuality
 		}
-		return webp.Encode(f, img, webp.Options{Quality: quality})
+		encodeErr = webp.Encode(f, img, webp.Options{Quality: quality})
 	default:
-		// Use configurable PNG compression level
 		encoder := &png.Encoder{CompressionLevel: png.BestCompression}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
 		}
-		return encoder.Encode(f, img)
+		encodeErr = encoder.Encode(f, img)
 	}
+
+	tmpName := f.Name()
+	f.Close()
+	if encodeErr != nil {
+		os.Remove(tmpName)
+		return encodeErr
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // resizeImage resizes an image to the target dimensions

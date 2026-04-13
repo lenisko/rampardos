@@ -6,10 +6,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/lenisko/rampardos/internal/models"
@@ -22,6 +23,7 @@ type TileHandler struct {
 	renderer         renderer.Renderer
 	statsController  *services.StatsController
 	stylesController stylesControllerGetExternal
+	sfg              singleflight.Group // dedup concurrent tile fetches
 }
 
 // NewTileHandler creates a new tile handler
@@ -81,7 +83,9 @@ func (h *TileHandler) Get(w http.ResponseWriter, r *http.Request) {
 	h.generateTileAndResponse(w, r, style, z, x, y, uint8(scale), format)
 }
 
-// GenerateTile generates a tile and returns the result
+// GenerateTile generates a tile and returns the result. Concurrent
+// requests for the same tile are deduplicated via singleflight: only
+// one goroutine downloads/renders, the rest wait for its result.
 func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y int, scale uint8, format models.ImageFormat) (*TileResult, error) {
 	path := fmt.Sprintf("Cache/Tile/%s-%d-%d-%d-%d.%s", style, z, x, y, scale, format)
 
@@ -91,40 +95,48 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 		return &TileResult{Path: path, Cached: true}, nil
 	}
 
-	// External styles: download from remote URL template.
-	if extStyle := h.stylesController.GetExternalStyle(style); extStyle != nil {
-		scaleString := ""
-		if scale != 1 {
-			scaleString = fmt.Sprintf("@%dx", scale)
+	// singleflight: only one goroutine generates a given tile at a time.
+	// Others wait and get the same result (or the same error).
+	_, err, _ := h.sfg.Do(path, func() (any, error) {
+		// Double-check cache inside singleflight (another request may
+		// have populated it between our outer check and acquiring the
+		// singleflight slot).
+		if _, err := os.Stat(path); err == nil {
+			return nil, nil
 		}
-		tileURL := extStyle.URL
-		tileURL = strings.ReplaceAll(tileURL, "{z}", strconv.Itoa(z))
-		tileURL = strings.ReplaceAll(tileURL, "{x}", strconv.Itoa(x))
-		tileURL = strings.ReplaceAll(tileURL, "{y}", strconv.Itoa(y))
-		tileURL = strings.ReplaceAll(tileURL, "{scale}", strconv.FormatUint(uint64(scale), 10))
-		tileURL = strings.ReplaceAll(tileURL, "{@scale}", scaleString)
-		tileURL = strings.ReplaceAll(tileURL, "{format}", string(format))
 
-		if err := services.DownloadFile(ctx, tileURL, path, "image", 0); err != nil {
-			return nil, fmt.Errorf("failed to load tile: %s (%w)", tileURL, err)
+		// External styles: download from remote URL template.
+		if extStyle := h.stylesController.GetExternalStyle(style); extStyle != nil {
+			scaleString := ""
+			if scale != 1 {
+				scaleString = fmt.Sprintf("@%dx", scale)
+			}
+			tileURL := extStyle.URL
+			tileURL = strings.ReplaceAll(tileURL, "{z}", strconv.Itoa(z))
+			tileURL = strings.ReplaceAll(tileURL, "{x}", strconv.Itoa(x))
+			tileURL = strings.ReplaceAll(tileURL, "{y}", strconv.Itoa(y))
+			tileURL = strings.ReplaceAll(tileURL, "{scale}", strconv.FormatUint(uint64(scale), 10))
+			tileURL = strings.ReplaceAll(tileURL, "{@scale}", scaleString)
+			tileURL = strings.ReplaceAll(tileURL, "{format}", string(format))
+
+			return nil, services.DownloadFile(ctx, tileURL, path, "image", 0)
 		}
-		h.statsController.TileServed(true, path, style)
-		return &TileResult{Path: path, Cached: false}, nil
-	}
 
-	// Local styles: render in-process via the Renderer.
-	encoded, err := h.renderer.Render(ctx, renderer.Request{
-		StyleID: style,
-		Z:       z, X: x, Y: y,
-		Scale:  scale,
-		Format: format,
+		// Local styles: render in-process via the Renderer.
+		encoded, err := h.renderer.Render(ctx, renderer.Request{
+			StyleID: style,
+			Z:       z, X: x, Y: y,
+			Scale:   scale,
+			Format:  format,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return nil, atomicWriteFile(path, encoded, 0o644)
 	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to render tile %s/%d/%d/%d: %w", style, z, x, y, err)
-	}
-	ensureDir(filepath.Dir(path))
-	if err := os.WriteFile(path, encoded, 0o644); err != nil {
-		return nil, fmt.Errorf("write tile cache: %w", err)
+		return nil, fmt.Errorf("failed to generate tile %s/%d/%d/%d: %w", style, z, x, y, err)
 	}
 
 	h.statsController.TileServed(true, path, style)

@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"golang.org/x/sync/singleflight"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/utils"
@@ -21,6 +23,7 @@ import (
 type MultiStaticMapHandler struct {
 	staticMapHandler *StaticMapHandler
 	statsController  *services.StatsController
+	sfg              singleflight.Group
 }
 
 // NewMultiStaticMapHandler creates a new multi static map handler
@@ -118,8 +121,12 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	services.GlobalMetrics.IncrementInFlight("multistaticmap")
 	defer services.GlobalMetrics.DecrementInFlight("multistaticmap")
 
-	// Check if cache should be skipped (for preview)
 	skipCache := r.URL.Query().Get("nocache") == "true"
+	ttlStr := r.URL.Query().Get("ttl")
+	var ttlSeconds int
+	if ttlStr != "" {
+		ttlSeconds, _ = strconv.Atoi(ttlStr)
+	}
 
 	// Check if cached (use cache index first, then filesystem)
 	cached := false
@@ -152,54 +159,76 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	}
 	mapCount := len(mapsToGenerate)
 
-	// Generate all component maps in parallel (limit concurrency to 5)
-	var wg sync.WaitGroup
-	var genErr error
-	var errOnce sync.Once
-	sem := make(chan struct{}, 5)
+	// singleflight: deduplicate the entire generate+combine operation
+	// for identical multistaticmap requests.
+	_, sfErr, _ := h.sfg.Do(path, func() (any, error) {
+		if _, err := os.Stat(path); err == nil {
+			return nil, nil
+		}
 
-	for _, staticMap := range mapsToGenerate {
-		wg.Add(1)
-		go func(sm models.StaticMap) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+		// Generate all component maps in parallel (limit concurrency to 5)
+		var wg sync.WaitGroup
+		var genErr error
+		var errOnce sync.Once
+		sem := make(chan struct{}, 5)
 
-			if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm); err != nil {
-				errOnce.Do(func() {
-					genErr = err
-				})
-			}
-		}(staticMap)
-	}
-	wg.Wait()
+		for _, staticMap := range mapsToGenerate {
+			wg.Add(1)
+			go func(sm models.StaticMap) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
 
-	if genErr != nil {
-		slog.Error("Failed to generate component map", "error", genErr)
-		services.GlobalMetrics.RecordError("multistaticmap", "component_generation_failed")
-		http.Error(w, genErr.Error(), http.StatusInternalServerError)
+				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm); err != nil {
+					errOnce.Do(func() {
+						genErr = err
+					})
+				}
+			}(staticMap)
+		}
+		wg.Wait()
+
+		if genErr != nil {
+			return nil, genErr
+		}
+
+		ensureDir(filepath.Dir(path))
+		return nil, utils.GenerateMultiStaticMap(multiStaticMap, path)
+	})
+
+	if sfErr != nil {
+		slog.Error("Failed to generate multi-static map", "error", sfErr)
+		services.GlobalMetrics.RecordError("multistaticmap", "generation_failed")
+		http.Error(w, sfErr.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	// Combine maps
-	ensureDir(filepath.Dir(path))
-	if err := utils.GenerateMultiStaticMap(multiStaticMap, path); err != nil {
-		slog.Error("Failed to generate multi-static map", "error", err)
-		services.GlobalMetrics.RecordError("multistaticmap", "combine_failed")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Add to cache index
-	if services.GlobalCacheIndex != nil {
-		services.GlobalCacheIndex.AddMultiStaticMap(path)
 	}
 
 	duration := time.Since(startTime).Seconds()
-	slog.Debug("Served multi-static map (generated)", "maps", mapCount, "duration", duration)
 	h.statsController.StaticMapServed(true, path, "multi")
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
+
+	if skipCache {
+		slog.Debug("Served multi-static map (nocache)", "maps", mapCount, "duration", duration)
+		serveFile(w, r, path)
+		os.Remove(path)
+		return
+	}
+
+	if services.GlobalCacheIndex != nil {
+		services.GlobalCacheIndex.AddMultiStaticMap(path)
+	}
+	slog.Debug("Served multi-static map (generated)", "maps", mapCount, "duration", duration)
 	h.generateResponse(w, r, multiStaticMap, path)
+
+	if ttlSeconds > 0 {
+		go func() {
+			time.Sleep(time.Duration(ttlSeconds) * time.Second)
+			os.Remove(path)
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.RemoveMultiStaticMap(path)
+			}
+		}()
+	}
 }
 
 func (h *MultiStaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *http.Request, id string) {

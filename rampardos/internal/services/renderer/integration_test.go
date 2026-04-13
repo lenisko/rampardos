@@ -1,5 +1,4 @@
 //go:build renderer_integration
-// +build renderer_integration
 
 package renderer
 
