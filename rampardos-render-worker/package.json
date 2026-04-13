@@ -1,0 +1,11 @@
+{
+  "name": "rampardos-render-worker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Node render worker for rampardos; loads @maplibre/maplibre-gl-native and renders tiles/viewports on request from the Go orchestrator via stdin/stdout.",
+  "main": "render-worker.js",
+  "dependencies": {
+    "@maplibre/maplibre-gl-native": "^6.4.1",
+    "better-sqlite3": "^11.3.0"
+  }
+}
