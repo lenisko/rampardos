@@ -1,6 +1,7 @@
 name: Build and Push Docker Image
 
 on:
+  workflow_dispatch:
   pull_request:
     types:
       - closed
@@ -22,7 +23,8 @@ jobs:
        !contains(github.event.head_commit.message, 'skip-ci')) ||
       (github.event_name == 'pull_request' &&
        github.event.pull_request.merged == true &&
-       !contains(github.event.pull_request.title, 'skip-ci'))
+       !contains(github.event.pull_request.title, 'skip-ci')) ||
+      (github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,7 +53,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable=${{ github.event_name == 'pull_request' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
             type=sha,prefix=
             type=ref,event=branch
 

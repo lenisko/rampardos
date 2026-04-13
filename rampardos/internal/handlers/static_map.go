@@ -249,9 +249,11 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	h.statsController.StaticMapServed(true, path, staticMap.Style)
 	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 
-	if skipCache {
-		// nocache mode: serve the image directly and clean up temp
-		// files. No cache index entry, no disk footprint left behind.
+	if skipCache && r.URL.Query().Get("pregenerate") != "true" {
+		// nocache mode (without pregenerate): serve the image directly
+		// and clean up temp files. No cache index entry, no disk
+		// footprint left behind. If pregenerate=true is also set, we
+		// fall through to generateResponse which returns the filename.
 		slog.Debug("Served static map (nocache)", "path", path, "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)
