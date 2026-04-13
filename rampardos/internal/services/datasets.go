@@ -109,14 +109,22 @@ func (dc *DatasetsController) IsCombined() bool {
 	return dc.isCombined
 }
 
-// reloadTileserverIfConfigured calls the reload callback if set
-func (dc *DatasetsController) reloadTileserverIfConfigured() {
+// reloadAfterDatasetChange is invoked when a dataset changes state
+// (added, deleted, or recombined). It calls the tileserver reload
+// callback if one is configured, and always schedules a drop of
+// Cache/Tile so stale raster tiles do not outlive the underlying
+// mbtiles visuals.
+func (dc *DatasetsController) reloadAfterDatasetChange() {
 	if dc.reloadTileserver != nil {
 		if err := dc.reloadTileserver(); err != nil {
 			slog.Error("Failed to reload tileserver", "error", err)
 		} else {
 			slog.Info("Tileserver reload triggered")
 		}
+	}
+	if cleaner := GetCacheCleaner("Tile"); cleaner != nil {
+		cleaner.ScheduleDropAll()
+		slog.Info("Scheduled Cache/Tile drop after dataset refresh")
 	}
 }
 
@@ -148,7 +156,7 @@ func (dc *DatasetsController) SetActive(name string) error {
 	dc.mu.Unlock()
 
 	// Reload tileserver
-	dc.reloadTileserverIfConfigured()
+	dc.reloadAfterDatasetChange()
 
 	return nil
 }
@@ -240,7 +248,7 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 		dc.mu.Unlock()
 		
 		// Reload tileserver to reflect changes
-		dc.reloadTileserverIfConfigured()
+		dc.reloadAfterDatasetChange()
 	}
 
 	slog.Info("Dataset deletion completed", "name", sanitized)
@@ -339,7 +347,7 @@ func (dc *DatasetsController) combineDatasets(datasets []string) error {
 		dc.activeDataset = datasets[0]
 		dc.isCombined = false
 		dc.mu.Unlock()
-		dc.reloadTileserverIfConfigured()
+		dc.reloadAfterDatasetChange()
 		return nil
 	}
 
@@ -365,7 +373,7 @@ func (dc *DatasetsController) combineDatasets(datasets []string) error {
 	// Update dataset sizes after combining
 	dc.UpdateAllDatasetSizes()
 
-	dc.reloadTileserverIfConfigured()
+	dc.reloadAfterDatasetChange()
 
 	return nil
 }
