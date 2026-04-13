@@ -17,27 +17,46 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 	"github.com/lenisko/rampardos/internal/utils"
 )
 
+// stylesControllerGetExternal is the subset of StylesController used by
+// StaticMapHandler's dispatch logic. An interface keeps dispatch
+// unit-testable without spinning up a real StylesController.
+type stylesControllerGetExternal interface {
+	GetExternalStyle(name string) *models.Style
+}
+
 // StaticMapHandler handles static map requests
 type StaticMapHandler struct {
-	tileServerURL     string
+	renderer          renderer.Renderer
 	tileHandler       *TileHandler
 	statsController   *services.StatsController
-	stylesController  *services.StylesController
+	stylesController  stylesControllerGetExternal
 	sphericalMercator *utils.SphericalMercator
+
+	// Function-valued hooks. Production wiring in NewStaticMapHandler
+	// sets these to the real methods below; tests override them to
+	// record dispatch without touching tileserver-gl or disk.
+	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap, basePath string) error
+	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) error
+	logExternalViewportApproxFn      func(sm models.StaticMap)
 }
 
 // NewStaticMapHandler creates a new static map handler
-func NewStaticMapHandler(tileServerURL string, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController) *StaticMapHandler {
-	return &StaticMapHandler{
-		tileServerURL:     tileServerURL,
+func NewStaticMapHandler(r renderer.Renderer, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController) *StaticMapHandler {
+	h := &StaticMapHandler{
+		renderer:          r,
 		tileHandler:       tileHandler,
 		statsController:   statsController,
 		stylesController:  stylesController,
 		sphericalMercator: utils.NewSphericalMercator(),
 	}
+	h.generateBaseStaticMapFromAPIFn = h.generateBaseStaticMapFromAPI
+	h.generateBaseStaticMapFromTilesFn = h.generateBaseStaticMapFromTiles
+	h.logExternalViewportApproxFn = h.logExternalViewportApprox
+	return h
 }
 
 // Get handles GET /staticmap
@@ -159,8 +178,16 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	services.GlobalMetrics.IncrementInFlight("staticmap")
 	defer services.GlobalMetrics.DecrementInFlight("staticmap")
 
-	// Check if cache should be skipped (for preview)
+	// Cache control: nocache=true skips cache entirely (image served
+	// then deleted). ttl=N keeps the file for N seconds then deletes
+	// (useful for Telegram-style deliveries where the consumer fetches
+	// via URL but doesn't need it to persist).
 	skipCache := r.URL.Query().Get("nocache") == "true"
+	ttlStr := r.URL.Query().Get("ttl")
+	var ttlSeconds int
+	if ttlStr != "" {
+		ttlSeconds, _ = strconv.Atoi(ttlStr)
+	}
 
 	// Check if cached (use cache index first, then filesystem)
 	cached := false
@@ -203,16 +230,44 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Add to cache index
+	duration := time.Since(startTime).Seconds()
+	h.statsController.StaticMapServed(true, path, staticMap.Style)
+	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
+
+	if skipCache {
+		// nocache mode: serve the image directly and clean up temp
+		// files. No cache index entry, no disk footprint left behind.
+		slog.Debug("Served static map (nocache)", "path", path, "duration", duration)
+		serveFile(w, r, path)
+		os.Remove(path)
+		if path != basePath {
+			os.Remove(basePath)
+		}
+		return
+	}
+
+	// Normal mode: keep on disk for cache.
 	if services.GlobalCacheIndex != nil {
 		services.GlobalCacheIndex.AddStaticMap(path)
 	}
-
-	duration := time.Since(startTime).Seconds()
 	slog.Debug("Served static map (generated)", "path", path, "duration", duration)
-	h.statsController.StaticMapServed(true, path, staticMap.Style)
-	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 	h.generateResponse(w, r, staticMap, path)
+
+	// If a TTL was requested, schedule deletion after the specified
+	// duration. The file stays on disk long enough for the consumer
+	// (e.g. Telegram) to fetch it via the pregenerated URL.
+	if ttlSeconds > 0 {
+		go func() {
+			time.Sleep(time.Duration(ttlSeconds) * time.Second)
+			os.Remove(path)
+			if path != basePath {
+				os.Remove(basePath)
+			}
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.RemoveStaticMap(path)
+			}
+		}()
+	}
 }
 
 func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *http.Request, id string) {
@@ -284,25 +339,37 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 }
 
 func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) error {
-	// Check if this is an external style (needs tile stitching)
-	if extStyle := h.stylesController.GetExternalStyle(staticMap.Style); extStyle != nil {
-		// External style - use tile stitching
-		return h.generateBaseStaticMapFromTiles(ctx, staticMap, basePath, extStyle)
+	extStyle := h.stylesController.GetExternalStyle(staticMap.Style) // nil for local styles
+
+	if extStyle == nil {
+		// Local style: fractional zoom → viewport render (native float zoom).
+		// Integer zoom → tile stitching (cacheable via Cache/Tile).
+		if isFractional(staticMap.Zoom) {
+			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap, basePath)
+		}
+		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
 	}
 
-	// Local style - use tileserver-gl's static API directly
-	return h.generateBaseStaticMapFromAPI(ctx, staticMap, basePath)
+	// External styles: tile stitching (no viewport endpoint available).
+	if isFractional(staticMap.Zoom) {
+		h.logExternalViewportApproxFn(staticMap)
+	}
+	return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
+}
+
+func (h *StaticMapHandler) logExternalViewportApprox(sm models.StaticMap) {
+	slog.Warn("external style requested at fractional zoom; rendering at integer approximation",
+		"style", sm.Style,
+		"zoom", sm.Zoom,
+		"lat", sm.Latitude,
+		"lng", sm.Longitude,
+	)
 }
 
 func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap, basePath string) error {
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
-	}
-
-	scaleString := ""
-	if scale > 1 {
-		scaleString = fmt.Sprintf("@%dx", scale)
 	}
 
 	bearing := 0.0
@@ -314,27 +381,26 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 		pitch = *staticMap.Pitch
 	}
 
-	// Use tileserver-gl's static API: /styles/{style}/static/{lon},{lat},{zoom}@{bearing},{pitch}/{width}x{height}{scale}.{format}
-	staticURL := fmt.Sprintf("%s/styles/%s/static/%f,%f,%f@%f,%f/%dx%d%s.%s",
-		h.tileServerURL,
-		staticMap.Style,
-		staticMap.Longitude,
-		staticMap.Latitude,
-		staticMap.Zoom,
-		bearing,
-		pitch,
-		staticMap.Width,
-		staticMap.Height,
-		scaleString,
-		staticMap.GetFormat(),
-	)
-
-	slog.Debug("Fetching static map from tileserver", "url", staticURL)
-
-	if err := services.DownloadFile(ctx, staticURL, basePath, "image", 0); err != nil {
-		return fmt.Errorf("failed to load base static map: %w", err)
+	encoded, err := h.renderer.RenderViewport(ctx, renderer.ViewportRequest{
+		StyleID:   staticMap.Style,
+		Longitude: staticMap.Longitude,
+		Latitude:  staticMap.Latitude,
+		Zoom:      staticMap.Zoom,
+		Width:     int(staticMap.Width),
+		Height:    int(staticMap.Height),
+		Bearing:   bearing,
+		Pitch:     pitch,
+		Scale:     scale,
+		Format:    staticMap.GetFormat(),
+	})
+	if err != nil {
+		return fmt.Errorf("renderer viewport: %w", err)
 	}
 
+	ensureDir(filepath.Dir(basePath))
+	if err := os.WriteFile(basePath, encoded, 0o644); err != nil {
+		return fmt.Errorf("write base path: %w", err)
+	}
 	return nil
 }
 
@@ -343,39 +409,77 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	center := models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude}
 	zoom := int(staticMap.Zoom)
 
-	// Get center tile
+	// Get center tile. xDelta/yDelta are pixel offsets within the tile
+	// in SphericalMercator's 256-based coordinate grid.
 	centerX, centerY, xDelta, yDelta := h.sphericalMercator.XY(center, zoom)
 
-	// Calculate how many tiles we need
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
 	}
 
-	tilesX := int(math.Ceil(float64(staticMap.Width)/256/float64(scale))) + 1
-	tilesY := int(math.Ceil(float64(staticMap.Height)/256/float64(scale))) + 1
+	// Tile pixel size depends on the source:
+	// - Local styles rendered via maplibre-native: 512px (MapLibre's base tile size)
+	// - External raster tiles: 256px (standard web tile size)
+	tilePixels := 256
+	if extStyle == nil {
+		tilePixels = renderer.TileSizePx
+	}
 
-	// Check if external style supports scale
-	hasScale := strings.Contains(extStyle.URL, "{@scale}") || strings.Contains(extStyle.URL, "{scale}")
+	// How many tiles we need to cover the requested viewport.
+	tilesX := int(math.Ceil(float64(staticMap.Width)/float64(tilePixels)/float64(scale))) + 1
+	tilesY := int(math.Ceil(float64(staticMap.Height)/float64(tilePixels)/float64(scale))) + 1
 
-	// Generate tiles
-	var tilePaths []string
+	// External styles may use scale-aware URL templates; local styles
+	// have no URL template at all.
+	hasScale := false
+	if extStyle != nil {
+		hasScale = strings.Contains(extStyle.URL, "{@scale}") || strings.Contains(extStyle.URL, "{scale}")
+	}
+
+	// Generate tiles in parallel. Each tile is an independent download
+	// or render; parallelising cuts wall-clock time from N*latency to
+	// ~1*latency for external tile sources like Mapbox satellite.
+	type tileSlot struct {
+		index int
+		path  string
+		err   error
+	}
+	totalTiles := (2*(tilesX/2) + 1) * (2*(tilesY/2) + 1)
+	tilePaths := make([]string, totalTiles)
+	results := make(chan tileSlot, totalTiles)
+
+	i := 0
 	for dy := -tilesY / 2; dy <= tilesY/2; dy++ {
 		for dx := -tilesX / 2; dx <= tilesX/2; dx++ {
 			tileX := centerX + dx
 			tileY := centerY + dy
-
-			result, err := h.tileHandler.GenerateTile(ctx, staticMap.Style, zoom, tileX, tileY, scale, staticMap.GetFormat())
-			if err != nil {
-				return fmt.Errorf("failed to generate tile: %w", err)
-			}
-			tilePaths = append(tilePaths, result.Path)
+			idx := i
+			i++
+			go func() {
+				result, err := h.tileHandler.GenerateTile(ctx, staticMap.Style, zoom, tileX, tileY, scale, staticMap.GetFormat())
+				if err != nil {
+					results <- tileSlot{index: idx, err: err}
+					return
+				}
+				results <- tileSlot{index: idx, path: result.Path}
+			}()
 		}
 	}
+	for j := 0; j < totalTiles; j++ {
+		slot := <-results
+		if slot.err != nil {
+			return fmt.Errorf("failed to generate tile: %w", slot.err)
+		}
+		tilePaths[slot.index] = slot.path
+	}
 
-	// Calculate offset
-	offsetX := int(xDelta) + (tilesX/2)*256
-	offsetY := int(yDelta) + (tilesY/2)*256
+	// Calculate offset: position of the map center in the combined tile grid.
+	// xDelta/yDelta are in SphericalMercator's 256-based pixel grid.
+	// Scale them to match the actual tile pixel size.
+	deltaScale := tilePixels / 256
+	offsetX := int(xDelta)*deltaScale + (tilesX/2)*tilePixels
+	offsetY := int(yDelta)*deltaScale + (tilesY/2)*tilePixels
 
 	// Create redownloader callback for corrupted tiles
 	redownload := func(tilePath string) error {
@@ -624,4 +728,21 @@ func parseQueryParams(r *http.Request, staticMap *models.StaticMap) error {
 	}
 
 	return nil
+}
+
+// isFractional reports whether the given zoom is non-integer, with
+// epsilon tolerance for floating-point noise. NaN and infinities are
+// treated as non-fractional (they fall through to whatever the
+// downstream code already handles — these should never occur in
+// validated input).
+func isFractional(zoom float64) bool {
+	if math.IsNaN(zoom) || math.IsInf(zoom, 0) {
+		return false
+	}
+	const epsilon = 1e-9
+	_, frac := math.Modf(zoom)
+	if frac < 0 {
+		frac = -frac
+	}
+	return frac > epsilon && frac < 1-epsilon
 }
