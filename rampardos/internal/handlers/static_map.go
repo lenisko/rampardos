@@ -217,15 +217,25 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	services.GlobalMetrics.IncrementInFlight("staticmap")
 	defer services.GlobalMetrics.DecrementInFlight("staticmap")
 
-	// Cache control: nocache=true skips cache entirely (image served
-	// then deleted). ttl=N keeps the file for N seconds then deletes
-	// (useful for Telegram-style deliveries where the consumer fetches
-	// via URL but doesn't need it to persist).
+	// Cache control:
+	//   nocache=true — skip cache, serve image directly, delete immediately
+	//   ttl=N        — keep file for N seconds then delete (e.g. Telegram)
+	//   pregenerate=true + nocache=true — treated as ttl=30 so the file
+	//     lives long enough for the consumer to fetch via the returned URL
 	skipCache := r.URL.Query().Get("nocache") == "true"
+	pregenerate := r.URL.Query().Get("pregenerate") == "true"
 	ttlStr := r.URL.Query().Get("ttl")
 	var ttlSeconds int
 	if ttlStr != "" {
 		ttlSeconds, _ = strconv.Atoi(ttlStr)
+	}
+	if skipCache && pregenerate {
+		// Can't delete immediately if we're returning a filename — the
+		// consumer needs time to fetch it. Convert to a short TTL.
+		skipCache = false
+		if ttlSeconds == 0 {
+			ttlSeconds = 30
+		}
 	}
 
 	// Check if cached (use cache index first, then filesystem)
@@ -282,11 +292,10 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	h.statsController.StaticMapServed(true, path, staticMap.Style)
 	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 
-	if skipCache && r.URL.Query().Get("pregenerate") != "true" {
-		// nocache mode (without pregenerate): serve the image directly
-		// and clean up temp files. No cache index entry, no disk
-		// footprint left behind. If pregenerate=true is also set, we
-		// fall through to generateResponse which returns the filename.
+	if skipCache {
+		// nocache mode: serve the image directly and clean up temp
+		// files. No cache index entry, no disk footprint left behind.
+		// (pregenerate+nocache is already converted to TTL above.)
 		slog.Debug("Served static map (nocache)", "path", path, "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)

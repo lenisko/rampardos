@@ -122,10 +122,17 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	defer services.GlobalMetrics.DecrementInFlight("multistaticmap")
 
 	skipCache := r.URL.Query().Get("nocache") == "true"
+	pregenerate := r.URL.Query().Get("pregenerate") == "true"
 	ttlStr := r.URL.Query().Get("ttl")
 	var ttlSeconds int
 	if ttlStr != "" {
 		ttlSeconds, _ = strconv.Atoi(ttlStr)
+	}
+	if skipCache && pregenerate {
+		skipCache = false
+		if ttlSeconds == 0 {
+			ttlSeconds = 30
+		}
 	}
 
 	// Check if cached (use cache index first, then filesystem)
@@ -232,7 +239,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	h.statsController.StaticMapServed(true, path, "multi")
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
-	if skipCache && r.URL.Query().Get("pregenerate") != "true" {
+	if skipCache {
 		slog.Debug("Served multi-static map (nocache)", "maps", mapCount, "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)
