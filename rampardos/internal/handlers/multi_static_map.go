@@ -220,14 +220,13 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	slog.Debug("Served multi-static map (generated)", "maps", mapCount, "duration", duration)
 	h.generateResponse(w, r, multiStaticMap, path)
 
-	if ttlSeconds > 0 {
-		go func() {
-			time.Sleep(time.Duration(ttlSeconds) * time.Second)
-			os.Remove(path)
+	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
+		cleanupIndex := func() {
 			if services.GlobalCacheIndex != nil {
 				services.GlobalCacheIndex.RemoveMultiStaticMap(path)
 			}
-		}()
+		}
+		services.GlobalExpiryQueue.Add(time.Duration(ttlSeconds)*time.Second, cleanupIndex, path)
 	}
 }
 

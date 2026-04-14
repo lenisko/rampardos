@@ -159,6 +159,9 @@ func main() {
 	// Initialize image settings
 	services.InitImageSettings(cfg)
 
+	// Initialize expiry queue for TTL-based file cleanup
+	services.InitExpiryQueue(30 * time.Second)
+
 	// Initialize cache cleaners
 	initCacheCleaners(cfg)
 
