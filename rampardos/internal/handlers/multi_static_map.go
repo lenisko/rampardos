@@ -159,11 +159,22 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	}
 	mapCount := len(mapsToGenerate)
 
+	// Flow through nocache/ttl to component map generation.
+	componentOpts := GenerateOpts{}
+	if skipCache {
+		componentOpts.NoCache = true
+	}
+	if ttlSeconds > 0 {
+		componentOpts.TTL = time.Duration(ttlSeconds) * time.Second
+	}
+
 	// singleflight: deduplicate the entire generate+combine operation
 	// for identical multistaticmap requests.
 	_, sfErr, _ := h.sfg.Do(path, func() (any, error) {
-		if _, err := os.Stat(path); err == nil {
-			return nil, nil
+		if !skipCache {
+			if _, err := os.Stat(path); err == nil {
+				return nil, nil
+			}
 		}
 
 		// Generate all component maps in parallel (limit concurrency to 5)
@@ -179,7 +190,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm); err != nil {
+				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
 					errOnce.Do(func() {
 						genErr = err
 					})
@@ -193,7 +204,21 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		}
 
 		ensureDir(filepath.Dir(path))
-		return nil, utils.GenerateMultiStaticMap(multiStaticMap, path)
+		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
+
+		// For nocache, clean up component files now that they've been
+		// combined into the final image.
+		if skipCache {
+			for _, sm := range mapsToGenerate {
+				os.Remove(sm.Path())
+				bp := sm.BasePath()
+				if bp != sm.Path() {
+					os.Remove(bp)
+				}
+			}
+		}
+
+		return nil, err
 	})
 
 	if sfErr != nil {
