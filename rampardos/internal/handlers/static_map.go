@@ -253,7 +253,7 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 
 	if cached {
 		duration := time.Since(startTime).Seconds()
-		slog.Debug("Served static map (cached)", "path", path)
+		slog.Debug("Served static map (cached)", "file", filepath.Base(path))
 		h.statsController.StaticMapServed(false, path, staticMap.Style)
 		services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, true, duration)
 		h.generateResponse(w, r, staticMap, path)
@@ -296,7 +296,7 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		// nocache mode: serve the image directly and clean up temp
 		// files. No cache index entry, no disk footprint left behind.
 		// (pregenerate+nocache is already converted to TTL above.)
-		slog.Debug("Served static map (nocache)", "path", path, "duration", duration)
+		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)
 		if path != basePath {
@@ -309,7 +309,7 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	if services.GlobalCacheIndex != nil {
 		services.GlobalCacheIndex.AddStaticMap(path)
 	}
-	slog.Debug("Served static map (generated)", "path", path, "duration", duration)
+	slog.Debug("Served static map (generated)", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, staticMap, path)
 
 	// If a TTL was requested, queue the file for deletion after the
@@ -335,7 +335,7 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 
 	// Check if exists
 	if _, err := os.Stat(path); err == nil {
-		slog.Debug("Served static map (pregenerated)")
+		slog.Debug("Served static map (pregenerated)", "file", filepath.Base(path))
 		serveFile(w, r, path)
 		return
 	}
