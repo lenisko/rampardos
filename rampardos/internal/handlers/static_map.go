@@ -136,19 +136,29 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 	h.handlePregeneratedRequest(w, r, id)
 }
 
+// GenerateOpts controls caching behaviour for component map generation.
+type GenerateOpts struct {
+	NoCache    bool          // if true, delete files immediately after the caller is done
+	TTL        time.Duration // if > 0, queue files for deletion after this duration
+}
+
 // GenerateStaticMap generates a static map (used by MultiStaticMapHandler).
 // Concurrent requests for the same map are deduplicated via singleflight.
-func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap) error {
+func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) error {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
-	if _, err := os.Stat(path); err == nil {
-		return nil
+	if !opts.NoCache {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
 	}
 
 	_, err, _ := h.sfg.Do(path, func() (any, error) {
-		if _, err := os.Stat(path); err == nil {
-			return nil, nil
+		if !opts.NoCache {
+			if _, err := os.Stat(path); err == nil {
+				return nil, nil
+			}
 		}
 		baseExists := false
 		if _, err := os.Stat(basePath); err == nil {
@@ -156,7 +166,30 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 		}
 		return nil, h.generateStaticMap(ctx, path, basePath, baseExists, staticMap)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Apply TTL or nocache cleanup to component files.
+	if opts.NoCache {
+		// Caller will read the file then we clean up.
+		// Defer cleanup so the multistaticmap combiner can read it first.
+		// The caller (multistaticmap handler) is responsible for calling
+		// CleanupComponentMaps after combining.
+	} else if opts.TTL > 0 && services.GlobalExpiryQueue != nil {
+		cleanupIndex := func() {
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.RemoveStaticMap(path)
+			}
+		}
+		if path != basePath {
+			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path, basePath)
+		} else {
+			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
+		}
+	}
+
+	return nil
 }
 
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
