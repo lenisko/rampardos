@@ -150,7 +150,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 
 	if cached {
 		duration := time.Since(startTime).Seconds()
-		slog.Debug("Served multi-static map (cached)", "path", path)
+		slog.Debug("Served multi-static map (cached)", "file", filepath.Base(path))
 		h.statsController.StaticMapServed(false, path, "multi")
 		services.GlobalMetrics.RecordRequest("multistaticmap", "multi", true, duration)
 		h.generateResponse(w, r, multiStaticMap, path)
@@ -240,7 +240,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
 	if skipCache {
-		slog.Debug("Served multi-static map (nocache)", "maps", mapCount, "duration", duration)
+		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)
 		return
@@ -249,7 +249,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	if services.GlobalCacheIndex != nil {
 		services.GlobalCacheIndex.AddMultiStaticMap(path)
 	}
-	slog.Debug("Served multi-static map (generated)", "maps", mapCount, "duration", duration)
+	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, multiStaticMap, path)
 
 	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {

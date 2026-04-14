@@ -34,9 +34,10 @@ func main() {
 	cfg := config.Load()
 
 	// Initialize runtime settings (includes logging setup)
-	services.InitGlobalRuntimeSettings(false)
+	debugMode := os.Getenv("DEBUG") == "true"
+	services.InitGlobalRuntimeSettings(debugMode)
 
-	slog.Info("Configuration loaded", "timeout", cfg.RequestTimeout, "debug", false)
+	slog.Info("Configuration loaded", "timeout", cfg.RequestTimeout, "debug", debugMode)
 
 	// Initialize Pyroscope profiling if configured
 	services.InitPyroscope(cfg)
