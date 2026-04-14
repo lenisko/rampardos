@@ -149,7 +149,13 @@ func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req Vie
 		return nil, err
 	}
 
-	return encodeRGBA(rgba, req.Width, req.Height, req.Format)
+	// The wire frame sends Width*Scale and Height*Scale as the actual
+	// pixel dimensions. encodeRGBA needs the actual size to match the buffer.
+	scale := int(req.Scale)
+	if scale < 1 {
+		scale = 1
+	}
+	return encodeRGBA(rgba, req.Width*scale, req.Height*scale, req.Format)
 }
 
 // getOrCreatePool returns the pool for a style, creating it on first
@@ -192,33 +198,46 @@ func (npr *NodePoolRenderer) getOrCreatePool(styleID string) (*stylePool, error)
 // disk. In-flight renders against old pools finish normally; new
 // renders block until the rebuild completes.
 func (npr *NodePoolRenderer) ReloadStyles(ctx context.Context) error {
-	npr.mu.Lock()
-	defer npr.mu.Unlock()
-
-	// Rebuild only pools that are currently active (were created by
-	// getOrCreatePool). New styles added to disk will be picked up
-	// lazily on their first request.
+	// Snapshot active style IDs under a short read lock.
+	npr.mu.RLock()
 	activeIDs := make([]string, 0, len(npr.pools))
 	for id := range npr.pools {
 		activeIDs = append(activeIDs, id)
 	}
+	npr.mu.RUnlock()
 
-	// Drain old pools.
-	for _, pool := range npr.pools {
-		pool.close()
-	}
-
+	// Build new pools OUTSIDE the lock so in-flight renders continue
+	// against the old pools without blocking. Each loadPool spawns
+	// workers and waits for handshakes — this can take seconds.
 	newPools := make(map[string]*stylePool, len(activeIDs))
 	for _, id := range activeIDs {
+		if ctx.Err() != nil {
+			// Context expired (e.g. SIGHUP timeout) — stop spawning.
+			for _, p := range newPools {
+				p.close()
+			}
+			return ctx.Err()
+		}
 		pool, err := npr.loadPool(id)
 		if err != nil {
 			slog.Error("Failed to reload pool, style will be recreated on next request",
 				"style", id, "error", err)
-			continue // Don't fail the whole reload for one broken style
+			continue
 		}
 		newPools[id] = pool
 	}
+
+	// Swap under a short write lock: replace pools map, then close
+	// old pools after the swap (so any final in-flight dispatches
+	// that already hold a pool reference can finish).
+	npr.mu.Lock()
+	oldPools := npr.pools
 	npr.pools = newPools
+	npr.mu.Unlock()
+
+	for _, pool := range oldPools {
+		pool.close()
+	}
 	return nil
 }
 
@@ -234,13 +253,20 @@ func (npr *NodePoolRenderer) Close() error {
 }
 
 // requestFrameForViewport builds the JSON wire frame sent to the
-// worker for a viewport render.
+// worker for a viewport render. Width and height are multiplied by
+// Scale to get the actual rendered pixel dimensions — the worker's
+// mbgl.Map is constructed with ratio:1, so DPR must be baked into
+// the dimensions rather than passed as a separate ratio field.
 func requestFrameForViewport(vp ViewportRequest) []byte {
+	scale := int(vp.Scale)
+	if scale < 1 {
+		scale = 1
+	}
 	m := map[string]any{
 		"zoom":    vp.Zoom,
 		"center":  []float64{vp.Longitude, vp.Latitude},
-		"width":   vp.Width,
-		"height":  vp.Height,
+		"width":   vp.Width * scale,
+		"height":  vp.Height * scale,
 		"bearing": vp.Bearing,
 		"pitch":   vp.Pitch,
 	}
