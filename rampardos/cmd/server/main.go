@@ -203,9 +203,9 @@ func main() {
 	r := chi.NewRouter()
 
 	// Middleware
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
+	r.Use(custommw.RequestLogger())
+	r.Use(middleware.Recoverer)
 	r.Use(custommw.Timeout(cfg.RequestTimeout))
 	r.Use(custommw.DebugRequestBody())
 
