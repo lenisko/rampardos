@@ -270,20 +270,20 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	slog.Debug("Served static map (generated)", "path", path, "duration", duration)
 	h.generateResponse(w, r, staticMap, path)
 
-	// If a TTL was requested, schedule deletion after the specified
-	// duration. The file stays on disk long enough for the consumer
-	// (e.g. Telegram) to fetch it via the pregenerated URL.
-	if ttlSeconds > 0 {
-		go func() {
-			time.Sleep(time.Duration(ttlSeconds) * time.Second)
-			os.Remove(path)
-			if path != basePath {
-				os.Remove(basePath)
-			}
+	// If a TTL was requested, queue the file for deletion after the
+	// specified duration. A single background sweeper handles cleanup.
+	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
+		ttl := time.Duration(ttlSeconds) * time.Second
+		cleanupIndex := func() {
 			if services.GlobalCacheIndex != nil {
 				services.GlobalCacheIndex.RemoveStaticMap(path)
 			}
-		}()
+		}
+		if path != basePath {
+			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path, basePath)
+		} else {
+			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
+		}
 	}
 }
 
