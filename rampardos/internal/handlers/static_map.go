@@ -143,6 +143,14 @@ type GenerateOpts struct {
 	TTL        time.Duration // if > 0, queue files for deletion after this duration
 }
 
+// nocacheBaseTTLFloor is the minimum TTL applied to a shared basePath
+// when the owning request was nocache. Without this floor, a burst of
+// concurrent requests at the same viewport (e.g. mass weather alerts)
+// would each regenerate the base. The floor lets the render be reused
+// across the burst without persisting for days. Tiles are already
+// cached, so re-stitching after the floor expires is cheap.
+const nocacheBaseTTLFloor = 30 * time.Second
+
 // GenerateStaticMap generates a static map (used by MultiStaticMapHandler).
 // Concurrent requests for the same map are deduplicated via singleflight.
 func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) error {
@@ -176,10 +184,16 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 				services.GlobalCacheIndex.RemoveStaticMap(path)
 			}
 		}
-		// basePath is shared state governed by CacheCleaner age
-		// eviction; do not enqueue it alongside a single caller's
-		// TTL or siblings will suffer a premature base deletion.
-		services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
+		// Enqueue path and basePath together so the base doesn't
+		// outlive the caller's requested TTL by days via CacheCleaner.
+		// The cache-index no longer tracks basePath, so enqueuing it
+		// can't produce the stale-lie 500 that motivated this class
+		// of fix.
+		if path != basePath {
+			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path, basePath)
+		} else {
+			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
+		}
 	}
 
 	return nil
@@ -280,8 +294,15 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		// (pregenerate+nocache is already converted to TTL above.)
 		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
 		serveFile(w, r, path)
-		os.Remove(path)
-		// basePath is shared state; CacheCleaner age-evicts it.
+		// Overlay-baked artifact has no reuse value; delete now.
+		// Leave basePath with a short floor TTL so sibling burst
+		// requests at the same viewport can share the render.
+		if path != basePath {
+			os.Remove(path)
+		}
+		if services.GlobalExpiryQueue != nil {
+			services.GlobalExpiryQueue.Add(nocacheBaseTTLFloor, nil, basePath)
+		}
 		return
 	}
 
@@ -301,10 +322,15 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 				services.GlobalCacheIndex.RemoveStaticMap(path)
 			}
 		}
-		// basePath is shared state governed by CacheCleaner age
-		// eviction; do not enqueue it alongside a single caller's
-		// TTL or siblings will suffer a premature base deletion.
-		services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
+		// Enqueue path and basePath together so the base doesn't
+		// outlive the requested TTL via CacheCleaner's 7-day default.
+		// Re-stitching from tiles on the next request is cheap; the
+		// old stale-index lie that made this dangerous is gone.
+		if path != basePath {
+			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path, basePath)
+		} else {
+			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
+		}
 	}
 }
 

@@ -213,13 +213,21 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		ensureDir(filepath.Dir(path))
 		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
 
-		// For nocache, remove only each component's final path. The
-		// shared basePath is not this request's to delete — siblings
-		// may be rendering against it concurrently, and CacheCleaner
-		// age-evicts it on its own schedule.
+		// For nocache, overlay-baked component finals are deleted now.
+		// Each component's basePath gets a short floor TTL so sibling
+		// bursts (e.g. mass weather alerts at the same location) share
+		// one render. Re-stitching from cached tiles after the floor
+		// is cheap.
 		if skipCache {
 			for _, sm := range mapsToGenerate {
-				os.Remove(sm.Path())
+				smPath := sm.Path()
+				basePath := sm.BasePath()
+				if smPath != basePath {
+					os.Remove(smPath)
+				}
+				if services.GlobalExpiryQueue != nil {
+					services.GlobalExpiryQueue.Add(nocacheBaseTTLFloor, nil, basePath)
+				}
 			}
 		}
 
