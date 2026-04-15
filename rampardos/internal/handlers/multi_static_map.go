@@ -188,7 +188,17 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 			wg.Add(1)
 			go func(sm models.StaticMap) {
 				defer wg.Done()
-				sem <- struct{}{}
+				// Respect client disconnect / request timeout while
+				// waiting for a sem slot. Without this escape, queued
+				// goroutines sit blocked after ctx is cancelled, then
+				// wake up and redundantly call into GenerateStaticMap
+				// only to fail fast. Cheaper to short-circuit now.
+				select {
+				case sem <- struct{}{}:
+				case <-r.Context().Done():
+					errOnce.Do(func() { genErr = r.Context().Err() })
+					return
+				}
 				defer func() { <-sem }()
 
 				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
