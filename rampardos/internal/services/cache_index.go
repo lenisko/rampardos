@@ -13,12 +13,14 @@ type markerImageEntry struct {
 	image image.Image
 }
 
-// CacheIndex maintains an in-memory index of cached files to reduce syscalls
+// CacheIndex maintains an in-memory index of cached files to reduce
+// syscalls on the serve path. Tiles are not indexed — the HasTile /
+// AddTile plumbing had no readers and the map only grew for the
+// process lifetime.
 type CacheIndex struct {
 	staticMaps      map[string]struct{}
 	multiStaticMaps map[string]struct{}
 	markers         map[string]struct{}
-	tiles           map[string]struct{}
 	mu              sync.RWMutex
 
 	// LRU cache for resized marker images (path+size -> image.Image)
@@ -37,7 +39,6 @@ func NewCacheIndex() *CacheIndex {
 		staticMaps:      make(map[string]struct{}),
 		multiStaticMaps: make(map[string]struct{}),
 		markers:         make(map[string]struct{}),
-		tiles:           make(map[string]struct{}),
 		markerImages:    make(map[string]*list.Element),
 		markerImagesLRU: list.New(),
 		markerImagesMax: 500, // Default, can be changed via SetMarkerImageCacheSize
@@ -175,31 +176,3 @@ func (c *CacheIndex) RemoveMarker(path string) {
 	delete(c.markers, path)
 }
 
-// HasTile checks if a tile is in the cache index
-func (c *CacheIndex) HasTile(path string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.tiles[path]
-	return ok
-}
-
-// AddTile adds a tile to the cache index
-func (c *CacheIndex) AddTile(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.tiles[path] = struct{}{}
-}
-
-// RemoveTile removes a tile from the cache index
-func (c *CacheIndex) RemoveTile(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.tiles, path)
-}
-
-// Stats returns cache index statistics
-func (c *CacheIndex) Stats() (staticMaps, multiStaticMaps, markers, tiles int) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.staticMaps), len(c.multiStaticMaps), len(c.markers), len(c.tiles)
-}
