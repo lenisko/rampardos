@@ -21,6 +21,16 @@ func GenerateStaticMap(staticMap models.StaticMap, basePath, path string, sm *Sp
 	return GenerateStaticMapNative(staticMap, basePath, path, sm)
 }
 
+// GenerateStaticMapBytes draws overlays (markers/polygons/circles) onto
+// an already-encoded base image in memory and returns the encoded result.
+// No disk access for the base — callers hold the base bytes, so external
+// file deletion cannot affect this path. Markers may be supplied via
+// markerBytes (keyed by getMarkerPath(marker)); absent keys fall back to
+// the disk read in drawOverlays for legacy callers.
+func GenerateStaticMapBytes(staticMap models.StaticMap, baseBytes []byte, markerBytes map[string][]byte, sm *SphericalMercator) ([]byte, error) {
+	return generateStaticMapBytesNative(staticMap, baseBytes, markerBytes, sm)
+}
+
 // GenerateMultiStaticMap combines multiple static maps into a grid
 func GenerateMultiStaticMap(multiStaticMap models.MultiStaticMap, path string) error {
 	return GenerateMultiStaticMapNative(multiStaticMap, path)

@@ -122,15 +122,27 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	return saveImage(path, cropped)
 }
 
-// GenerateStaticMapNative adds markers, polygons, and circles to a base map using native Go
+// GenerateStaticMapNative is the legacy file-path entrypoint. It reads
+// the base from disk and delegates to the bytes implementation with
+// nil markerBytes (drawOverlays falls back to disk reads for markers).
 func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
-	// Load base image
-	baseImg, err := loadImage(basePath)
+	baseBytes, err := os.ReadFile(basePath)
 	if err != nil {
 		return fmt.Errorf("failed to load base image: %w", err)
 	}
+	out, err := generateStaticMapBytesNative(staticMap, baseBytes, nil, sm)
+	if err != nil {
+		return err
+	}
+	return SaveImageBytes(path, out)
+}
 
-	// Create drawing context
+// generateStaticMapBytesNative is the canonical in-memory implementation.
+func generateStaticMapBytesNative(staticMap models.StaticMap, baseBytes []byte, markerBytes map[string][]byte, sm *SphericalMercator) ([]byte, error) {
+	baseImg, err := decodeImage(baseBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode base: %w", err)
+	}
 	dc := gg.NewContextForImage(baseImg)
 
 	scale := staticMap.Scale
@@ -138,6 +150,17 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 		scale = 1
 	}
 
+	if err := drawOverlays(dc, staticMap, scale, markerBytes, sm); err != nil {
+		return nil, err
+	}
+
+	return encodeImage(dc.Image(), staticMap.GetFormat())
+}
+
+// drawOverlays renders polygons, circles, and markers onto dc. Marker
+// images may be supplied via markerBytes (map keyed by getMarkerPath);
+// when a key is missing, the marker is loaded from disk.
+func drawOverlays(dc *gg.Context, staticMap models.StaticMap, scale uint8, markerBytes map[string][]byte, sm *SphericalMercator) error {
 	// Process polygons
 	for _, polygon := range staticMap.Polygons {
 		if len(polygon.Path) == 0 {
@@ -262,7 +285,12 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 		// Load and resize if not cached
 		if markerImg == nil {
 			var err error
-			markerImg, err = loadImage(markerPath)
+			key := getMarkerPath(marker)
+			if b, ok := markerBytes[key]; ok {
+				markerImg, err = decodeImage(b)
+			} else {
+				markerImg, err = loadImage(markerPath)
+			}
 			if err != nil {
 				continue // Skip markers that can't be loaded
 			}
@@ -287,7 +315,7 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 		dc.DrawImage(markerImg, drawX, drawY)
 	}
 
-	return saveImage(path, dc.Image())
+	return nil
 }
 
 // GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go.

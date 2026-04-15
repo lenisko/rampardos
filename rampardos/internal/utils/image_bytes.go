@@ -6,6 +6,8 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"os"
+	"path/filepath"
 
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/models"
@@ -41,4 +43,32 @@ func encodeImage(img image.Image, format models.ImageFormat) ([]byte, error) {
 		return nil, fmt.Errorf("unsupported image format %q", format)
 	}
 	return buf.Bytes(), nil
+}
+
+// SaveImageBytes atomically writes encoded image bytes to path. The
+// parent directory is created if needed. Uses a temp file in the same
+// directory followed by rename, so readers never observe a partial file.
+func SaveImageBytes(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
 }
