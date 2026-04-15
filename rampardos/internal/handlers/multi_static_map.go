@@ -197,7 +197,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
+				if _, err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
 					errOnce.Do(func() {
 						genErr = err
 					})

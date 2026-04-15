@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/lenisko/rampardos/internal/models"
 )
 
 // knownDirs caches directories that have been created to avoid repeated syscalls
@@ -53,6 +55,17 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 func serveFile(w http.ResponseWriter, r *http.Request, path string) {
 	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
 	http.ServeFile(w, r, path)
+}
+
+func contentTypeFor(format models.ImageFormat) string {
+	switch format {
+	case models.ImageFormatJPG, models.ImageFormatJPEG:
+		return "image/jpeg"
+	case models.ImageFormatWEBP:
+		return "image/webp"
+	default:
+		return "image/png"
+	}
 }
 
 // handlePregenerateResponse handles pregenerate query param and saves regeneratable data if needed.
