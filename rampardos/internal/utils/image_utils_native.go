@@ -274,10 +274,10 @@ func drawOverlays(dc *gg.Context, staticMap models.StaticMap, scale uint8, marke
 			continue
 		}
 
-		markerPath := getMarkerPath(marker)
+		markerPath := GetMarkerPath(marker)
 		if marker.FallbackURL != "" {
 			if _, err := os.Stat(markerPath); os.IsNotExist(err) {
-				markerPath = getFallbackMarkerPath(marker)
+				markerPath = GetFallbackMarkerPath(marker)
 			}
 		}
 
@@ -296,7 +296,7 @@ func drawOverlays(dc *gg.Context, staticMap models.StaticMap, scale uint8, marke
 		// Load and resize if not cached
 		if markerImg == nil {
 			var err error
-			key := getMarkerPath(marker)
+			key := GetMarkerPath(marker)
 			if b, ok := markerBytes[key]; ok {
 				markerImg, err = decodeImage(b)
 			} else {

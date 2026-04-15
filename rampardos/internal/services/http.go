@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -165,4 +166,109 @@ func HTTPGet(ctx context.Context, fromURL string, timeout time.Duration) (*http.
 
 func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// HTTPServiceInitialized reports whether the global HTTP service has been
+// initialised. Useful in tests to avoid double-init.
+func HTTPServiceInitialized() bool { return globalHTTPService != nil }
+
+// InitHTTPServiceForTest initialises the global HTTP service with simple
+// in-memory clients suitable for unit tests.
+func InitHTTPServiceForTest() {
+	globalHTTPService = &HTTPService{
+		generalClient:  &http.Client{Timeout: 30 * time.Second},
+		downloadClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// DownloadBytes fetches a URL and returns the body as bytes. When
+// cachePath is non-empty, bytes are also persisted atomically to
+// that path (useful for marker caching: the bytes returned to the
+// caller are race-free; the disk copy is best-effort).
+// expectedType, if set, is matched against the response's Content-Type.
+// A cachePath write failure is non-fatal: DownloadBytes returns the
+// bytes and logs a warning — the in-memory bytes are the authoritative
+// result for the caller.
+func DownloadBytes(ctx context.Context, fromURL, cachePath, expectedType string, timeout time.Duration) ([]byte, error) {
+	if globalHTTPService == nil {
+		return nil, fmt.Errorf("HTTP service not initialized")
+	}
+	parsedURL, err := url.Parse(fromURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	host := parsedURL.Host
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	startTime := time.Now()
+	GlobalMetrics.RecordHTTPClientRequest(host)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fromURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("User-Agent", "TileserverCache")
+
+	resp, err := globalHTTPService.downloadClient.Do(req)
+	if err != nil {
+		GlobalMetrics.RecordHTTPClientError(host)
+		return nil, fmt.Errorf("failed to download: %w", err)
+	}
+	defer resp.Body.Close()
+
+	GlobalMetrics.RecordHTTPClientDuration(host, time.Since(startTime).Seconds())
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		GlobalMetrics.RecordHTTPClientError(host)
+		GlobalMetrics.RecordError("http_client", fmt.Sprintf("status_%d", resp.StatusCode))
+		return nil, fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	if expectedType != "" {
+		if ct := resp.Header.Get("Content-Type"); ct != "" && !hasPrefix(ct, expectedType) {
+			return nil, fmt.Errorf("invalid content type %q", ct)
+		}
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty response body")
+	}
+
+	if cachePath != "" {
+		if err := saveBytesAtomic(cachePath, data); err != nil {
+			slog.Warn("DownloadBytes: cache write failed", "path", cachePath, "error", err)
+		}
+	}
+	return data, nil
+}
+
+// saveBytesAtomic writes data to path via temp file + rename.
+func saveBytesAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }

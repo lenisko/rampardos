@@ -365,13 +365,12 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 		return baseBytes, nil
 	}
 
-	if err := h.downloadMarkers(ctx, staticMap); err != nil {
+	markerBytes, err := h.downloadMarkerBytes(ctx, staticMap)
+	if err != nil {
 		return nil, err
 	}
 
-	// markerBytes is nil here — drawOverlays falls back to disk reads
-	// for markers. Task 4b will upgrade this to in-memory markers.
-	finalBytes, err := utils.GenerateStaticMapBytes(staticMap, baseBytes, nil, h.sphericalMercator)
+	finalBytes, err := utils.GenerateStaticMapBytes(staticMap, baseBytes, markerBytes, h.sphericalMercator)
 	if err != nil {
 		return nil, err
 	}
@@ -572,105 +571,130 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	return utils.ComposeBaseStaticMapBytes(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
 }
 
-func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models.StaticMap) error {
-	// Ensure marker cache directory exists
+// downloadMarkerBytes returns marker image bytes keyed by each
+// marker's cache path (utils.GetMarkerPath). Bytes are read once
+// per request — either from disk when the marker is cached, or
+// directly from the HTTP response (and best-effort persisted to
+// Cache/Marker). Callers pass the map to utils.GenerateStaticMapBytes
+// so the overlay draw never touches Cache/Marker disk — closing the
+// race between CacheCleaner and draw that the old downloadMarkers
+// (which only wrote to disk) could not close.
+//
+// Primary URL failures fall back to marker.FallbackURL when present;
+// the fallback's bytes are stored under the PRIMARY key so
+// drawOverlays' map lookup still succeeds.
+func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap models.StaticMap) (map[string][]byte, error) {
 	ensureDir("Cache/Marker")
-
-	// Collect markers that need downloading
-	type markerDownload struct {
-		marker models.Marker
-		path   string
-		domain string
-		format string
+	if len(staticMap.Markers) == 0 {
+		return nil, nil
 	}
-	var toDownload []markerDownload
+
+	result := make(map[string][]byte, len(staticMap.Markers))
+	var mu sync.Mutex
+
+	type work struct {
+		marker models.Marker
+		key    string // primary key (always utils.GetMarkerPath)
+	}
+	var toFetch []work
 
 	for _, marker := range staticMap.Markers {
+		key := utils.GetMarkerPath(marker)
 		if !strings.HasPrefix(marker.URL, "http://") && !strings.HasPrefix(marker.URL, "https://") {
-			continue
-		}
-
-		hash := utils.PersistentHashString(marker.URL)
-		parts := strings.Split(marker.URL, ".")
-		format := "png"
-		if len(parts) > 0 {
-			format = parts[len(parts)-1]
-		}
-		path := fmt.Sprintf("Cache/Marker/%s.%s", hash, format)
-		domain := extractDomain(marker.URL)
-
-		// Check cache index first (fast path)
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(path) {
-			h.statsController.MarkerServed(false, path, domain)
-			continue
-		}
-
-		// Check filesystem
-		if _, err := os.Stat(path); err == nil {
-			// Add to cache index
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarker(path)
+			// Bundled marker under Markers/ — read directly once.
+			b, err := os.ReadFile(key)
+			if err != nil {
+				return nil, fmt.Errorf("read bundled marker %s: %w", key, err)
 			}
-			h.statsController.MarkerServed(false, path, domain)
+			result[key] = b
 			continue
 		}
-
-		toDownload = append(toDownload, markerDownload{marker, path, domain, format})
+		// Remote marker. Cached on disk?
+		if b, err := os.ReadFile(key); err == nil {
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.AddMarker(key)
+			}
+			if h.statsController != nil {
+				h.statsController.MarkerServed(false, key, extractDomain(marker.URL))
+			}
+			result[key] = b
+			continue
+		}
+		toFetch = append(toFetch, work{marker: marker, key: key})
 	}
 
-	if len(toDownload) == 0 {
-		return nil
+	if len(toFetch) == 0 {
+		return result, nil
 	}
 
-	// Download markers in parallel (limit concurrency to 10)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 10)
+	var fetchErr error
+	var errOnce sync.Once
 
-	for _, md := range toDownload {
+	for _, w := range toFetch {
 		wg.Add(1)
-		go func(md markerDownload) {
+		go func(w work) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			if err := services.DownloadFile(ctx, md.marker.URL, md.path, "", 0); err != nil {
-				// Try fallback
-				if md.marker.FallbackURL != "" {
-					fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
-					fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
-					fallbackDomain := extractDomain(md.marker.FallbackURL)
-
-					// Check if fallback exists
-					if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(fallbackPath) {
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-					if _, err := os.Stat(fallbackPath); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-
-					if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
-					}
-				}
-			} else {
+			b, err := services.DownloadBytes(ctx, w.marker.URL, w.key, "", 0)
+			if err == nil {
 				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarker(md.path)
+					services.GlobalCacheIndex.AddMarker(w.key)
 				}
-				h.statsController.MarkerServed(true, md.path, md.domain)
+				if h.statsController != nil {
+					h.statsController.MarkerServed(true, w.key, extractDomain(w.marker.URL))
+				}
+				mu.Lock()
+				result[w.key] = b
+				mu.Unlock()
+				return
 			}
-		}(md)
+			if w.marker.FallbackURL == "" {
+				errOnce.Do(func() { fetchErr = fmt.Errorf("marker %s: %w", w.marker.URL, err) })
+				return
+			}
+			fbKey := utils.GetFallbackMarkerPath(w.marker)
+			fbDomain := extractDomain(w.marker.FallbackURL)
+			// Cached fallback on disk?
+			if fb, err := os.ReadFile(fbKey); err == nil {
+				if services.GlobalCacheIndex != nil {
+					services.GlobalCacheIndex.AddMarker(fbKey)
+				}
+				if h.statsController != nil {
+					h.statsController.MarkerServed(false, fbKey, fbDomain)
+				}
+				mu.Lock()
+				result[w.key] = fb // stored under PRIMARY key for drawOverlays lookup
+				mu.Unlock()
+				return
+			}
+			fb, fbErr := services.DownloadBytes(ctx, w.marker.FallbackURL, fbKey, "", 0)
+			if fbErr != nil {
+				errOnce.Do(func() {
+					fetchErr = fmt.Errorf("marker %s (both primary and fallback failed): %w", w.marker.URL, fbErr)
+				})
+				return
+			}
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.AddMarker(fbKey)
+			}
+			if h.statsController != nil {
+				h.statsController.MarkerServed(true, fbKey, fbDomain)
+			}
+			mu.Lock()
+			result[w.key] = fb
+			mu.Unlock()
+		}(w)
 	}
-
 	wg.Wait()
-	return nil
+
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+	return result, nil
 }
 
 func extractDomain(url string) string {

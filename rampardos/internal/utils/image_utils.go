@@ -68,7 +68,10 @@ func getRealOffset(at, center models.Coordinate, zoom float64, scale uint8, extr
 	}
 }
 
-func getMarkerPath(marker models.Marker) string {
+// GetMarkerPath returns the cache path for the given marker's primary URL.
+// Remote markers (http/https) are stored as Cache/Marker/<hash>.<ext>;
+// bundled markers are stored as Markers/<filename>.
+func GetMarkerPath(marker models.Marker) string {
 	if strings.HasPrefix(marker.URL, "http://") || strings.HasPrefix(marker.URL, "https://") {
 		hash := PersistentHashString(marker.URL)
 		parts := strings.Split(marker.URL, ".")
@@ -81,7 +84,8 @@ func getMarkerPath(marker models.Marker) string {
 	return fmt.Sprintf("Markers/%s", marker.URL)
 }
 
-func getFallbackMarkerPath(marker models.Marker) string {
+// GetFallbackMarkerPath returns the cache path for the given marker's fallback URL.
+func GetFallbackMarkerPath(marker models.Marker) string {
 	if strings.HasPrefix(marker.FallbackURL, "http://") || strings.HasPrefix(marker.FallbackURL, "https://") {
 		hash := PersistentHashString(marker.FallbackURL)
 		parts := strings.Split(marker.FallbackURL, ".")
