@@ -135,16 +135,10 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// Check if cached (use cache index first, then filesystem)
 	cached := false
 	if !skipCache {
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMultiStaticMap(path) {
+		if _, err := os.Stat(path); err == nil {
 			cached = true
-		} else if _, err := os.Stat(path); err == nil {
-			cached = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMultiStaticMap(path)
-			}
 		}
 	}
 
@@ -252,19 +246,11 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if services.GlobalCacheIndex != nil {
-		services.GlobalCacheIndex.AddMultiStaticMap(path)
-	}
 	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, multiStaticMap, path)
 
 	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
-		cleanupIndex := func() {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.RemoveMultiStaticMap(path)
-			}
-		}
-		services.GlobalExpiryQueue.Add(time.Duration(ttlSeconds)*time.Second, cleanupIndex, path)
+		services.GlobalExpiryQueue.Add(time.Duration(ttlSeconds)*time.Second, nil, path)
 	}
 }
 
