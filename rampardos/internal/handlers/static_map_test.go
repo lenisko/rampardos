@@ -3,8 +3,6 @@ package handlers
 import (
 	"context"
 	"math"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/lenisko/rampardos/internal/models"
@@ -56,14 +54,14 @@ func newDispatchHandlerForTest(t *testing.T, ext *models.Style, rec *dispatchRec
 	h := &StaticMapHandler{
 		stylesController: stubStylesController{ext: ext},
 	}
-	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap, basePath string) error {
+	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap) ([]byte, error) {
 		rec.fromAPI++
-		return nil
+		return []byte{0x89, 'P', 'N', 'G'}, nil
 	}
-	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) error {
+	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, extStyle *models.Style) ([]byte, error) {
 		rec.fromTiles++
 		rec.lastExt = extStyle
-		return nil
+		return []byte{0x89, 'P', 'N', 'G'}, nil
 	}
 	h.logExternalViewportApproxFn = func(sm models.StaticMap) {
 		rec.lastWarn = true
@@ -77,15 +75,12 @@ func (s stubStylesController) GetExternalStyle(name string) *models.Style { retu
 
 func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 	ctx := context.Background()
-	tmp := t.TempDir()
-	basePath := filepath.Join(tmp, "base.png")
-	_ = os.Remove(basePath)
 
 	t.Run("local integer zoom -> stitch", func(t *testing.T) {
 		rec := &dispatchRecord{}
 		h := newDispatchHandlerForTest(t, nil, rec)
 		sm := models.StaticMap{Style: "local", Zoom: 14, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromTiles != 1 || rec.fromAPI != 0 {
@@ -104,7 +99,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		ext := &models.Style{ID: "ext", URL: "https://x/y/{z}/{x}/{y}.png"}
 		h := newDispatchHandlerForTest(t, ext, rec)
 		sm := models.StaticMap{Style: "ext", Zoom: 14, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromTiles != 1 || rec.fromAPI != 0 {
@@ -122,7 +117,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		rec := &dispatchRecord{}
 		h := newDispatchHandlerForTest(t, nil, rec)
 		sm := models.StaticMap{Style: "local", Zoom: 14.7, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromAPI != 1 || rec.fromTiles != 0 {
@@ -138,7 +133,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		ext := &models.Style{ID: "ext", URL: "https://x/y/{z}/{x}/{y}.png"}
 		h := newDispatchHandlerForTest(t, ext, rec)
 		sm := models.StaticMap{Style: "ext", Zoom: 14.7, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromTiles != 1 || rec.fromAPI != 0 {
@@ -162,9 +157,6 @@ func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
 	h.generateBaseStaticMapFromTilesFn = h.generateBaseStaticMapFromTiles
 	h.logExternalViewportApproxFn = h.logExternalViewportApprox
 
-	tmp := t.TempDir()
-	basePath := filepath.Join(tmp, "base.png")
-
 	sm := models.StaticMap{
 		Style:     "local",
 		Zoom:      14.7,
@@ -174,7 +166,7 @@ func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
 		Height:    512,
 		Scale:     1,
 	}
-	err := h.generateBaseStaticMapFromAPI(context.Background(), sm, basePath)
+	got, err := h.generateBaseStaticMapFromAPI(context.Background(), sm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,12 +182,8 @@ func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
 		t.Errorf("zoom: got %v, want 14.7", call.Viewport.Zoom)
 	}
 
-	// Verify bytes landed on disk.
-	got, err := os.ReadFile(basePath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Verify bytes were returned.
 	if len(got) == 0 {
-		t.Errorf("basePath is empty")
+		t.Errorf("returned bytes are empty")
 	}
 }

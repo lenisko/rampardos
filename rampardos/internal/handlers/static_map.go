@@ -41,8 +41,8 @@ type StaticMapHandler struct {
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
 	// record dispatch without touching tileserver-gl or disk.
-	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap, basePath string) error
-	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) error
+	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap) ([]byte, error)
+	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, extStyle *models.Style) ([]byte, error)
 	logExternalViewportApproxFn      func(sm models.StaticMap)
 }
 
@@ -370,7 +370,11 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 
 	// Generate base if needed
 	if !baseExists {
-		if err := h.generateBaseStaticMap(ctx, staticMap, basePath); err != nil {
+		baseBytes, err := h.generateBaseStaticMap(ctx, staticMap)
+		if err != nil {
+			return err
+		}
+		if err := utils.SaveImageBytes(basePath, baseBytes); err != nil {
 			return err
 		}
 	}
@@ -397,23 +401,20 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 	return utils.GenerateStaticMap(staticMap, basePath, path, h.sphericalMercator)
 }
 
-func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) error {
-	extStyle := h.stylesController.GetExternalStyle(staticMap.Style) // nil for local styles
+func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap) ([]byte, error) {
+	extStyle := h.stylesController.GetExternalStyle(staticMap.Style)
 
 	if extStyle == nil {
-		// Local style: fractional zoom → viewport render (native float zoom).
-		// Integer zoom → tile stitching (cacheable via Cache/Tile).
 		if isFractional(staticMap.Zoom) {
-			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap, basePath)
+			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap)
 		}
-		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
+		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
 	}
 
-	// External styles: tile stitching (no viewport endpoint available).
 	if isFractional(staticMap.Zoom) {
 		h.logExternalViewportApproxFn(staticMap)
 	}
-	return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
+	return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
 }
 
 func (h *StaticMapHandler) logExternalViewportApprox(sm models.StaticMap) {
@@ -425,12 +426,11 @@ func (h *StaticMapHandler) logExternalViewportApprox(sm models.StaticMap) {
 	)
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap, basePath string) error {
+func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap) ([]byte, error) {
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
 	}
-
 	bearing := 0.0
 	if staticMap.Bearing != nil {
 		bearing = *staticMap.Bearing
@@ -439,7 +439,6 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 	if staticMap.Pitch != nil {
 		pitch = *staticMap.Pitch
 	}
-
 	encoded, err := h.renderer.RenderViewport(ctx, renderer.ViewportRequest{
 		StyleID:   staticMap.Style,
 		Longitude: staticMap.Longitude,
@@ -453,17 +452,12 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 		Format:    staticMap.GetFormat(),
 	})
 	if err != nil {
-		return fmt.Errorf("renderer viewport: %w", err)
+		return nil, fmt.Errorf("renderer viewport: %w", err)
 	}
-
-	ensureDir(filepath.Dir(basePath))
-	if err := atomicWriteFile(basePath, encoded, 0o644); err != nil {
-		return fmt.Errorf("write base path: %w", err)
-	}
-	return nil
+	return encoded, nil
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, basePath string, extStyle *models.Style) error {
+func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, extStyle *models.Style) ([]byte, error) {
 	// Calculate tiles needed
 	center := models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude}
 	zoom := int(staticMap.Zoom)
@@ -528,7 +522,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	for range totalTiles {
 		slot := <-results
 		if slot.err != nil {
-			return fmt.Errorf("failed to generate tile: %w", slot.err)
+			return nil, fmt.Errorf("failed to generate tile: %w", slot.err)
 		}
 		tilePaths[slot.index] = slot.path
 	}
@@ -562,7 +556,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	}
 
 	// Combine tiles
-	return utils.GenerateBaseStaticMap(staticMap, tilePaths, basePath, offsetX, offsetY, hasScale, redownload)
+	return utils.ComposeBaseStaticMapBytes(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
 }
 
 func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models.StaticMap) error {

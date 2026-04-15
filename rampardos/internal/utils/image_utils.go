@@ -16,6 +16,14 @@ func GenerateBaseStaticMap(staticMap models.StaticMap, tilePaths []string, path 
 	return GenerateBaseStaticMapNative(staticMap, tilePaths, path, offsetX, offsetY, hasScale, redownload)
 }
 
+// ComposeBaseStaticMapBytes stitches tile images and crops to the
+// requested viewport, returning the encoded result. Equivalent to
+// GenerateBaseStaticMap but with no disk write — callers decide
+// whether to persist the returned bytes.
+func ComposeBaseStaticMapBytes(staticMap models.StaticMap, tilePaths []string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) ([]byte, error) {
+	return composeBaseStaticMapBytesNative(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
+}
+
 // GenerateStaticMap adds markers, polygons, and circles to a base map
 func GenerateStaticMap(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
 	return GenerateStaticMapNative(staticMap, basePath, path, sm)
