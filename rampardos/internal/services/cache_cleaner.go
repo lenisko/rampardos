@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -193,13 +192,9 @@ func (cc *CacheCleaner) runOnce() {
 
 		path := filepath.Join(cc.folder, entry.Name())
 
-		// If dropAll, remove all files
 		if dropAll {
 			if err := os.Remove(path); err == nil {
 				count++
-				if GlobalCacheIndex != nil {
-					cc.removeFromCacheIndex(path)
-				}
 			}
 			continue
 		}
@@ -212,10 +207,6 @@ func (cc *CacheCleaner) runOnce() {
 		if cc.shouldRemove(info, cutoff, dropCutoff) {
 			if err := os.Remove(path); err == nil {
 				count++
-				// Remove from cache index
-				if GlobalCacheIndex != nil {
-					cc.removeFromCacheIndex(path)
-				}
 			}
 		}
 	}
@@ -277,19 +268,3 @@ func (cc *CacheCleaner) shouldRemove(info os.FileInfo, cutoff, dropCutoff time.T
 	return false
 }
 
-// removeFromCacheIndex removes a path from the appropriate cache index
-// based on folder. Cache/Tile is not indexed — the Tile branch had no
-// readers and was removed alongside HasTile/AddTile.
-//
-// StaticMulti must be checked first — "Cache/Static" is a prefix of
-// "Cache/StaticMulti", so the broader case would shadow it.
-func (cc *CacheCleaner) removeFromCacheIndex(path string) {
-	switch {
-	case strings.HasPrefix(cc.folder, "Cache/StaticMulti"):
-		GlobalCacheIndex.RemoveMultiStaticMap(path)
-	case strings.HasPrefix(cc.folder, "Cache/Static"):
-		GlobalCacheIndex.RemoveStaticMap(path)
-	case strings.HasPrefix(cc.folder, "Cache/Marker"):
-		GlobalCacheIndex.RemoveMarker(path)
-	}
-}

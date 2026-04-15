@@ -179,20 +179,14 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	if opts.NoCache {
 		// Caller reads the file then cleans up.
 	} else if opts.TTL > 0 && services.GlobalExpiryQueue != nil {
-		cleanupIndex := func() {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.RemoveStaticMap(path)
-			}
-		}
 		// Enqueue path and basePath together so the base doesn't
-		// outlive the caller's requested TTL by days via CacheCleaner.
-		// The cache-index no longer tracks basePath, so enqueuing it
-		// can't produce the stale-lie 500 that motivated this class
-		// of fix.
+		// outlive the caller's requested TTL via CacheCleaner's
+		// default (~7 days). Re-stitching from cached tiles on a
+		// future request is cheap.
 		if path != basePath {
-			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path, basePath)
+			services.GlobalExpiryQueue.Add(opts.TTL, nil, path, basePath)
 		} else {
-			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
+			services.GlobalExpiryQueue.Add(opts.TTL, nil, path)
 		}
 	}
 
@@ -245,16 +239,13 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Check if cached (use cache index first, then filesystem)
+	// Check if cached — os.Stat is authoritative. The prior cache
+	// index could outlive its on-disk file and serve a stale "true"
+	// that led to a 404 on the subsequent ServeFile.
 	cached := false
 	if !skipCache {
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(path) {
+		if _, err := os.Stat(path); err == nil {
 			cached = true
-		} else if _, err := os.Stat(path); err == nil {
-			cached = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddStaticMap(path)
-			}
 		}
 	}
 
@@ -307,9 +298,6 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	}
 
 	// Normal mode: keep on disk for cache.
-	if services.GlobalCacheIndex != nil {
-		services.GlobalCacheIndex.AddStaticMap(path)
-	}
 	slog.Debug("Served static map (generated)", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, staticMap, path)
 
@@ -317,19 +305,13 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	// specified duration. A single background sweeper handles cleanup.
 	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
 		ttl := time.Duration(ttlSeconds) * time.Second
-		cleanupIndex := func() {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.RemoveStaticMap(path)
-			}
-		}
 		// Enqueue path and basePath together so the base doesn't
 		// outlive the requested TTL via CacheCleaner's 7-day default.
-		// Re-stitching from tiles on the next request is cheap; the
-		// old stale-index lie that made this dangerous is gone.
+		// Re-stitching from tiles on the next request is cheap.
 		if path != basePath {
-			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path, basePath)
+			services.GlobalExpiryQueue.Add(ttl, nil, path, basePath)
 		} else {
-			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
+			services.GlobalExpiryQueue.Add(ttl, nil, path)
 		}
 	}
 }
@@ -616,18 +598,8 @@ func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models
 		path := fmt.Sprintf("Cache/Marker/%s.%s", hash, format)
 		domain := extractDomain(marker.URL)
 
-		// Check cache index first (fast path)
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(path) {
-			h.statsController.MarkerServed(false, path, domain)
-			continue
-		}
-
-		// Check filesystem
+		// Already cached on disk?
 		if _, err := os.Stat(path); err == nil {
-			// Add to cache index
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarker(path)
-			}
 			h.statsController.MarkerServed(false, path, domain)
 			continue
 		}
@@ -651,36 +623,21 @@ func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models
 			defer func() { <-sem }()
 
 			if err := services.DownloadFile(ctx, md.marker.URL, md.path, "", 0); err != nil {
-				// Try fallback
-				if md.marker.FallbackURL != "" {
-					fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
-					fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
-					fallbackDomain := extractDomain(md.marker.FallbackURL)
+				if md.marker.FallbackURL == "" {
+					return
+				}
+				fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
+				fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
+				fallbackDomain := extractDomain(md.marker.FallbackURL)
 
-					// Check if fallback exists
-					if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(fallbackPath) {
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-					if _, err := os.Stat(fallbackPath); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-
-					if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
-					}
+				if _, err := os.Stat(fallbackPath); err == nil {
+					h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
+					return
+				}
+				if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
+					h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
 				}
 			} else {
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarker(md.path)
-				}
 				h.statsController.MarkerServed(true, md.path, md.domain)
 			}
 		}(md)
