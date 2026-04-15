@@ -213,15 +213,13 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		ensureDir(filepath.Dir(path))
 		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
 
-		// For nocache, clean up component files now that they've been
-		// combined into the final image.
+		// For nocache, remove only each component's final path. The
+		// shared basePath is not this request's to delete — siblings
+		// may be rendering against it concurrently, and CacheCleaner
+		// age-evicts it on its own schedule.
 		if skipCache {
 			for _, sm := range mapsToGenerate {
 				os.Remove(sm.Path())
-				bp := sm.BasePath()
-				if bp != sm.Path() {
-					os.Remove(bp)
-				}
 			}
 		}
 
