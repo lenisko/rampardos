@@ -389,6 +389,12 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 // requests (different overlays, same viewport) do not duplicate
 // base rendering.
 //
+// Singleflight key correctness: basePath == BasePath() ==
+// hash(WithoutDrawables()), so two callers share a slot iff their
+// base-rendering inputs (style/lat/lon/zoom/w/h/scale/bearing/pitch/
+// format) are identical. generateBaseStaticMap reads none of
+// Markers/Polygons/Circles, so merging the renders is safe.
+//
 // Cache-persist failure is non-fatal: the request succeeds with
 // bytes in hand; the next request pays the cache miss.
 func (h *StaticMapHandler) loadOrRenderBaseBytes(ctx context.Context, staticMap models.StaticMap, basePath string) ([]byte, error) {
@@ -582,7 +588,15 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 //
 // Primary URL failures fall back to marker.FallbackURL when present;
 // the fallback's bytes are stored under the PRIMARY key so
-// drawOverlays' map lookup still succeeds.
+// drawOverlays' map lookup still succeeds. This is load-bearing:
+// drawOverlays does `markerBytes[GetMarkerPath(marker)]` with no
+// awareness of fallback. If that lookup moves, the fallback store
+// key here must move in lockstep.
+//
+// Marker download failure is non-fatal: the key is omitted from
+// the result map, drawOverlays skips missing markers, and the
+// request renders without it. Matches the legacy downloadMarkers
+// behaviour — a broken marker URL must not 500 a staticmap request.
 func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap models.StaticMap) (map[string][]byte, error) {
 	ensureDir("Cache/Marker")
 	if len(staticMap.Markers) == 0 {
@@ -627,10 +641,12 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 		return result, nil
 	}
 
+	// Marker failures are tolerated: a missing marker is omitted from
+	// the result map, drawOverlays skips it, and the request still
+	// succeeds. This matches the legacy downloadMarkers behaviour —
+	// a broken marker URL should not 500 a staticmap request.
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 10)
-	var fetchErr error
-	var errOnce sync.Once
 
 	for _, w := range toFetch {
 		wg.Add(1)
@@ -653,12 +669,11 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 				return
 			}
 			if w.marker.FallbackURL == "" {
-				errOnce.Do(func() { fetchErr = fmt.Errorf("marker %s: %w", w.marker.URL, err) })
+				slog.Warn("Marker download failed; omitting from image", "url", w.marker.URL, "error", err)
 				return
 			}
 			fbKey := utils.GetFallbackMarkerPath(w.marker)
 			fbDomain := extractDomain(w.marker.FallbackURL)
-			// Cached fallback on disk?
 			if fb, err := os.ReadFile(fbKey); err == nil {
 				if services.GlobalCacheIndex != nil {
 					services.GlobalCacheIndex.AddMarker(fbKey)
@@ -673,9 +688,8 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 			}
 			fb, fbErr := services.DownloadBytes(ctx, w.marker.FallbackURL, fbKey, "", 0)
 			if fbErr != nil {
-				errOnce.Do(func() {
-					fetchErr = fmt.Errorf("marker %s (both primary and fallback failed): %w", w.marker.URL, fbErr)
-				})
+				slog.Warn("Marker primary and fallback both failed; omitting from image",
+					"url", w.marker.URL, "fallback", w.marker.FallbackURL, "error", fbErr)
 				return
 			}
 			if services.GlobalCacheIndex != nil {
@@ -691,9 +705,6 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 	}
 	wg.Wait()
 
-	if fetchErr != nil {
-		return nil, fetchErr
-	}
 	return result, nil
 }
 

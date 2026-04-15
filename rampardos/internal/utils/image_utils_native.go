@@ -397,6 +397,10 @@ func composeMultiStaticMapBytesNative(multiStaticMap models.MultiStaticMap, comp
 		result = appendImages(result, groupImages[i], dir)
 	}
 
+	// MultiStaticMap carries no Format field; output is always PNG.
+	// The multi handler's generateResponseBytes sets Content-Type
+	// accordingly. If a future change adds per-multi format support,
+	// thread it through here too.
 	return encodeImage(result, models.ImageFormatPNG)
 }
 

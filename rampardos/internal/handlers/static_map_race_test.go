@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lenisko/rampardos/internal/models"
 )
@@ -87,15 +88,39 @@ func TestBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 
 // TestConcurrentSiblingBaseSingleflight verifies that N concurrent
 // requests for the same basePath render it exactly once.
+//
+// Determinism: the fake render fn blocks on a gate so the leader
+// cannot release the singleflight slot before followers arrive. A
+// previous version of this test let the leader finish synchronously,
+// which meant the singleflight dedupe could be bypassed by luck
+// (goroutine 2 entering Do after goroutine 1 had already returned).
 func TestConcurrentSiblingBaseSingleflight(t *testing.T) {
-	h, renders, cleanup := raceTestHandler(t)
+	h, cleanup := newTestStaticMapHandler(t)
 	defer cleanup()
+	h.stylesController = stubStylesController{ext: nil}
+	h.logExternalViewportApproxFn = func(sm models.StaticMap) {}
+
+	const N = 8
+	var renders atomic.Int32
+	reached := make(chan struct{}, N+1)
+	gate := make(chan struct{})
+	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, _ *models.Style) ([]byte, error) {
+		renders.Add(1)
+		reached <- struct{}{}
+		<-gate
+		return fakePNG(t), nil
+	}
+	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap) ([]byte, error) {
+		renders.Add(1)
+		reached <- struct{}{}
+		<-gate
+		return fakePNG(t), nil
+	}
 
 	sm := raceTestStaticMap()
 	basePath := sm.BasePath()
 	ctx := context.Background()
 
-	const N = 8
 	var wg sync.WaitGroup
 	for i := 0; i < N; i++ {
 		wg.Add(1)
@@ -106,10 +131,20 @@ func TestConcurrentSiblingBaseSingleflight(t *testing.T) {
 			}
 		}()
 	}
+
+	// Wait for the singleflight leader to reach the render fn. If
+	// singleflight dedupes correctly, exactly one goroutine arrives.
+	<-reached
+	// Give the scheduler room to park the other N-1 goroutines inside
+	// baseSfg.Do. They should all be suspended on the shared key.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
 	wg.Wait()
 
-	got := renders.Load()
-	if got != 1 {
+	if got := renders.Load(); got != 1 {
 		t.Fatalf("expected 1 base render for %d concurrent callers, got %d", N, got)
+	}
+	if extra := len(reached); extra != 0 {
+		t.Fatalf("expected no extra render fn entries, got %d", extra)
 	}
 }

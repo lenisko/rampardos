@@ -231,9 +231,17 @@ func DownloadBytes(ctx context.Context, fromURL, cachePath, expectedType string,
 		}
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	// Cap body size to prevent a malicious or misconfigured upstream
+	// from OOMing the server. Markers and other assets fetched through
+	// DownloadBytes are image files in the low-KB range; 32 MiB is
+	// comfortably above any legitimate payload.
+	const maxDownloadBytes = 32 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(data)) > maxDownloadBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxDownloadBytes)
 	}
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty response body")
