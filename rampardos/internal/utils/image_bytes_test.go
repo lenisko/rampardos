@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -60,6 +61,47 @@ func TestGenerateStaticMapBytes_NoDrawables(t *testing.T) {
 	if _, err := decodeImage(out); err != nil {
 		t.Fatalf("output not decodable: %v", err)
 	}
+}
+
+func TestComposeMultiStaticMapBytes_TwoHorizontal(t *testing.T) {
+	red := uniformPNG(t, color.RGBA{R: 255, A: 255})
+	blue := uniformPNG(t, color.RGBA{B: 255, A: 255})
+
+	msm := models.MultiStaticMap{
+		Grid: []models.DirectionedMultiStaticMap{
+			{
+				Direction: models.CombineDirectionFirst,
+				Maps: []models.DirectionedStaticMap{
+					{Map: models.StaticMap{}, Direction: models.CombineDirectionFirst},
+					{Map: models.StaticMap{}, Direction: models.CombineDirectionRight},
+				},
+			},
+		},
+	}
+
+	out, err := ComposeMultiStaticMapBytes(msm, [][]byte{red, blue})
+	if err != nil {
+		t.Fatalf("compose: %v", err)
+	}
+	got, err := decodeImage(out)
+	if err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if got.Bounds().Dx() != 16 || got.Bounds().Dy() != 8 {
+		t.Fatalf("bounds: got %v want 16x8", got.Bounds())
+	}
+}
+
+// uniformPNG returns an 8x8 PNG filled with c.
+func uniformPNG(t *testing.T, c color.Color) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: c}, image.Point{}, draw.Src)
+	b, err := encodeImage(img, models.ImageFormatPNG)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return b
 }
 
 func TestGenerateStaticMapBytes_FileWrapperStillWorks(t *testing.T) {

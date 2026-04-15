@@ -44,6 +44,13 @@ func GenerateMultiStaticMap(multiStaticMap models.MultiStaticMap, path string) e
 	return GenerateMultiStaticMapNative(multiStaticMap, path)
 }
 
+// ComposeMultiStaticMapBytes composes pre-encoded component images
+// into the final grid image. componentBytes must be in grid iteration
+// order (outer: grids, inner: maps within each grid, flattened).
+func ComposeMultiStaticMapBytes(multiStaticMap models.MultiStaticMap, componentBytes [][]byte) ([]byte, error) {
+	return composeMultiStaticMapBytesNative(multiStaticMap, componentBytes)
+}
+
 type offsetResult struct {
 	x, y int
 }

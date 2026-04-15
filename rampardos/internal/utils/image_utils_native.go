@@ -329,34 +329,52 @@ func drawOverlays(dc *gg.Context, staticMap models.StaticMap, scale uint8, marke
 	return nil
 }
 
-// GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go.
-//
-// This matches ImageMagick's -append/+append behaviour used by the
-// original Swift implementation: each image in a grid group is
-// sequentially appended to the cumulative result, and images are
-// scaled to match the append dimension (height for +append/right,
-// width for -append/bottom) so the seams align cleanly.
+// GenerateMultiStaticMapNative is the legacy file-path entrypoint.
+// Reads each component from disk in grid iteration order and delegates
+// to composeMultiStaticMapBytesNative.
 func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path string) error {
-	// Build each grid group as a composite image, then combine groups.
+	var componentBytes [][]byte
+	for _, grid := range multiStaticMap.Grid {
+		for _, m := range grid.Maps {
+			b, err := os.ReadFile(m.Map.Path())
+			if err != nil {
+				return fmt.Errorf("failed to load map %s: %w", m.Map.Path(), err)
+			}
+			componentBytes = append(componentBytes, b)
+		}
+	}
+	out, err := composeMultiStaticMapBytesNative(multiStaticMap, componentBytes)
+	if err != nil {
+		return err
+	}
+	return SaveImageBytes(path, out)
+}
+
+// composeMultiStaticMapBytesNative is the canonical in-memory grid
+// composer. componentBytes must align with the flat iteration order:
+// for each grid, for each map within it, in order.
+func composeMultiStaticMapBytesNative(multiStaticMap models.MultiStaticMap, componentBytes [][]byte) ([]byte, error) {
 	var groupImages []image.Image
 	var groupDirections []models.CombineDirection
 
+	idx := 0
 	for _, grid := range multiStaticMap.Grid {
 		var composite image.Image
 
 		for _, m := range grid.Maps {
-			mapPath := m.Map.Path()
-			img, err := loadImage(mapPath)
+			if idx >= len(componentBytes) {
+				return nil, fmt.Errorf("component bytes underflow at idx %d (got %d entries)", idx, len(componentBytes))
+			}
+			img, err := decodeImage(componentBytes[idx])
+			idx++
 			if err != nil {
-				return fmt.Errorf("failed to load map %s: %w", mapPath, err)
+				return nil, fmt.Errorf("decode component %d: %w", idx-1, err)
 			}
 
 			if m.Direction == models.CombineDirectionFirst || composite == nil {
-				// First image in the group — this is the anchor.
 				composite = img
 				continue
 			}
-
 			composite = appendImages(composite, img, m.Direction)
 		}
 
@@ -367,10 +385,9 @@ func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path str
 	}
 
 	if len(groupImages) == 0 {
-		return fmt.Errorf("no images to combine")
+		return nil, fmt.Errorf("no images to combine")
 	}
 
-	// Combine all grid groups together.
 	result := groupImages[0]
 	for i := 1; i < len(groupImages); i++ {
 		dir := groupDirections[i]
@@ -380,7 +397,7 @@ func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path str
 		result = appendImages(result, groupImages[i], dir)
 	}
 
-	return saveImage(path, result)
+	return encodeImage(result, models.ImageFormatPNG)
 }
 
 // appendImages combines two images in the given direction, scaling the
