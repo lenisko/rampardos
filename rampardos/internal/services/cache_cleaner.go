@@ -282,6 +282,8 @@ func (cc *CacheCleaner) shouldRemove(info os.FileInfo, cutoff, dropCutoff time.T
 // Cache/Tile and Cache/Marker are not (the index entries gave no
 // measurable benefit for those paths).
 func (cc *CacheCleaner) removeFromCacheIndex(path string) {
+	// StaticMulti must be checked first — "Cache/Static" is a prefix
+	// of "Cache/StaticMulti", so the broader case would shadow it.
 	switch {
 	case strings.HasPrefix(cc.folder, "Cache/StaticMulti"):
 		GlobalCacheIndex.RemoveMultiStaticMap(path)

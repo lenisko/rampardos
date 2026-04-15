@@ -155,9 +155,3 @@ func (c *CacheIndex) RemoveMultiStaticMap(path string) {
 	delete(c.multiStaticMaps, path)
 }
 
-// Stats returns cache index statistics.
-func (c *CacheIndex) Stats() (staticMaps, multiStaticMaps int) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.staticMaps), len(c.multiStaticMaps)
-}
