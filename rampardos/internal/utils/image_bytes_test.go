@@ -104,6 +104,55 @@ func uniformPNG(t *testing.T, c color.Color) []byte {
 	return b
 }
 
+// TestComposeMultiStaticMapBytes_ImmuneToComponentDeletion verifies
+// the invariant Task 7 depends on: once components are held as
+// [][]byte, the stitcher cannot be affected by concurrent deletion
+// of any on-disk copies. This test pre-populates on-disk copies,
+// deletes them before compose, and confirms the compose still
+// produces a valid image.
+func TestComposeMultiStaticMapBytes_ImmuneToComponentDeletion(t *testing.T) {
+	red := uniformPNG(t, color.RGBA{R: 255, A: 255})
+	blue := uniformPNG(t, color.RGBA{B: 255, A: 255})
+
+	tmp := t.TempDir()
+	redPath := filepath.Join(tmp, "red.png")
+	bluePath := filepath.Join(tmp, "blue.png")
+	if err := os.WriteFile(redPath, red, 0o644); err != nil {
+		t.Fatalf("write red: %v", err)
+	}
+	if err := os.WriteFile(bluePath, blue, 0o644); err != nil {
+		t.Fatalf("write blue: %v", err)
+	}
+
+	// Simulate CacheCleaner sweep between component fetch and stitch.
+	if err := os.Remove(redPath); err != nil {
+		t.Fatalf("remove red: %v", err)
+	}
+	if err := os.Remove(bluePath); err != nil {
+		t.Fatalf("remove blue: %v", err)
+	}
+
+	msm := models.MultiStaticMap{
+		Grid: []models.DirectionedMultiStaticMap{
+			{
+				Direction: models.CombineDirectionFirst,
+				Maps: []models.DirectionedStaticMap{
+					{Map: models.StaticMap{}, Direction: models.CombineDirectionFirst},
+					{Map: models.StaticMap{}, Direction: models.CombineDirectionRight},
+				},
+			},
+		},
+	}
+
+	out, err := ComposeMultiStaticMapBytes(msm, [][]byte{red, blue})
+	if err != nil {
+		t.Fatalf("compose after component deletion: %v", err)
+	}
+	if _, err := decodeImage(out); err != nil {
+		t.Fatalf("output not decodable: %v", err)
+	}
+}
+
 func TestGenerateStaticMapBytes_FileWrapperStillWorks(t *testing.T) {
 	// Legacy GenerateStaticMapNative file-path path must still work:
 	// write a base to a temp dir, call the file-path wrapper, read the result.
