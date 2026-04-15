@@ -11,6 +11,11 @@ var (
 	jetForPattern  = regexp.MustCompile(`#for\s*\(\s*(\w+)\s+in\s+(\w+(?:\.\w+)*)\s*\)\s*:`)
 	jetIndexRegex  = regexp.MustCompile(`#index\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)`)
 	jetIndexWordRe = regexp.MustCompile(`\bindex\b`)
+	// Jet's `x != nil` does not safeguard against undefined identifiers —
+	// accessing an unset context key raises at render time. `isset(x)`
+	// is the idiomatic check and also covers the nil case.
+	jetNotNilRegex = regexp.MustCompile(`(\w+(?:\.\w+)*)\s*!=\s*nil`)
+	jetIsNilRegex  = regexp.MustCompile(`(\w+(?:\.\w+)*)\s*==\s*nil`)
 )
 
 // LeafToJetConverter converts Leaf template syntax to Jet template syntax
@@ -204,8 +209,8 @@ func (c *LeafToJetConverter) convertIfBlock(condition, body string) string {
 func (c *LeafToJetConverter) convertCondition(condition string) string {
 	condition = strings.TrimSpace(condition)
 
-	// Jet uses same operators as Go: ==, !=, etc.
-	// nil in Leaf -> nil in Jet (Jet understands nil)
+	condition = jetNotNilRegex.ReplaceAllString(condition, "isset($1)")
+	condition = jetIsNilRegex.ReplaceAllString(condition, "!isset($1)")
 
 	// Convert Leaf's magic "index" variable to Jet's "i" (from range loop)
 	// Use word boundary matching to avoid replacing "index" in "indexOf" etc.

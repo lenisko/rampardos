@@ -208,9 +208,14 @@
                   <td><code>&#123;&#123; object.property &#125;&#125;</code></td>
                 </tr>
                 <tr>
-                  <td>If (not nil)</td>
+                  <td>If Defined (not nil)</td>
                   <td><code>#if(var != nil):...#endif</code></td>
-                  <td><code>&#123;&#123; if var != nil &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                  <td><code>&#123;&#123; if isset(var) &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                </tr>
+                <tr>
+                  <td>If Not Defined (nil)</td>
+                  <td><code>#if(var == nil):...#endif</code></td>
+                  <td><code>&#123;&#123; if !isset(var) &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
                 </tr>
                 <tr>
                   <td>If/Else If/Else</td>
@@ -225,7 +230,7 @@
                 <tr>
                   <td>Boolean AND/OR</td>
                   <td><code>#if(a != nil &amp;&amp; b):...#endif</code></td>
-                  <td><code>&#123;&#123; if a != nil &amp;&amp; b &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
+                  <td><code>&#123;&#123; if isset(a) &amp;&amp; b &#125;&#125;...&#123;&#123; end &#125;&#125;</code></td>
                 </tr>
                 <tr>
                   <td>Loop</td>
@@ -266,6 +271,10 @@
             <p class="text-warning mb-0 mt-2">
               <i class="fas fa-exclamation-triangle"></i>
               <strong>Tip:</strong> If a variable contains a JSON string (e.g. <code>poly_path</code>), use <code>json(poly_path)</code> to parse it before iterating: <code>&#123;&#123; range i, item := json(poly_path) &#125;&#125;</code>
+            </p>
+            <p class="text-warning mb-0 mt-2">
+              <i class="fas fa-exclamation-triangle"></i>
+              <strong>Tip:</strong> Use <code>isset(var)</code> instead of <code>var != nil</code>. Jet raises an error on undefined context keys, so <code>isset()</code> is the safe way to check that an optional variable was provided.
             </p>
           </div>
         </div>
