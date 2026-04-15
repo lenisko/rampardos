@@ -36,7 +36,8 @@ type StaticMapHandler struct {
 	statsController   *services.StatsController
 	stylesController  stylesControllerGetExternal
 	sphericalMercator *utils.SphericalMercator
-	sfg               singleflight.Group // dedup concurrent generates for same path
+	sfg               singleflight.Group // dedup concurrent generates for same final path
+	baseSfg           singleflight.Group // dedup concurrent base renders for same basePath
 
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
@@ -160,11 +161,7 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 				return nil, nil
 			}
 		}
-		baseExists := false
-		if _, err := os.Stat(basePath); err == nil {
-			baseExists = true
-		}
-		return nil, h.generateStaticMap(ctx, path, basePath, baseExists, staticMap)
+		return nil, h.generateStaticMap(ctx, path, basePath, staticMap)
 	})
 	if err != nil {
 		return err
@@ -172,21 +169,17 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 
 	// Apply TTL or nocache cleanup to component files.
 	if opts.NoCache {
-		// Caller will read the file then we clean up.
-		// Defer cleanup so the multistaticmap combiner can read it first.
-		// The caller (multistaticmap handler) is responsible for calling
-		// CleanupComponentMaps after combining.
+		// Caller reads the file then cleans up.
 	} else if opts.TTL > 0 && services.GlobalExpiryQueue != nil {
 		cleanupIndex := func() {
 			if services.GlobalCacheIndex != nil {
 				services.GlobalCacheIndex.RemoveStaticMap(path)
 			}
 		}
-		if path != basePath {
-			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path, basePath)
-		} else {
-			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
-		}
+		// basePath is shared state governed by CacheCleaner age
+		// eviction; do not enqueue it alongside a single caller's
+		// TTL or siblings will suffer a premature base deletion.
+		services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
 	}
 
 	return nil
@@ -264,21 +257,10 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	// singleflight. Two poracle webhooks for the same spawn arriving
 	// simultaneously will only generate once.
 	_, genErr, _ := h.sfg.Do(path, func() (any, error) {
-		// Double-check cache inside singleflight.
 		if _, err := os.Stat(path); err == nil {
 			return nil, nil
 		}
-
-		baseExists := false
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(basePath) {
-			baseExists = true
-		} else if _, err := os.Stat(basePath); err == nil {
-			baseExists = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddStaticMap(basePath)
-			}
-		}
-		return nil, h.generateStaticMap(r.Context(), path, basePath, baseExists, staticMap)
+		return nil, h.generateStaticMap(r.Context(), path, basePath, staticMap)
 	})
 
 	if genErr != nil {
@@ -299,9 +281,7 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
 		serveFile(w, r, path)
 		os.Remove(path)
-		if path != basePath {
-			os.Remove(basePath)
-		}
+		// basePath is shared state; CacheCleaner age-evicts it.
 		return
 	}
 
@@ -321,11 +301,10 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 				services.GlobalCacheIndex.RemoveStaticMap(path)
 			}
 		}
-		if path != basePath {
-			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path, basePath)
-		} else {
-			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
-		}
+		// basePath is shared state governed by CacheCleaner age
+		// eviction; do not enqueue it alongside a single caller's
+		// TTL or siblings will suffer a premature base deletion.
+		services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
 	}
 }
 
@@ -362,18 +341,37 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 	h.handleRequest(w, r, staticMap)
 }
 
-func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, baseExists bool, staticMap models.StaticMap) error {
-	// Ensure cache directory exists (cached check)
+// ensureBase renders basePath if it's missing on disk. Concurrent
+// callers for the same basePath are deduplicated via baseSfg, so
+// sibling requests (same viewport, different overlays) do not
+// duplicate base rendering. The cache index is not consulted — a
+// stale entry could falsely claim the base existed while it had
+// been removed by CacheCleaner or an external actor, leading the
+// subsequent read to fail.
+//
+// Singleflight key correctness: basePath == BasePath() ==
+// hash(WithoutDrawables()), so two callers share a slot iff their
+// base-rendering inputs (style/lat/lon/zoom/w/h/scale/bearing/pitch/
+// format) are identical. Base generation reads none of Markers,
+// Polygons, or Circles, so merging the renders is safe.
+func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string) error {
+	_, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
+		if _, err := os.Stat(basePath); err == nil {
+			return nil, nil
+		}
+		return nil, h.generateBaseStaticMap(ctx, staticMap, basePath)
+	})
+	return err
+}
+
+func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap) error {
 	ensureDir(filepath.Dir(path))
 
-	hasDrawables := len(staticMap.Markers) > 0 || len(staticMap.Polygons) > 0 || len(staticMap.Circles) > 0
-
-	// Generate base if needed
-	if !baseExists {
-		if err := h.generateBaseStaticMap(ctx, staticMap, basePath); err != nil {
-			return err
-		}
+	if err := h.ensureBase(ctx, staticMap, basePath); err != nil {
+		return err
 	}
+
+	hasDrawables := len(staticMap.Markers) > 0 || len(staticMap.Polygons) > 0 || len(staticMap.Circles) > 0
 
 	// If no drawables, just use base
 	if !hasDrawables {
