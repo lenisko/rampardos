@@ -13,15 +13,19 @@ type markerImageEntry struct {
 	image image.Image
 }
 
-// CacheIndex maintains an in-memory index of cached files to reduce syscalls
+// CacheIndex maintains an in-memory index of cached files to reduce
+// syscalls on the serve path. Only the final staticmap/multistaticmap
+// paths are indexed — tile and marker caches are managed entirely via
+// the filesystem and CacheCleaner, since in-memory presence checks
+// gave no measurable benefit for those paths.
 type CacheIndex struct {
 	staticMaps      map[string]struct{}
 	multiStaticMaps map[string]struct{}
-	markers         map[string]struct{}
-	tiles           map[string]struct{}
 	mu              sync.RWMutex
 
-	// LRU cache for resized marker images (path+size -> image.Image)
+	// LRU cache for resized marker images (path+size -> image.Image).
+	// Unlike the file-presence indices, this saves real work — decode
+	// plus bicubic resize is millisecond-scale per marker.
 	markerImages    map[string]*list.Element
 	markerImagesLRU *list.List
 	markerImagesMax int
@@ -36,8 +40,6 @@ func NewCacheIndex() *CacheIndex {
 	return &CacheIndex{
 		staticMaps:      make(map[string]struct{}),
 		multiStaticMaps: make(map[string]struct{}),
-		markers:         make(map[string]struct{}),
-		tiles:           make(map[string]struct{}),
 		markerImages:    make(map[string]*list.Element),
 		markerImagesLRU: list.New(),
 		markerImagesMax: 500, // Default, can be changed via SetMarkerImageCacheSize
@@ -153,53 +155,9 @@ func (c *CacheIndex) RemoveMultiStaticMap(path string) {
 	delete(c.multiStaticMaps, path)
 }
 
-// HasMarker checks if a marker is in the cache index
-func (c *CacheIndex) HasMarker(path string) bool {
+// Stats returns cache index statistics.
+func (c *CacheIndex) Stats() (staticMaps, multiStaticMaps int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	_, ok := c.markers[path]
-	return ok
-}
-
-// AddMarker adds a marker to the cache index
-func (c *CacheIndex) AddMarker(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.markers[path] = struct{}{}
-}
-
-// RemoveMarker removes a marker from the cache index
-func (c *CacheIndex) RemoveMarker(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.markers, path)
-}
-
-// HasTile checks if a tile is in the cache index
-func (c *CacheIndex) HasTile(path string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.tiles[path]
-	return ok
-}
-
-// AddTile adds a tile to the cache index
-func (c *CacheIndex) AddTile(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.tiles[path] = struct{}{}
-}
-
-// RemoveTile removes a tile from the cache index
-func (c *CacheIndex) RemoveTile(path string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.tiles, path)
-}
-
-// Stats returns cache index statistics
-func (c *CacheIndex) Stats() (staticMaps, multiStaticMaps, markers, tiles int) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.staticMaps), len(c.multiStaticMaps), len(c.markers), len(c.tiles)
+	return len(c.staticMaps), len(c.multiStaticMaps)
 }

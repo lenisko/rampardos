@@ -277,16 +277,15 @@ func (cc *CacheCleaner) shouldRemove(info os.FileInfo, cutoff, dropCutoff time.T
 	return false
 }
 
-// removeFromCacheIndex removes a path from the appropriate cache index based on folder
+// removeFromCacheIndex removes a path from the appropriate cache index
+// based on folder. Only final static/multi-static paths are indexed;
+// Cache/Tile and Cache/Marker are not (the index entries gave no
+// measurable benefit for those paths).
 func (cc *CacheCleaner) removeFromCacheIndex(path string) {
 	switch {
 	case strings.HasPrefix(cc.folder, "Cache/StaticMulti"):
 		GlobalCacheIndex.RemoveMultiStaticMap(path)
 	case strings.HasPrefix(cc.folder, "Cache/Static"):
 		GlobalCacheIndex.RemoveStaticMap(path)
-	case strings.HasPrefix(cc.folder, "Cache/Marker"):
-		GlobalCacheIndex.RemoveMarker(path)
-	case strings.HasPrefix(cc.folder, "Cache/Tile"):
-		GlobalCacheIndex.RemoveTile(path)
 	}
 }

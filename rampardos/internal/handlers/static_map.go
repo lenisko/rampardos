@@ -625,9 +625,6 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 		}
 		// Remote marker. Cached on disk?
 		if b, err := os.ReadFile(key); err == nil {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarker(key)
-			}
 			if h.statsController != nil {
 				h.statsController.MarkerServed(false, key, extractDomain(marker.URL))
 			}
@@ -657,9 +654,6 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 
 			b, err := services.DownloadBytes(ctx, w.marker.URL, w.key, "", 0)
 			if err == nil {
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarker(w.key)
-				}
 				if h.statsController != nil {
 					h.statsController.MarkerServed(true, w.key, extractDomain(w.marker.URL))
 				}
@@ -675,9 +669,6 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 			fbKey := utils.GetFallbackMarkerPath(w.marker)
 			fbDomain := extractDomain(w.marker.FallbackURL)
 			if fb, err := os.ReadFile(fbKey); err == nil {
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarker(fbKey)
-				}
 				if h.statsController != nil {
 					h.statsController.MarkerServed(false, fbKey, fbDomain)
 				}
@@ -691,9 +682,6 @@ func (h *StaticMapHandler) downloadMarkerBytes(ctx context.Context, staticMap mo
 				slog.Warn("Marker primary and fallback both failed; omitting from image",
 					"url", w.marker.URL, "fallback", w.marker.FallbackURL, "error", fbErr)
 				return
-			}
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarker(fbKey)
 			}
 			if h.statsController != nil {
 				h.statsController.MarkerServed(true, fbKey, fbDomain)
