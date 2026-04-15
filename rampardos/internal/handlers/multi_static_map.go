@@ -306,7 +306,7 @@ func (h *MultiStaticMapHandler) generateResponseBytes(w http.ResponseWriter, r *
 		return
 	}
 	if stitched != nil {
-		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Type", models.ImageFormatPNG.ContentType())
 		w.Header().Set("Content-Length", strconv.Itoa(len(stitched)))
 		_, _ = w.Write(stitched)
 		return

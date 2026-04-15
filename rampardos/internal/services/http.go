@@ -240,15 +240,17 @@ func DownloadBytes(ctx context.Context, fromURL, cachePath, expectedType string,
 	}
 
 	if cachePath != "" {
-		if err := saveBytesAtomic(cachePath, data); err != nil {
+		if err := SaveBytesAtomic(cachePath, data); err != nil {
 			slog.Warn("DownloadBytes: cache write failed", "path", cachePath, "error", err)
 		}
 	}
 	return data, nil
 }
 
-// saveBytesAtomic writes data to path via temp file + rename.
-func saveBytesAtomic(path string, data []byte) error {
+// SaveBytesAtomic writes data to path via temp file + rename. Callers
+// across packages use this as the canonical atomic-write primitive
+// (utils.SaveImageBytes and handlers.atomicWriteFile both delegate).
+func SaveBytesAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

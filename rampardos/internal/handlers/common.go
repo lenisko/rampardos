@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/lenisko/rampardos/internal/models"
+	"github.com/lenisko/rampardos/internal/services"
 )
 
 // knownDirs caches directories that have been created to avoid repeated syscalls
@@ -23,49 +23,20 @@ func ensureDir(dir string) {
 	knownDirs.Store(dir, struct{}{})
 }
 
-// atomicWriteFile writes data to a temporary file then renames it to
-// the target path. os.Rename is atomic on POSIX, so readers never see
-// a partially-written file. This prevents corruption when multiple
-// goroutines race to generate the same cached file.
+// atomicWriteFile writes data to path atomically with the requested
+// file mode. Delegates to services.SaveBytesAtomic for the write +
+// rename, then chmods the final path to perm.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	ensureDir(filepath.Dir(path))
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.*")
-	if err != nil {
+	if err := services.SaveBytesAtomic(path, data); err != nil {
 		return err
 	}
-	tmp := f.Name()
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	f.Close()
-	if err := os.Chmod(tmp, perm); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return os.Chmod(path, perm)
 }
 
 // serveFile serves a file with cache headers
 func serveFile(w http.ResponseWriter, r *http.Request, path string) {
 	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
 	http.ServeFile(w, r, path)
-}
-
-func contentTypeFor(format models.ImageFormat) string {
-	switch format {
-	case models.ImageFormatJPG, models.ImageFormatJPEG:
-		return "image/jpeg"
-	case models.ImageFormatWEBP:
-		return "image/webp"
-	default:
-		return "image/png"
-	}
 }
 
 // handlePregenerateResponse handles pregenerate query param and saves regeneratable data if needed.

@@ -726,7 +726,7 @@ func (h *StaticMapHandler) generateResponseBytes(w http.ResponseWriter, r *http.
 		return
 	}
 	if finalBytes != nil {
-		w.Header().Set("Content-Type", contentTypeFor(staticMap.GetFormat()))
+		w.Header().Set("Content-Type", staticMap.GetFormat().ContentType())
 		w.Header().Set("Content-Length", strconv.Itoa(len(finalBytes)))
 		_, _ = w.Write(finalBytes)
 		return
