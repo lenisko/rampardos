@@ -115,14 +115,24 @@ func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 // singleflight behaviour: N concurrent callers for the same basePath
 // trigger exactly one render.
 //
-// Determinism: the render fn blocks on a gate so the singleflight
-// leader cannot release its slot before followers arrive. Without
-// the gate, the leader could complete synchronously and later
-// goroutines would enter Do after the slot was released, producing
-// a "renders == 1" by luck rather than by correctness.
+// Determinism in two stages:
+//  1. Each goroutine signals `started` immediately before calling
+//     ensureBase. Draining N signals proves all N are live.
+//  2. The render fn blocks on `gate` so the leader cannot release
+//     its singleflight slot before followers arrive. We read one
+//     `reached` signal to confirm the leader is inside the render
+//     fn, then briefly yield for the N-1 followers to suspend
+//     inside baseSfg.Do (the only call between "started" and the
+//     render fn for them), then release the gate.
+//
+// singleflight.Group exposes no "pending count" so the final yield
+// is necessarily wall-clock, but the start barrier shrinks the
+// window it has to cover from "all goroutines must run" to just
+// "N-1 goroutines must enter Do" — a handful of instructions.
 func TestEnsureBaseSingleflightDedupesSiblings(t *testing.T) {
 	const N = 8
 	var renders atomic.Int32
+	started := make(chan struct{}, N)
 	reached := make(chan struct{}, N+1)
 	gate := make(chan struct{})
 
@@ -147,14 +157,18 @@ func TestEnsureBaseSingleflightDedupesSiblings(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			started <- struct{}{}
 			if err := h.ensureBase(ctx, sm, basePath); err != nil {
 				t.Errorf("ensureBase: %v", err)
 			}
 		}()
 	}
 
+	for i := 0; i < N; i++ {
+		<-started
+	}
 	<-reached
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	close(gate)
 	wg.Wait()
 

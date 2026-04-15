@@ -143,14 +143,6 @@ type GenerateOpts struct {
 	TTL        time.Duration // if > 0, queue files for deletion after this duration
 }
 
-// nocacheBaseTTLFloor is the minimum TTL applied to a shared basePath
-// when the owning request was nocache. Without this floor, a burst of
-// concurrent requests at the same viewport (e.g. mass weather alerts)
-// would each regenerate the base. The floor lets the render be reused
-// across the burst without persisting for days. Tiles are already
-// cached, so re-stitching after the floor expires is cheap.
-const nocacheBaseTTLFloor = 30 * time.Second
-
 // GenerateStaticMap generates a static map (used by MultiStaticMapHandler).
 // Concurrent requests for the same map are deduplicated via singleflight.
 func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) error {
@@ -178,16 +170,8 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	// Apply TTL or nocache cleanup to component files.
 	if opts.NoCache {
 		// Caller reads the file then cleans up.
-	} else if opts.TTL > 0 && services.GlobalExpiryQueue != nil {
-		// Enqueue path and basePath together so the base doesn't
-		// outlive the caller's requested TTL via CacheCleaner's
-		// default (~7 days). Re-stitching from cached tiles on a
-		// future request is cheap.
-		if path != basePath {
-			services.GlobalExpiryQueue.Add(opts.TTL, nil, path, basePath)
-		} else {
-			services.GlobalExpiryQueue.Add(opts.TTL, nil, path)
-		}
+	} else if opts.TTL > 0 {
+		enqueueWithBase(services.GlobalExpiryQueue, opts.TTL, path, basePath)
 	}
 
 	return nil
@@ -303,16 +287,8 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 
 	// If a TTL was requested, queue the file for deletion after the
 	// specified duration. A single background sweeper handles cleanup.
-	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
-		ttl := time.Duration(ttlSeconds) * time.Second
-		// Enqueue path and basePath together so the base doesn't
-		// outlive the requested TTL via CacheCleaner's 7-day default.
-		// Re-stitching from tiles on the next request is cheap.
-		if path != basePath {
-			services.GlobalExpiryQueue.Add(ttl, nil, path, basePath)
-		} else {
-			services.GlobalExpiryQueue.Add(ttl, nil, path)
-		}
+	if ttlSeconds > 0 {
+		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, basePath)
 	}
 }
 
