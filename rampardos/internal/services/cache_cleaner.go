@@ -277,7 +277,12 @@ func (cc *CacheCleaner) shouldRemove(info os.FileInfo, cutoff, dropCutoff time.T
 	return false
 }
 
-// removeFromCacheIndex removes a path from the appropriate cache index based on folder
+// removeFromCacheIndex removes a path from the appropriate cache index
+// based on folder. Cache/Tile is not indexed — the Tile branch had no
+// readers and was removed alongside HasTile/AddTile.
+//
+// StaticMulti must be checked first — "Cache/Static" is a prefix of
+// "Cache/StaticMulti", so the broader case would shadow it.
 func (cc *CacheCleaner) removeFromCacheIndex(path string) {
 	switch {
 	case strings.HasPrefix(cc.folder, "Cache/StaticMulti"):
@@ -286,7 +291,5 @@ func (cc *CacheCleaner) removeFromCacheIndex(path string) {
 		GlobalCacheIndex.RemoveStaticMap(path)
 	case strings.HasPrefix(cc.folder, "Cache/Marker"):
 		GlobalCacheIndex.RemoveMarker(path)
-	case strings.HasPrefix(cc.folder, "Cache/Tile"):
-		GlobalCacheIndex.RemoveTile(path)
 	}
 }
