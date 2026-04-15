@@ -157,75 +157,66 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Collect all maps to generate
-	var mapsToGenerate []models.StaticMap
+	// Flatten component order for the stitcher.
+	var components []models.StaticMap
 	for _, grid := range multiStaticMap.Grid {
 		for _, m := range grid.Maps {
-			mapsToGenerate = append(mapsToGenerate, m.Map)
+			components = append(components, m.Map)
 		}
 	}
-	mapCount := len(mapsToGenerate)
+	mapCount := len(components)
 
 	// Flow through nocache/ttl to component map generation.
-	componentOpts := GenerateOpts{}
-	if skipCache {
-		componentOpts.NoCache = true
-	}
+	componentOpts := GenerateOpts{NoCache: skipCache}
 	if ttlSeconds > 0 {
 		componentOpts.TTL = time.Duration(ttlSeconds) * time.Second
 	}
 
 	// singleflight: deduplicate the entire generate+combine operation
-	// for identical multistaticmap requests.
-	_, sfErr, _ := h.sfg.Do(path, func() (any, error) {
+	// for identical multistaticmap requests. Returns the final stitched
+	// bytes so the caller can serve from memory.
+	v, sfErr, _ := h.sfg.Do(path, func() (any, error) {
 		if !skipCache {
-			if _, err := os.Stat(path); err == nil {
-				return nil, nil
+			if b, err := os.ReadFile(path); err == nil {
+				return b, nil
 			}
 		}
 
-		// Generate all component maps in parallel (limit concurrency to 5)
-		var wg sync.WaitGroup
-		var genErr error
-		var errOnce sync.Once
+		// Parallel component generation, preserving slot order for the stitcher.
+		componentBytes := make([][]byte, len(components))
+		errCh := make(chan error, len(components))
 		sem := make(chan struct{}, 5)
-
-		for _, staticMap := range mapsToGenerate {
+		var wg sync.WaitGroup
+		for i, sm := range components {
 			wg.Add(1)
-			go func(sm models.StaticMap) {
+			sem <- struct{}{}
+			go func(i int, sm models.StaticMap) {
 				defer wg.Done()
-				sem <- struct{}{}
 				defer func() { <-sem }()
-
-				if _, err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
-					errOnce.Do(func() {
-						genErr = err
-					})
+				b, err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts)
+				if err != nil {
+					errCh <- err
+					return
 				}
-			}(staticMap)
+				componentBytes[i] = b
+			}(i, sm)
 		}
 		wg.Wait()
-
-		if genErr != nil {
-			return nil, genErr
+		close(errCh)
+		if err, ok := <-errCh; ok {
+			return nil, err
 		}
 
-		ensureDir(filepath.Dir(path))
-		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
-
-		// For nocache, clean up component files now that they've been
-		// combined into the final image.
-		if skipCache {
-			for _, sm := range mapsToGenerate {
-				os.Remove(sm.Path())
-				bp := sm.BasePath()
-				if bp != sm.Path() {
-					os.Remove(bp)
-				}
+		stitched, err := utils.ComposeMultiStaticMapBytes(multiStaticMap, componentBytes)
+		if err != nil {
+			return nil, err
+		}
+		if !skipCache {
+			if err := utils.SaveImageBytes(path, stitched); err != nil {
+				return nil, err
 			}
 		}
-
-		return nil, err
+		return stitched, nil
 	})
 
 	if sfErr != nil {
@@ -235,14 +226,19 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	var stitched []byte
+	if v != nil {
+		stitched, _ = v.([]byte)
+	}
+
 	duration := time.Since(startTime).Seconds()
 	h.statsController.StaticMapServed(true, path, "multi")
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
 	if skipCache {
+		// nocache: serve bytes directly, no disk footprint.
 		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
-		serveFile(w, r, path)
-		os.Remove(path)
+		h.generateResponseBytes(w, r, multiStaticMap, path, stitched)
 		return
 	}
 
@@ -250,7 +246,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		services.GlobalCacheIndex.AddMultiStaticMap(path)
 	}
 	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
-	h.generateResponse(w, r, multiStaticMap, path)
+	h.generateResponseBytes(w, r, multiStaticMap, path, stitched)
 
 	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
 		cleanupIndex := func() {
@@ -297,6 +293,22 @@ func (h *MultiStaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter,
 
 func (h *MultiStaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, multiStaticMap models.MultiStaticMap, path string) {
 	if handlePregenerateResponse(w, r, path, multiStaticMap) {
+		return
+	}
+	serveFile(w, r, path)
+}
+
+// generateResponseBytes prefers serving the stitched bytes in memory
+// so the response is immune to external deletion of path between the
+// atomic-write and serve. Falls back to serveFile if stitched is nil.
+func (h *MultiStaticMapHandler) generateResponseBytes(w http.ResponseWriter, r *http.Request, msm models.MultiStaticMap, path string, stitched []byte) {
+	if handlePregenerateResponse(w, r, path, msm) {
+		return
+	}
+	if stitched != nil {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Length", strconv.Itoa(len(stitched)))
+		_, _ = w.Write(stitched)
 		return
 	}
 	serveFile(w, r, path)
