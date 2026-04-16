@@ -179,7 +179,7 @@ type styleUsage struct {
 
 // analyzeUsage parses style.json to find used fonts and icons
 func (sc *StylesController) analyzeUsage(id string) styleUsage {
-	stylePath := filepath.Join(sc.folder, id+".json")
+	stylePath := filepath.Join(sc.folder, id, "style.json")
 	data, err := os.ReadFile(stylePath)
 	if err != nil {
 		return styleUsage{}
