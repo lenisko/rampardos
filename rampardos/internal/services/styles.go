@@ -26,6 +26,14 @@ func NewStylesController(externalStyles []models.Style, folder string, fontsCont
 	os.MkdirAll(folder, 0755)
 	os.MkdirAll(filepath.Join(folder, "External"), 0755)
 
+	// Bridge the legacy tileserver-gl-era flat layout
+	// (Styles/<id>.json) into the directory layout
+	// (Styles/<id>/style.json) this renderer expects. Runs once at
+	// startup and never overwrites existing <id>/style.json files.
+	if err := promoteFlatStyleFiles(folder); err != nil {
+		slog.Warn("Legacy style promotion encountered errors", "error", err)
+	}
+
 	sc := &StylesController{
 		folder:          folder,
 		fontsController: fontsController,
