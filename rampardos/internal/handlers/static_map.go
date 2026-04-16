@@ -472,6 +472,13 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	if extStyle != nil {
 		hasScale = strings.Contains(extStyle.URL, "{@scale}") || strings.Contains(extStyle.URL, "{scale}")
 	}
+	// Local styles at scale>1 produce tiles at tilePixels*scale
+	// (e.g. 1024px for scale=2). The crop in GenerateBaseStaticMap
+	// must multiply offset and output dimensions by scale — the same
+	// path external scale-aware tiles use via hasScale.
+	if extStyle == nil && scale > 1 {
+		hasScale = true
+	}
 
 	// Generate tiles in parallel. Each tile is an independent download
 	// or render; parallelising cuts wall-clock time from N*latency to
