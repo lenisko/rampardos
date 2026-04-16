@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -63,7 +64,7 @@ func TestIntegrationRealWorker(t *testing.T) {
 
 	// Build a SpawnFactory that launches the real Node worker with the
 	// CLI args render-worker.js expects.
-	sf := func(styleID, preparedStylePath string) func() (*worker, error) {
+	sf := func(styleID, preparedStylePath string, ratio int) func() (*worker, error) {
 		return func() (*worker, error) {
 			return spawnWorker(workerArgs{
 				binary:  cfg.NodeBinary,
@@ -75,6 +76,7 @@ func TestIntegrationRealWorker(t *testing.T) {
 					"--mbtiles", cfg.MbtilesFile,
 					"--styles-dir", cfg.StylesDir,
 					"--fonts-dir", cfg.FontsDir,
+					"--ratio", strconv.Itoa(ratio),
 				},
 				handshakeTimeout: cfg.StartupTimeout,
 			})

@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,18 +21,39 @@ import (
 	"github.com/lenisko/rampardos/internal/models"
 )
 
+// poolKey builds the map key for a (style, scale) pool. Scale=1 pools
+// use the bare styleID for backward compatibility with log messages
+// and the canary render path.
+func poolKey(styleID string, scale uint8) string {
+	if scale <= 1 {
+		return styleID
+	}
+	return styleID + "@" + strconv.FormatUint(uint64(scale), 10)
+}
+
+func parsePoolKey(key string) (styleID string, ratio int) {
+	if i := strings.LastIndex(key, "@"); i >= 0 {
+		if r, err := strconv.Atoi(key[i+1:]); err == nil {
+			return key[:i], r
+		}
+	}
+	return key, 1
+}
+
 // Ensure NodePoolRenderer satisfies the Renderer interface.
 var _ Renderer = (*NodePoolRenderer)(nil)
 
-// SpawnFactory builds a spawn closure for a given style. Production
-// callers pass a factory that constructs `node render-worker.js ...`
-// invocations; tests inject fake-worker spawners.
-type SpawnFactory func(styleID, preparedStylePath string) func() (*worker, error)
+// SpawnFactory builds a spawn closure for a given style and pixel
+// ratio. The ratio maps to maplibre-native's DPR: ratio=1 is standard,
+// ratio=2 is retina (same geographic extent, 2× pixel density).
+// Production callers pass a factory that constructs
+// `node render-worker.js ...` invocations; tests inject fake spawners.
+type SpawnFactory func(styleID, preparedStylePath string, ratio int) func() (*worker, error)
 
 // DefaultSpawnFactory returns a SpawnFactory that launches real Node
 // render-worker processes using the paths from cfg.
 func DefaultSpawnFactory(cfg Config) SpawnFactory {
-	return func(styleID, preparedStylePath string) func() (*worker, error) {
+	return func(styleID, preparedStylePath string, ratio int) func() (*worker, error) {
 		return func() (*worker, error) {
 			return spawnWorker(workerArgs{
 				binary:  cfg.NodeBinary,
@@ -42,6 +65,7 @@ func DefaultSpawnFactory(cfg Config) SpawnFactory {
 					"--mbtiles", cfg.MbtilesFile,
 					"--styles-dir", cfg.StylesDir,
 					"--fonts-dir", cfg.FontsDir,
+					"--ratio", strconv.Itoa(ratio),
 				},
 				handshakeTimeout: cfg.StartupTimeout,
 			})
@@ -94,7 +118,7 @@ func NewNodePoolRenderer(cfg Config, sf SpawnFactory) (*NodePoolRenderer, error)
 // loadPool reads the on-disk style.json, rewrites it via PrepareStyle,
 // writes the prepared version next to the original, and creates a
 // stylePool with the given spawn closure.
-func (npr *NodePoolRenderer) loadPool(id string) (*stylePool, error) {
+func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) {
 	styleFile := filepath.Join(npr.cfg.StylesDir, id, "style.json")
 	raw, err := os.ReadFile(styleFile)
 	if err != nil {
@@ -111,7 +135,7 @@ func (npr *NodePoolRenderer) loadPool(id string) (*stylePool, error) {
 		return nil, fmt.Errorf("write prepared style: %w", err)
 	}
 
-	spawn := npr.spawnFactory(id, preparedPath)
+	spawn := npr.spawnFactory(id, preparedPath, ratio)
 
 	return newStylePool(stylePoolConfig{
 		styleID:          id,
@@ -137,11 +161,20 @@ func (npr *NodePoolRenderer) RenderViewport(ctx context.Context, req ViewportReq
 }
 
 func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req ViewportRequest) ([]byte, error) {
-	pool, err := npr.getOrCreatePool(req.StyleID)
+	scale := int(req.Scale)
+	if scale < 1 {
+		scale = 1
+	}
+
+	pool, err := npr.getOrCreatePool(req.StyleID, req.Scale)
 	if err != nil {
 		return nil, err
 	}
 
+	// Send LOGICAL dimensions to the worker. The worker's map was
+	// constructed with ratio=scale, so it produces width*ratio ×
+	// height*ratio actual pixels covering the same geographic extent
+	// as a ratio=1 render at these logical dimensions.
 	frame := requestFrameForViewport(req)
 
 	rgba, err := pool.dispatch(ctx, frame)
@@ -149,22 +182,23 @@ func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req Vie
 		return nil, err
 	}
 
-	// The wire frame sends Width*Scale and Height*Scale as the actual
-	// pixel dimensions. encodeRGBA needs the actual size to match the buffer.
-	scale := int(req.Scale)
-	if scale < 1 {
-		scale = 1
-	}
+	// The RGBA buffer from the worker is width*scale × height*scale
+	// actual pixels (due to the map's ratio). encodeRGBA must match.
 	return encodeRGBA(rgba, req.Width*scale, req.Height*scale, req.Format)
 }
 
 // getOrCreatePool returns the pool for a style, creating it on first
 // use. Uses double-checked locking: fast RLock path for the common
 // case (pool already exists), slow Lock path for first-time creation.
-func (npr *NodePoolRenderer) getOrCreatePool(styleID string) (*stylePool, error) {
+func (npr *NodePoolRenderer) getOrCreatePool(styleID string, scale uint8) (*stylePool, error) {
+	if scale < 1 {
+		scale = 1
+	}
+	key := poolKey(styleID, scale)
+
 	// Fast path: pool already running.
 	npr.mu.RLock()
-	pool, ok := npr.pools[styleID]
+	pool, ok := npr.pools[key]
 	npr.mu.RUnlock()
 	if ok {
 		return pool, nil
@@ -174,23 +208,22 @@ func (npr *NodePoolRenderer) getOrCreatePool(styleID string) (*stylePool, error)
 	npr.mu.Lock()
 	defer npr.mu.Unlock()
 
-	// Double-check after acquiring write lock.
-	if pool, ok := npr.pools[styleID]; ok {
+	if pool, ok := npr.pools[key]; ok {
 		return pool, nil
 	}
 
-	// Verify the style exists on disk before spawning workers.
 	stylePath := filepath.Join(npr.cfg.StylesDir, styleID, "style.json")
 	if _, err := os.Stat(stylePath); err != nil {
 		return nil, fmt.Errorf("renderer: unknown style %q (no style.json at %s)", styleID, stylePath)
 	}
 
-	slog.Info("Creating renderer pool on first use", "style", styleID, "poolSize", npr.cfg.PoolSize)
-	pool, err := npr.loadPool(styleID)
+	ratio := int(scale)
+	slog.Info("Creating renderer pool on first use", "style", styleID, "ratio", ratio, "poolSize", npr.cfg.PoolSize)
+	pool, err := npr.loadPool(styleID, ratio)
 	if err != nil {
-		return nil, fmt.Errorf("renderer: create pool %q: %w", styleID, err)
+		return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
 	}
-	npr.pools[styleID] = pool
+	npr.pools[key] = pool
 	return pool, nil
 }
 
@@ -198,33 +231,33 @@ func (npr *NodePoolRenderer) getOrCreatePool(styleID string) (*stylePool, error)
 // disk. In-flight renders against old pools finish normally; new
 // renders block until the rebuild completes.
 func (npr *NodePoolRenderer) ReloadStyles(ctx context.Context) error {
-	// Snapshot active style IDs under a short read lock.
+	// Snapshot active pool keys under a short read lock.
 	npr.mu.RLock()
-	activeIDs := make([]string, 0, len(npr.pools))
-	for id := range npr.pools {
-		activeIDs = append(activeIDs, id)
+	activeKeys := make([]string, 0, len(npr.pools))
+	for key := range npr.pools {
+		activeKeys = append(activeKeys, key)
 	}
 	npr.mu.RUnlock()
 
 	// Build new pools OUTSIDE the lock so in-flight renders continue
 	// against the old pools without blocking. Each loadPool spawns
 	// workers and waits for handshakes — this can take seconds.
-	newPools := make(map[string]*stylePool, len(activeIDs))
-	for _, id := range activeIDs {
+	newPools := make(map[string]*stylePool, len(activeKeys))
+	for _, key := range activeKeys {
 		if ctx.Err() != nil {
-			// Context expired (e.g. SIGHUP timeout) — stop spawning.
 			for _, p := range newPools {
 				p.close()
 			}
 			return ctx.Err()
 		}
-		pool, err := npr.loadPool(id)
+		styleID, ratio := parsePoolKey(key)
+		pool, err := npr.loadPool(styleID, ratio)
 		if err != nil {
 			slog.Error("Failed to reload pool, style will be recreated on next request",
-				"style", id, "error", err)
+				"style", styleID, "ratio", ratio, "error", err)
 			continue
 		}
-		newPools[id] = pool
+		newPools[key] = pool
 	}
 
 	// Swap under a short write lock: replace pools map, then close
@@ -253,20 +286,16 @@ func (npr *NodePoolRenderer) Close() error {
 }
 
 // requestFrameForViewport builds the JSON wire frame sent to the
-// worker for a viewport render. Width and height are multiplied by
-// Scale to get the actual rendered pixel dimensions — the worker's
-// mbgl.Map is constructed with ratio:1, so DPR must be baked into
-// the dimensions rather than passed as a separate ratio field.
+// worker for a viewport render. Width and height are LOGICAL
+// dimensions — the worker's mbgl.Map is constructed with
+// ratio=scale, so it produces width*ratio × height*ratio actual
+// pixels covering the same geographic extent as these logical dims.
 func requestFrameForViewport(vp ViewportRequest) []byte {
-	scale := int(vp.Scale)
-	if scale < 1 {
-		scale = 1
-	}
 	m := map[string]any{
 		"zoom":    vp.Zoom,
 		"center":  []float64{vp.Longitude, vp.Latitude},
-		"width":   vp.Width * scale,
-		"height":  vp.Height * scale,
+		"width":   vp.Width,
+		"height":  vp.Height,
 		"bearing": vp.Bearing,
 		"pitch":   vp.Pitch,
 	}
