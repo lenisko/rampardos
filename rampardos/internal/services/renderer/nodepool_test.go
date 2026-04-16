@@ -45,7 +45,7 @@ func TestNodePoolRendererRenderReturnsBytes(t *testing.T) {
 		RenderTimeout:  5 * time.Second,
 		StartupTimeout: 2 * time.Second,
 		DiscoverStyles: func() ([]string, error) { return []string{"basic"}, nil },
-	}, func(styleID, preparedPath string) func() (*worker, error) {
+	}, func(styleID, preparedPath string, ratio int) func() (*worker, error) {
 		return func() (*worker, error) {
 			return spawnWorker(workerArgs{
 				binary:           "bash",
@@ -91,7 +91,7 @@ func TestNodePoolRendererUnknownStyle(t *testing.T) {
 		RenderTimeout:  5 * time.Second,
 		StartupTimeout: 2 * time.Second,
 		DiscoverStyles: func() ([]string, error) { return []string{"basic"}, nil },
-	}, func(styleID, preparedPath string) func() (*worker, error) {
+	}, func(styleID, preparedPath string, ratio int) func() (*worker, error) {
 		return func() (*worker, error) {
 			return spawnWorker(workerArgs{
 				binary:           "bash",

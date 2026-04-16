@@ -44,6 +44,7 @@ const args = require("node:util").parseArgs({
     "mbtiles":    { type: "string" },
     "styles-dir": { type: "string" },
     "fonts-dir":  { type: "string" },
+    "ratio":      { type: "string" },
   },
 }).values;
 
@@ -145,8 +146,9 @@ try {
     "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?"
   );
 
+  const ratio = parseInt(args["ratio"] || "1", 10) || 1;
   map = new mbgl.Map({
-    ratio: 1,
+    ratio: ratio,
     request: (req, callback) => {
       try {
         const url = req.url;

@@ -135,16 +135,10 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// Check if cached (use cache index first, then filesystem)
 	cached := false
 	if !skipCache {
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMultiStaticMap(path) {
+		if _, err := os.Stat(path); err == nil {
 			cached = true
-		} else if _, err := os.Stat(path); err == nil {
-			cached = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMultiStaticMap(path)
-			}
 		}
 	}
 
@@ -194,7 +188,17 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 			wg.Add(1)
 			go func(sm models.StaticMap) {
 				defer wg.Done()
-				sem <- struct{}{}
+				// Respect client disconnect / request timeout while
+				// waiting for a sem slot. Without this escape, queued
+				// goroutines sit blocked after ctx is cancelled, then
+				// wake up and redundantly call into GenerateStaticMap
+				// only to fail fast. Cheaper to short-circuit now.
+				select {
+				case sem <- struct{}{}:
+				case <-r.Context().Done():
+					errOnce.Do(func() { genErr = r.Context().Err() })
+					return
+				}
 				defer func() { <-sem }()
 
 				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
@@ -213,17 +217,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		ensureDir(filepath.Dir(path))
 		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
 
-		// For nocache, clean up component files now that they've been
-		// combined into the final image.
-		if skipCache {
-			for _, sm := range mapsToGenerate {
-				os.Remove(sm.Path())
-				bp := sm.BasePath()
-				if bp != sm.Path() {
-					os.Remove(bp)
-				}
-			}
-		}
+		// Component files are enqueued by each GenerateStaticMap call.
 
 		return nil, err
 	})
@@ -242,23 +236,18 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	if skipCache {
 		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
 		serveFile(w, r, path)
-		os.Remove(path)
+		// nocacheBaseTTLFloor protects in-flight pregenerate+ttl subscribers.
+		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, path)
 		return
 	}
 
-	if services.GlobalCacheIndex != nil {
-		services.GlobalCacheIndex.AddMultiStaticMap(path)
-	}
 	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, multiStaticMap, path)
 
-	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
-		cleanupIndex := func() {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.RemoveMultiStaticMap(path)
-			}
-		}
-		services.GlobalExpiryQueue.Add(time.Duration(ttlSeconds)*time.Second, cleanupIndex, path)
+	if ttlSeconds > 0 {
+		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, path)
+	} else {
+		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, path)
 	}
 }
 

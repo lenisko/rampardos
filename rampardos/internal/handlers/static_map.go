@@ -36,7 +36,8 @@ type StaticMapHandler struct {
 	statsController   *services.StatsController
 	stylesController  stylesControllerGetExternal
 	sphericalMercator *utils.SphericalMercator
-	sfg               singleflight.Group // dedup concurrent generates for same path
+	sfg               singleflight.Group // dedup concurrent generates for same final path
+	baseSfg           singleflight.Group // dedup concurrent base renders for same basePath
 
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
@@ -160,33 +161,20 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 				return nil, nil
 			}
 		}
-		baseExists := false
-		if _, err := os.Stat(basePath); err == nil {
-			baseExists = true
-		}
-		return nil, h.generateStaticMap(ctx, path, basePath, baseExists, staticMap)
+		return nil, h.generateStaticMap(ctx, path, basePath, staticMap)
 	})
 	if err != nil {
 		return err
 	}
 
-	// Apply TTL or nocache cleanup to component files.
+	// Every generation enqueues its intent so the extend-only queue
+	// resolves concurrent nocache vs TTL vs cached races correctly.
 	if opts.NoCache {
-		// Caller will read the file then we clean up.
-		// Defer cleanup so the multistaticmap combiner can read it first.
-		// The caller (multistaticmap handler) is responsible for calling
-		// CleanupComponentMaps after combining.
-	} else if opts.TTL > 0 && services.GlobalExpiryQueue != nil {
-		cleanupIndex := func() {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.RemoveStaticMap(path)
-			}
-		}
-		if path != basePath {
-			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path, basePath)
-		} else {
-			services.GlobalExpiryQueue.Add(opts.TTL, cleanupIndex, path)
-		}
+		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
+	} else if opts.TTL > 0 {
+		enqueueWithBase(services.GlobalExpiryQueue, opts.TTL, path, basePath)
+	} else {
+		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, basePath)
 	}
 
 	return nil
@@ -238,16 +226,13 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Check if cached (use cache index first, then filesystem)
+	// Check if cached — os.Stat is authoritative. The prior cache
+	// index could outlive its on-disk file and serve a stale "true"
+	// that led to a 404 on the subsequent ServeFile.
 	cached := false
 	if !skipCache {
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(path) {
+		if _, err := os.Stat(path); err == nil {
 			cached = true
-		} else if _, err := os.Stat(path); err == nil {
-			cached = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddStaticMap(path)
-			}
 		}
 	}
 
@@ -264,21 +249,10 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	// singleflight. Two poracle webhooks for the same spawn arriving
 	// simultaneously will only generate once.
 	_, genErr, _ := h.sfg.Do(path, func() (any, error) {
-		// Double-check cache inside singleflight.
 		if _, err := os.Stat(path); err == nil {
 			return nil, nil
 		}
-
-		baseExists := false
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(basePath) {
-			baseExists = true
-		} else if _, err := os.Stat(basePath); err == nil {
-			baseExists = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddStaticMap(basePath)
-			}
-		}
-		return nil, h.generateStaticMap(r.Context(), path, basePath, baseExists, staticMap)
+		return nil, h.generateStaticMap(r.Context(), path, basePath, staticMap)
 	})
 
 	if genErr != nil {
@@ -293,39 +267,23 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 
 	if skipCache {
-		// nocache mode: serve the image directly and clean up temp
-		// files. No cache index entry, no disk footprint left behind.
-		// (pregenerate+nocache is already converted to TTL above.)
 		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
 		serveFile(w, r, path)
-		os.Remove(path)
-		if path != basePath {
-			os.Remove(basePath)
-		}
+		// nocacheBaseTTLFloor protects in-flight pregenerate+ttl subscribers.
+		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
 		return
 	}
 
-	// Normal mode: keep on disk for cache.
-	if services.GlobalCacheIndex != nil {
-		services.GlobalCacheIndex.AddStaticMap(path)
-	}
 	slog.Debug("Served static map (generated)", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, staticMap, path)
 
-	// If a TTL was requested, queue the file for deletion after the
-	// specified duration. A single background sweeper handles cleanup.
-	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
-		ttl := time.Duration(ttlSeconds) * time.Second
-		cleanupIndex := func() {
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.RemoveStaticMap(path)
-			}
-		}
-		if path != basePath {
-			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path, basePath)
-		} else {
-			services.GlobalExpiryQueue.Add(ttl, cleanupIndex, path)
-		}
+	if ttlSeconds > 0 {
+		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, basePath)
+	} else {
+		// No explicit TTL: mark as owned by CacheCleaner so a
+		// concurrent nocache request's short floor can't shorten
+		// this file's lifetime.
+		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, basePath)
 	}
 }
 
@@ -362,18 +320,37 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 	h.handleRequest(w, r, staticMap)
 }
 
-func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, baseExists bool, staticMap models.StaticMap) error {
-	// Ensure cache directory exists (cached check)
+// ensureBase renders basePath if it's missing on disk. Concurrent
+// callers for the same basePath are deduplicated via baseSfg, so
+// sibling requests (same viewport, different overlays) do not
+// duplicate base rendering. The cache index is not consulted — a
+// stale entry could falsely claim the base existed while it had
+// been removed by CacheCleaner or an external actor, leading the
+// subsequent read to fail.
+//
+// Singleflight key correctness: basePath == BasePath() ==
+// hash(WithoutDrawables()), so two callers share a slot iff their
+// base-rendering inputs (style/lat/lon/zoom/w/h/scale/bearing/pitch/
+// format) are identical. Base generation reads none of Markers,
+// Polygons, or Circles, so merging the renders is safe.
+func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string) error {
+	_, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
+		if _, err := os.Stat(basePath); err == nil {
+			return nil, nil
+		}
+		return nil, h.generateBaseStaticMap(ctx, staticMap, basePath)
+	})
+	return err
+}
+
+func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap) error {
 	ensureDir(filepath.Dir(path))
 
-	hasDrawables := len(staticMap.Markers) > 0 || len(staticMap.Polygons) > 0 || len(staticMap.Circles) > 0
-
-	// Generate base if needed
-	if !baseExists {
-		if err := h.generateBaseStaticMap(ctx, staticMap, basePath); err != nil {
-			return err
-		}
+	if err := h.ensureBase(ctx, staticMap, basePath); err != nil {
+		return err
 	}
+
+	hasDrawables := len(staticMap.Markers) > 0 || len(staticMap.Polygons) > 0 || len(staticMap.Circles) > 0
 
 	// If no drawables, just use base
 	if !hasDrawables {
@@ -403,6 +380,8 @@ func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap 
 	if extStyle == nil {
 		// Local style: fractional zoom → viewport render (native float zoom).
 		// Integer zoom → tile stitching (cacheable via Cache/Tile).
+		// Scale>1 uses per-scale worker pools (ratio=scale) so tiles
+		// have correct geographic extent; stitching works normally.
 		if isFractional(staticMap.Zoom) {
 			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap, basePath)
 		}
@@ -494,6 +473,13 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	hasScale := false
 	if extStyle != nil {
 		hasScale = strings.Contains(extStyle.URL, "{@scale}") || strings.Contains(extStyle.URL, "{scale}")
+	}
+	// Local styles at scale>1 produce tiles at tilePixels*scale
+	// (e.g. 1024px for scale=2). The crop in GenerateBaseStaticMap
+	// must multiply offset and output dimensions by scale — the same
+	// path external scale-aware tiles use via hasScale.
+	if extStyle == nil && scale > 1 {
+		hasScale = true
 	}
 
 	// Generate tiles in parallel. Each tile is an independent download
@@ -592,18 +578,8 @@ func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models
 		path := fmt.Sprintf("Cache/Marker/%s.%s", hash, format)
 		domain := extractDomain(marker.URL)
 
-		// Check cache index first (fast path)
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(path) {
-			h.statsController.MarkerServed(false, path, domain)
-			continue
-		}
-
-		// Check filesystem
+		// Already cached on disk?
 		if _, err := os.Stat(path); err == nil {
-			// Add to cache index
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarker(path)
-			}
 			h.statsController.MarkerServed(false, path, domain)
 			continue
 		}
@@ -627,36 +603,21 @@ func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models
 			defer func() { <-sem }()
 
 			if err := services.DownloadFile(ctx, md.marker.URL, md.path, "", 0); err != nil {
-				// Try fallback
-				if md.marker.FallbackURL != "" {
-					fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
-					fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
-					fallbackDomain := extractDomain(md.marker.FallbackURL)
+				if md.marker.FallbackURL == "" {
+					return
+				}
+				fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
+				fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
+				fallbackDomain := extractDomain(md.marker.FallbackURL)
 
-					// Check if fallback exists
-					if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(fallbackPath) {
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-					if _, err := os.Stat(fallbackPath); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-
-					if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
-					}
+				if _, err := os.Stat(fallbackPath); err == nil {
+					h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
+					return
+				}
+				if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
+					h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
 				}
 			} else {
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarker(md.path)
-				}
 				h.statsController.MarkerServed(true, md.path, md.domain)
 			}
 		}(md)
