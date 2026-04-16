@@ -269,11 +269,7 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	if skipCache {
 		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
 		serveFile(w, r, path)
-		// Enqueue with the burst-sharing floor instead of os.Remove.
-		// A concurrent pregenerate+ttl request for the same hash may
-		// have told its subscribers to fetch the file later — an
-		// immediate delete would 404 them. The extend-only expiry
-		// queue ensures the longer TTL wins.
+		// nocacheBaseTTLFloor protects in-flight pregenerate+ttl subscribers.
 		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
 		return
 	}

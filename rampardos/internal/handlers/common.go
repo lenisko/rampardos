@@ -21,19 +21,16 @@ import (
 const nocacheBaseTTLFloor = 30 * time.Second
 
 // enqueueWithBase schedules path and, when distinct, basePath for
-// deletion after ttl. Used by the static-map and multi-static-map
-// handlers to honour the caller's TTL for the shared base — the
-// old behaviour of leaving basePath for CacheCleaner's ~7-day sweep
-// caused bases to persist orders of magnitude longer than the
-// caller asked for.
+// deletion after ttl. For single-path callers (e.g. multi handler
+// whose composite has no shared base), pass path == basePath.
 func enqueueWithBase(q *services.ExpiryQueue, ttl time.Duration, path, basePath string) {
 	if q == nil {
 		return
 	}
 	if path != basePath {
-		q.Add(ttl, nil, path, basePath)
+		q.Add(ttl, path, basePath)
 	} else {
-		q.Add(ttl, nil, path)
+		q.Add(ttl, path)
 	}
 }
 
