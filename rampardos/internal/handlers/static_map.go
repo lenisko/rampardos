@@ -155,13 +155,18 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 		}
 	}
 
+	// Detach the caller's cancellation from the shared render. singleflight
+	// runs the callback once for all joiners; if the leader disconnects,
+	// cancelling its ctx would abort generation for every follower that
+	// is still live. Values (deadlines, trace IDs) still flow through.
+	genCtx := context.WithoutCancel(ctx)
 	_, err, _ := h.sfg.Do(path, func() (any, error) {
 		if !opts.NoCache {
 			if _, err := os.Stat(path); err == nil {
 				return nil, nil
 			}
 		}
-		return nil, h.generateStaticMap(ctx, path, basePath, staticMap)
+		return nil, h.generateStaticMap(genCtx, path, basePath, staticMap)
 	})
 	if err != nil {
 		return err
@@ -247,12 +252,15 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 
 	// Deduplicate concurrent requests for the same static map via
 	// singleflight. Two poracle webhooks for the same spawn arriving
-	// simultaneously will only generate once.
+	// simultaneously will only generate once. Detach the caller's
+	// cancellation so a leader disconnect does not abort the shared
+	// render for concurrent followers.
+	genCtx := context.WithoutCancel(r.Context())
 	_, genErr, _ := h.sfg.Do(path, func() (any, error) {
 		if _, err := os.Stat(path); err == nil {
 			return nil, nil
 		}
-		return nil, h.generateStaticMap(r.Context(), path, basePath, staticMap)
+		return nil, h.generateStaticMap(genCtx, path, basePath, staticMap)
 	})
 
 	if genErr != nil {
