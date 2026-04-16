@@ -115,6 +115,38 @@ func NewNodePoolRenderer(cfg Config, sf SpawnFactory) (*NodePoolRenderer, error)
 	}, nil
 }
 
+// atomicWritePrepared writes the prepared style JSON via a tempfile +
+// rename so readers (workers spawned by the same or a concurrent
+// loadPool) only ever observe a complete file. ReloadStyles calls
+// loadPool outside any lock, so plain os.WriteFile's truncate window
+// would let a racing reader see a zero-length or partial file.
+func atomicWritePrepared(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // loadPool reads the on-disk style.json, rewrites it via PrepareStyle,
 // writes the prepared version next to the original, and creates a
 // stylePool with the given spawn closure.
@@ -131,7 +163,7 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 	}
 
 	preparedPath := filepath.Join(npr.cfg.StylesDir, id, "style.prepared.json")
-	if err := os.WriteFile(preparedPath, prepared, 0o644); err != nil {
+	if err := atomicWritePrepared(preparedPath, prepared); err != nil {
 		return nil, fmt.Errorf("write prepared style: %w", err)
 	}
 
@@ -233,9 +265,9 @@ func (npr *NodePoolRenderer) getOrCreatePool(styleID string, scale uint8) (*styl
 func (npr *NodePoolRenderer) ReloadStyles(ctx context.Context) error {
 	// Snapshot active pool keys under a short read lock.
 	npr.mu.RLock()
-	activeKeys := make([]string, 0, len(npr.pools))
+	activeKeys := make(map[string]struct{}, len(npr.pools))
 	for key := range npr.pools {
-		activeKeys = append(activeKeys, key)
+		activeKeys[key] = struct{}{}
 	}
 	npr.mu.RUnlock()
 
@@ -243,7 +275,7 @@ func (npr *NodePoolRenderer) ReloadStyles(ctx context.Context) error {
 	// against the old pools without blocking. Each loadPool spawns
 	// workers and waits for handshakes — this can take seconds.
 	newPools := make(map[string]*stylePool, len(activeKeys))
-	for _, key := range activeKeys {
+	for key := range activeKeys {
 		if ctx.Err() != nil {
 			for _, p := range newPools {
 				p.close()
@@ -260,11 +292,21 @@ func (npr *NodePoolRenderer) ReloadStyles(ctx context.Context) error {
 		newPools[key] = pool
 	}
 
-	// Swap under a short write lock: replace pools map, then close
-	// old pools after the swap (so any final in-flight dispatches
-	// that already hold a pool reference can finish).
+	// Swap under a short write lock. A concurrent getOrCreatePool may
+	// have inserted a new key into npr.pools while we were rebuilding
+	// outside the lock — those pools were created for styles we didn't
+	// know about at snapshot time, so merge them into newPools instead
+	// of overwriting. Only the snapshotted keys are dropped/replaced;
+	// their pool pointers go into oldPools to be closed after the swap.
 	npr.mu.Lock()
-	oldPools := npr.pools
+	oldPools := make(map[string]*stylePool, len(activeKeys))
+	for key, pool := range npr.pools {
+		if _, wasActive := activeKeys[key]; wasActive {
+			oldPools[key] = pool
+		} else {
+			newPools[key] = pool
+		}
+	}
 	npr.pools = newPools
 	npr.mu.Unlock()
 

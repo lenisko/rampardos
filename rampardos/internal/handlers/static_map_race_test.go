@@ -111,6 +111,75 @@ func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 	}
 }
 
+// TestGenerateStaticMapSingleflightSurvivesLeaderCancel locks in the
+// invariant that when multiple callers join the outer sfg for the same
+// final path, cancelling the leader's context must not abort the
+// generation for concurrent waiters that are still live. Before the
+// fix the sfg.Do callback used the leader's ctx verbatim, so a client
+// disconnect on the leader cancelled the shared render function and
+// returned ctx.Err() to every waiter.
+func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) error {
+		entered <- struct{}{}
+		select {
+		case <-gate:
+			if err := os.MkdirAll(filepath.Dir(basePath), 0o755); err != nil {
+				return err
+			}
+			return os.WriteFile(basePath, raceFakePNG(t), 0o644)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	h, cleanup := raceTestHandler(t, renderFn)
+	defer cleanup()
+
+	sm := raceTestStaticMap()
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	followerCtx, cancelFollower := context.WithCancel(context.Background())
+	defer cancelFollower()
+
+	leaderErr := make(chan error, 1)
+	followerErr := make(chan error, 1)
+
+	go func() { leaderErr <- h.GenerateStaticMap(leaderCtx, sm, GenerateOpts{}) }()
+
+	// Wait for the leader to enter the renderFn so we know it has the
+	// sfg slot. The follower arriving after this is guaranteed to
+	// attach to the same sfg group.
+	<-entered
+
+	go func() { followerErr <- h.GenerateStaticMap(followerCtx, sm, GenerateOpts{}) }()
+
+	// Give the follower time to subscribe to the sfg group.
+	time.Sleep(20 * time.Millisecond)
+
+	// Simulate leader client disconnect.
+	cancelLeader()
+
+	// Release the blocked render. With the fix the render fn's ctx is
+	// detached from leaderCtx, so the render completes normally. Without
+	// the fix the render returned ctx.Err() the moment cancelLeader ran
+	// and the follower inherits that error from sfg.
+	close(gate)
+
+	select {
+	case err := <-followerErr:
+		if err != nil {
+			t.Fatalf("follower aborted due to leader cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("follower did not complete within timeout")
+	}
+
+	<-leaderErr
+}
+
 // TestEnsureBaseSingleflightDedupesSiblings locks in the baseSfg
 // singleflight behaviour: N concurrent callers for the same basePath
 // trigger exactly one render.

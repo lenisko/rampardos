@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -170,7 +171,10 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	}
 
 	// singleflight: deduplicate the entire generate+combine operation
-	// for identical multistaticmap requests.
+	// for identical multistaticmap requests. Detach the caller's
+	// cancellation so a leader disconnect does not abort the shared
+	// composite render for concurrent followers.
+	genCtx := context.WithoutCancel(r.Context())
 	_, sfErr, _ := h.sfg.Do(path, func() (any, error) {
 		if !skipCache {
 			if _, err := os.Stat(path); err == nil {
@@ -188,20 +192,10 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 			wg.Add(1)
 			go func(sm models.StaticMap) {
 				defer wg.Done()
-				// Respect client disconnect / request timeout while
-				// waiting for a sem slot. Without this escape, queued
-				// goroutines sit blocked after ctx is cancelled, then
-				// wake up and redundantly call into GenerateStaticMap
-				// only to fail fast. Cheaper to short-circuit now.
-				select {
-				case sem <- struct{}{}:
-				case <-r.Context().Done():
-					errOnce.Do(func() { genErr = r.Context().Err() })
-					return
-				}
+				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				if err := h.staticMapHandler.GenerateStaticMap(r.Context(), sm, componentOpts); err != nil {
+				if err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, componentOpts); err != nil {
 					errOnce.Do(func() {
 						genErr = err
 					})
