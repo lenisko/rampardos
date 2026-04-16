@@ -167,11 +167,14 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 		return err
 	}
 
-	// Apply TTL or nocache cleanup to component files.
+	// Every generation enqueues its intent so the extend-only queue
+	// resolves concurrent nocache vs TTL vs cached races correctly.
 	if opts.NoCache {
-		// Caller reads the file then cleans up.
+		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
 	} else if opts.TTL > 0 {
 		enqueueWithBase(services.GlobalExpiryQueue, opts.TTL, path, basePath)
+	} else {
+		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, basePath)
 	}
 
 	return nil
@@ -264,31 +267,27 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 
 	if skipCache {
-		// nocache mode: serve the image directly and clean up temp
-		// files. No cache index entry, no disk footprint left behind.
-		// (pregenerate+nocache is already converted to TTL above.)
 		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
 		serveFile(w, r, path)
-		// Overlay-baked artifact has no reuse value; delete now.
-		// Leave basePath with a short floor TTL so sibling burst
-		// requests at the same viewport can share the render.
-		if path != basePath {
-			os.Remove(path)
-		}
-		if services.GlobalExpiryQueue != nil {
-			services.GlobalExpiryQueue.Add(nocacheBaseTTLFloor, nil, basePath)
-		}
+		// Enqueue with the burst-sharing floor instead of os.Remove.
+		// A concurrent pregenerate+ttl request for the same hash may
+		// have told its subscribers to fetch the file later — an
+		// immediate delete would 404 them. The extend-only expiry
+		// queue ensures the longer TTL wins.
+		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
 		return
 	}
 
-	// Normal mode: keep on disk for cache.
 	slog.Debug("Served static map (generated)", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, staticMap, path)
 
-	// If a TTL was requested, queue the file for deletion after the
-	// specified duration. A single background sweeper handles cleanup.
 	if ttlSeconds > 0 {
 		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, basePath)
+	} else {
+		// No explicit TTL: mark as owned by CacheCleaner so a
+		// concurrent nocache request's short floor can't shorten
+		// this file's lifetime.
+		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, basePath)
 	}
 }
 

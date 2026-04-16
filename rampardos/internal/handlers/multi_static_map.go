@@ -217,23 +217,10 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		ensureDir(filepath.Dir(path))
 		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
 
-		// Overlay-baked component finals have no reuse value; delete
-		// immediately under nocache. Each component's basePath gets a
-		// short floor TTL so sibling bursts (e.g. mass weather alerts
-		// at the same location) share one render; re-stitching from
-		// cached tiles after the floor is cheap.
-		if skipCache {
-			for _, sm := range mapsToGenerate {
-				smPath := sm.Path()
-				basePath := sm.BasePath()
-				if smPath != basePath {
-					os.Remove(smPath)
-				}
-				if services.GlobalExpiryQueue != nil {
-					services.GlobalExpiryQueue.Add(nocacheBaseTTLFloor, nil, basePath)
-				}
-			}
-		}
+		// Component cleanup is handled by each component's
+		// GenerateStaticMap call (which enqueues per its own
+		// nocache/TTL intent). Nothing to do here — the extend-
+		// only expiry queue ensures the longest intent wins.
 
 		return nil, err
 	})
@@ -252,7 +239,12 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	if skipCache {
 		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
 		serveFile(w, r, path)
-		os.Remove(path)
+		// Enqueue with floor instead of os.Remove — a concurrent
+		// pregenerate+ttl request may have just handed this URL to
+		// its subscribers; an immediate delete would 404 them.
+		if services.GlobalExpiryQueue != nil {
+			services.GlobalExpiryQueue.Add(nocacheBaseTTLFloor, nil, path)
+		}
 		return
 	}
 
@@ -261,6 +253,8 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 
 	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
 		services.GlobalExpiryQueue.Add(time.Duration(ttlSeconds)*time.Second, nil, path)
+	} else if services.GlobalExpiryQueue != nil {
+		services.GlobalExpiryQueue.Add(services.OwnedThreshold, nil, path)
 	}
 }
 
