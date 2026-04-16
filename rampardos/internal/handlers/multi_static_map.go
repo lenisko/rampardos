@@ -217,10 +217,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		ensureDir(filepath.Dir(path))
 		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
 
-		// Component cleanup is handled by each component's
-		// GenerateStaticMap call (which enqueues per its own
-		// nocache/TTL intent). Nothing to do here — the extend-
-		// only expiry queue ensures the longest intent wins.
+		// Component files are enqueued by each GenerateStaticMap call.
 
 		return nil, err
 	})
@@ -239,22 +236,18 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	if skipCache {
 		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
 		serveFile(w, r, path)
-		// Enqueue with floor instead of os.Remove — a concurrent
-		// pregenerate+ttl request may have just handed this URL to
-		// its subscribers; an immediate delete would 404 them.
-		if services.GlobalExpiryQueue != nil {
-			services.GlobalExpiryQueue.Add(nocacheBaseTTLFloor, nil, path)
-		}
+		// nocacheBaseTTLFloor protects in-flight pregenerate+ttl subscribers.
+		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, path)
 		return
 	}
 
 	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
 	h.generateResponse(w, r, multiStaticMap, path)
 
-	if ttlSeconds > 0 && services.GlobalExpiryQueue != nil {
-		services.GlobalExpiryQueue.Add(time.Duration(ttlSeconds)*time.Second, nil, path)
-	} else if services.GlobalExpiryQueue != nil {
-		services.GlobalExpiryQueue.Add(services.OwnedThreshold, nil, path)
+	if ttlSeconds > 0 {
+		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, path)
+	} else {
+		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, path)
 	}
 }
 

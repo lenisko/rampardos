@@ -14,6 +14,11 @@ import (
 // An Add at this TTL drops any existing short-TTL entry and marks
 // the path as owned, blocking future short-TTL inserts until
 // CacheCleaner age-evicts the file and calls Unown.
+//
+// Callers must only use OwnedThreshold for paths in folders that
+// have a CacheCleaner configured (maxAge + clearDelay set). If the
+// cleaner is absent, Unown is never called and the owned set grows
+// for the process lifetime.
 const OwnedThreshold = 24 * time.Hour
 
 // ExpiryQueue tracks files that should be deleted after a TTL.
@@ -68,11 +73,7 @@ func InitExpiryQueue(sweepInterval time.Duration) {
 //     TTL never shortens an existing scheduled deletion.
 //   - If the path is in the owned set, the call is a no-op regardless
 //     of TTL (CacheCleaner owns its lifecycle).
-//
-// The onExpiry parameter is accepted for API compatibility but unused
-// in the current codebase (all callers pass nil). It is stored on the
-// item and called after the file is deleted, if non-nil.
-func (q *ExpiryQueue) Add(ttl time.Duration, onExpiry func(), paths ...string) {
+func (q *ExpiryQueue) Add(ttl time.Duration, paths ...string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
