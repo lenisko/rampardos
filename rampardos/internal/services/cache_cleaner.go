@@ -195,6 +195,9 @@ func (cc *CacheCleaner) runOnce() {
 		if dropAll {
 			if err := os.Remove(path); err == nil {
 				count++
+				if GlobalExpiryQueue != nil {
+					GlobalExpiryQueue.Unown(path)
+				}
 			}
 			continue
 		}
@@ -207,6 +210,9 @@ func (cc *CacheCleaner) runOnce() {
 		if cc.shouldRemove(info, cutoff, dropCutoff) {
 			if err := os.Remove(path); err == nil {
 				count++
+				if GlobalExpiryQueue != nil {
+					GlobalExpiryQueue.Unown(path)
+				}
 			}
 		}
 	}
