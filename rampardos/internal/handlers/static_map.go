@@ -380,6 +380,8 @@ func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap 
 	if extStyle == nil {
 		// Local style: fractional zoom → viewport render (native float zoom).
 		// Integer zoom → tile stitching (cacheable via Cache/Tile).
+		// Scale>1 uses per-scale worker pools (ratio=scale) so tiles
+		// have correct geographic extent; stitching works normally.
 		if isFractional(staticMap.Zoom) {
 			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap, basePath)
 		}
