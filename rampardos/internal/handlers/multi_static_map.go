@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
 	"log/slog"
 	"net/http"
 	"os"
@@ -136,22 +137,6 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	cached := false
-	if !skipCache {
-		if _, err := os.Stat(path); err == nil {
-			cached = true
-		}
-	}
-
-	if cached {
-		duration := time.Since(startTime).Seconds()
-		slog.Debug("Served multi-static map (cached)", "file", filepath.Base(path))
-		h.statsController.StaticMapServed(false, path, "multi")
-		services.GlobalMetrics.RecordRequest("multistaticmap", "multi", true, duration)
-		h.generateResponse(w, r, multiStaticMap, path)
-		return
-	}
-
 	// Collect all maps to generate
 	var mapsToGenerate []models.StaticMap
 	for _, grid := range multiStaticMap.Grid {
@@ -175,32 +160,33 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	// cancellation so a leader disconnect does not abort the shared
 	// composite render for concurrent followers.
 	genCtx := context.WithoutCancel(r.Context())
-	_, sfErr, _ := h.sfg.Do(path, func() (any, error) {
-		if !skipCache {
-			if _, err := os.Stat(path); err == nil {
-				return nil, nil
+	v, sfErr, _ := h.sfg.Do(path, func() (any, error) {
+		if !skipCache && services.GlobalCompositeImageCache != nil {
+			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+				return cached, nil
 			}
 		}
 
-		// Generate all component maps in parallel (limit concurrency to 5)
+		componentImages := make([]image.Image, len(mapsToGenerate))
 		var wg sync.WaitGroup
 		var genErr error
 		var errOnce sync.Once
 		sem := make(chan struct{}, 5)
 
-		for _, staticMap := range mapsToGenerate {
+		for i, staticMap := range mapsToGenerate {
 			wg.Add(1)
-			go func(sm models.StaticMap) {
+			go func(idx int, sm models.StaticMap) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				if _, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, componentOpts); err != nil {
-					errOnce.Do(func() {
-						genErr = err
-					})
+				img, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, componentOpts)
+				if err != nil {
+					errOnce.Do(func() { genErr = err })
+					return
 				}
-			}(staticMap)
+				componentImages[idx] = img
+			}(i, staticMap)
 		}
 		wg.Wait()
 
@@ -208,12 +194,14 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 			return nil, genErr
 		}
 
-		ensureDir(filepath.Dir(path))
-		err := utils.GenerateMultiStaticMap(multiStaticMap, path)
-
-		// Component files are enqueued by each GenerateStaticMap call.
-
-		return nil, err
+		composed, err := utils.GenerateMultiStaticMapFromImages(multiStaticMap, componentImages)
+		if err != nil {
+			return nil, err
+		}
+		if services.GlobalCompositeImageCache != nil {
+			services.GlobalCompositeImageCache.Add(path, composed)
+		}
+		return composed, nil
 	})
 
 	if sfErr != nil {
@@ -222,27 +210,29 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		http.Error(w, sfErr.Error(), http.StatusInternalServerError)
 		return
 	}
+	composed := v.(image.Image)
+	encoded, err := utils.EncodeImage(composed, filepath.Ext(path))
+	if err != nil {
+		slog.Error("Failed to encode multi-static map", "error", err)
+		services.GlobalMetrics.RecordError("multistaticmap", "encode_failed")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	duration := time.Since(startTime).Seconds()
 	h.statsController.StaticMapServed(true, path, "multi")
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
+	ttl := effectiveTTL(skipCache, ttlSeconds)
+
 	if skipCache {
 		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
-		serveFile(w, r, path)
-		// nocacheBaseTTLFloor protects in-flight pregenerate+ttl subscribers.
-		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, path)
+		serveStaticMapBytes(w, r, path, encoded)
 		return
 	}
 
 	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
-	h.generateResponse(w, r, multiStaticMap, path)
-
-	if ttlSeconds > 0 {
-		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, path)
-	} else {
-		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, path)
-	}
+	h.generateResponse(w, r, multiStaticMap, path, encoded, ttl, path)
 }
 
 func (h *MultiStaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *http.Request, id string) {
@@ -278,11 +268,11 @@ func (h *MultiStaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter,
 	h.handleRequest(w, r, multiStaticMap)
 }
 
-func (h *MultiStaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, multiStaticMap models.MultiStaticMap, path string) {
-	if handlePregenerateResponseFile(w, r, path, multiStaticMap) {
+func (h *MultiStaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, multiStaticMap models.MultiStaticMap, path string, encoded []byte, ttl time.Duration, basePath string) {
+	if handlePregenerateResponseBytes(w, r, path, multiStaticMap, encoded, ttl, basePath) {
 		return
 	}
-	serveFile(w, r, path)
+	serveStaticMapBytes(w, r, path, encoded)
 }
 
 func (h *MultiStaticMapHandler) renderTemplate(_ *http.Request, template string, params map[string][]string) (*models.MultiStaticMap, error) {
