@@ -149,9 +149,16 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 }
 
 // GenerateOpts controls caching behaviour for component map generation.
+// In the bytes-first pipeline the in-memory LRU is always consulted;
+// nocache semantics collapse to "use a short TTL" on the pregenerate
+// disk-write path, which the caller expresses directly via TTL.
 type GenerateOpts struct {
-	NoCache    bool          // if true, skip LRU cache lookup
-	TTL        time.Duration // if > 0, queue files for deletion after this duration
+	// TTL governs disk-file deletion for pregenerate requests. Has
+	// no effect on non-pregenerate paths — those never write a file.
+	// Callers conveying the ?nocache=true semantic set this to
+	// nocacheBaseTTLFloor (30 s); zero leaves pregenerate files under
+	// the CacheCleaner's OwnedThreshold age sweep.
+	TTL time.Duration
 }
 
 // GenerateStaticMap generates a static map and returns the decoded
@@ -170,7 +177,11 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
-	if !opts.NoCache && services.GlobalCompositeImageCache != nil {
+	// NoCache governs disk-file lifetime at the pregenerate layer, not
+	// in-memory reuse. Weather-alert fan-out hits this path with
+	// nocache=true and the whole point is that N siblings share the
+	// single render via the LRU.
+	if services.GlobalCompositeImageCache != nil {
 		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 			return cached, nil
 		}
@@ -182,7 +193,7 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	// is still live. Values (deadlines, trace IDs) still flow through.
 	genCtx := context.WithoutCancel(ctx)
 	v, err, _ := h.sfg.Do(path, func() (any, error) {
-		if !opts.NoCache && services.GlobalCompositeImageCache != nil {
+		if services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 				return cached, nil
 			}
@@ -255,7 +266,10 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	// render for concurrent followers.
 	genCtx := context.WithoutCancel(r.Context())
 	v, genErr, _ := h.sfg.Do(path, func() (any, error) {
-		if !skipCache && services.GlobalCompositeImageCache != nil {
+		// skipCache (from ?nocache=true) governs disk lifetime in the
+		// pregenerate path, not in-memory reuse. Concurrent siblings
+		// always benefit from the LRU.
+		if services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 				return cached, nil
 			}
@@ -289,17 +303,14 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	h.statsController.StaticMapServed(true, path, staticMap.Style)
 	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 
-	// Resolve effective TTL once. Only used if pregenerate writes
-	// the file; otherwise it governs nothing.
-	ttl := effectiveTTL(skipCache, ttlSeconds)
+	// ttl only has effect if pregenerate=true (handlePregenerateResponseBytes
+	// writes the file + enqueues it); otherwise the response is served
+	// from in-memory bytes with no disk artefact to expire. The
+	// nocache+pregenerate conversion above already folded nocache into
+	// ttlSeconds=30 for the pregenerate case.
+	ttl := effectiveTTL(ttlSeconds)
 
-	if skipCache {
-		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
-		serveStaticMapBytes(w, r, path, encoded)
-		return
-	}
-
-	slog.Debug("Served static map (generated)", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds)
+	slog.Debug("Served static map", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds, "nocache", skipCache)
 	h.generateResponse(w, r, staticMap, path, encoded, ttl, basePath)
 }
 
@@ -687,17 +698,12 @@ func serveStaticMapBytes(w http.ResponseWriter, r *http.Request, path string, en
 	http.ServeContent(w, r, filepath.Base(path), time.Now(), bytes.NewReader(encoded))
 }
 
-// effectiveTTL resolves query-param state into the duration that
-// governs disk-file lifetime when pregenerate=true writes a file.
-// Only used when there will actually be a file on disk.
-func effectiveTTL(skipCache bool, ttlSeconds int) time.Duration {
-	if skipCache {
-		// The nocache+pregenerate combo is rewritten earlier to
-		// skipCache=false + ttlSeconds=30; if skipCache is still
-		// true here, there is no pregenerate and no file. The
-		// returned value is unused.
-		return nocacheBaseTTLFloor
-	}
+// effectiveTTL resolves the ?ttl query-param into the duration that
+// governs disk-file lifetime for pregenerate requests. Zero falls
+// through to OwnedThreshold (CacheCleaner age-sweep). The nocache+
+// pregenerate combo is rewritten to ttlSeconds=30 at the handler
+// entry, so nocache-specific handling lives there, not here.
+func effectiveTTL(ttlSeconds int) time.Duration {
 	if ttlSeconds > 0 {
 		return time.Duration(ttlSeconds) * time.Second
 	}
