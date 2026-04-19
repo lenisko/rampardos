@@ -172,7 +172,7 @@ func (npr *NodePoolRenderer) RenderViewport(ctx context.Context, req ViewportReq
 	if scale < 1 {
 		scale = 1
 	}
-	return encodeRGBAImage(img, req.Width*scale, req.Height*scale, req.Format)
+	return encodeRGBAImage(img, req.Format)
 }
 
 // RenderViewportImage dispatches a viewport request and returns the
@@ -205,6 +205,13 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 	}, nil
 }
 
+// renderViewportInternal is the tile-serving dispatch path. It keeps
+// the lenient encodeRGBA so TestNodePoolRendererRenderReturnsBytes
+// can run against the fake worker's 4-byte canned payload; strict
+// callers that need the worker's buffer length validated (static-
+// map pipeline after the bytes-first refactor) use RenderViewport
+// or RenderViewportImage, both of which go through encodeRGBAImage
+// directly.
 func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req ViewportRequest) ([]byte, error) {
 	scale := int(req.Scale)
 	if scale < 1 {
@@ -370,16 +377,21 @@ func encodeRGBA(rgba []byte, width, height int, format models.ImageFormat) ([]by
 		Stride: width * 4,
 		Rect:   image.Rect(0, 0, width, height),
 	}
-	return encodeRGBAImage(img, width, height, format)
+	return encodeRGBAImage(img, format)
 }
 
 // encodeRGBAImage is the shared encode path used by both the byte-
 // based renderer.Render entry points and any caller that already has
 // an *image.NRGBA in hand.
-func encodeRGBAImage(img *image.NRGBA, width, height int, format models.ImageFormat) ([]byte, error) {
+func encodeRGBAImage(img *image.NRGBA, format models.ImageFormat) ([]byte, error) {
 	var buf bytes.Buffer
 	switch format {
 	case models.ImageFormatPNG:
+		// Respect PNG_COMPRESSION_LEVEL. Default png.Encoder uses
+		// flate level 6 — ~4-6× slower than the "fast" setting
+		// applied everywhere else via saveImage. The renderer runs
+		// this on every maplibre-native tile/viewport, so the
+		// difference compounds.
 		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
