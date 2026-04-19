@@ -90,7 +90,7 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	// Create combined image
 	gridWidth := (maxX - minX + 1) * tileWidth
 	gridHeight := (maxY - minY + 1) * tileHeight
-	combined := image.NewRGBA(image.Rect(0, 0, gridWidth, gridHeight))
+	combined := image.NewNRGBA(image.Rect(0, 0, gridWidth, gridHeight))
 
 	// Draw tiles at their positions
 	for _, pos := range positions {
@@ -115,7 +115,7 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	}
 
 	// Crop to final size
-	cropped := image.NewRGBA(image.Rect(0, 0, imgWidth, imgHeight))
+	cropped := image.NewNRGBA(image.Rect(0, 0, imgWidth, imgHeight))
 	draw.Draw(cropped, cropped.Bounds(), combined,
 		image.Point{X: imgWidthOffset, Y: imgHeightOffset}, draw.Src)
 
@@ -363,7 +363,7 @@ func appendImages(base, addition image.Image, direction models.CombineDirection)
 			addW = scaledW
 			addH = targetH
 		}
-		combined := image.NewRGBA(image.Rect(0, 0, baseW+addW, targetH))
+		combined := image.NewNRGBA(image.Rect(0, 0, baseW+addW, targetH))
 		draw.Draw(combined, image.Rect(0, 0, baseW, baseH), base, image.Point{}, draw.Src)
 		draw.Draw(combined, image.Rect(baseW, 0, baseW+addW, addH), addition, image.Point{}, draw.Src)
 		return combined
@@ -377,7 +377,7 @@ func appendImages(base, addition image.Image, direction models.CombineDirection)
 			addW = targetW
 			addH = scaledH
 		}
-		combined := image.NewRGBA(image.Rect(0, 0, targetW, baseH+addH))
+		combined := image.NewNRGBA(image.Rect(0, 0, targetW, baseH+addH))
 		draw.Draw(combined, image.Rect(0, 0, baseW, baseH), base, image.Point{}, draw.Src)
 		draw.Draw(combined, image.Rect(0, baseH, addW, baseH+addH), addition, image.Point{}, draw.Src)
 		return combined
@@ -391,7 +391,7 @@ func appendImages(base, addition image.Image, direction models.CombineDirection)
 // scaleImage resizes an image to the target dimensions using high-quality
 // CatmullRom interpolation.
 func scaleImage(src image.Image, width, height int) image.Image {
-	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
 	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
 	return dst
 }
@@ -489,7 +489,7 @@ func saveImage(path string, img image.Image) error {
 
 // resizeImage resizes an image to the target dimensions
 func resizeImage(img image.Image, width, height int) image.Image {
-	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
 	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Over, nil)
 	return dst
 }
