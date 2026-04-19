@@ -78,6 +78,12 @@ type MetricsManager struct {
 	// encoding) would meaningfully reduce per-stitch CPU.
 	tileDecodeDuration *prometheus.HistogramVec
 
+	// Viewport render time for the arbitrary-size maplibre-native
+	// path. Covers fractional-zoom staticmaps and the
+	// LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass; distinct from
+	// tile_generate_duration which only times per-tile work.
+	rendererViewportDuration *prometheus.HistogramVec
+
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
 
@@ -241,6 +247,12 @@ func newMetricsManager() *MetricsManager {
 			Help:    "Time to produce a decoded *image.NRGBA for a tile. source=ram_lru is a memory cache hit (lock + memcpy); source=disk is a file read + image.Decode on miss.",
 			Buckets: []float64{0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
 		}, []string{"source"}),
+
+		rendererViewportDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_viewport_duration_seconds",
+			Help:    "Time spent inside renderer.RenderViewport, covering fractional-zoom bases and the LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass. Includes maplibre-native render + encode + IPC; excludes the caller's disk write.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+		}, []string{"style"}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
@@ -412,6 +424,10 @@ func (m *MetricsManager) RecordTileGenerate(style, source string, duration float
 
 func (m *MetricsManager) RecordTileDecode(source string, duration float64) {
 	m.tileDecodeDuration.WithLabelValues(source).Observe(duration)
+}
+
+func (m *MetricsManager) RecordRendererViewport(style string, duration float64) {
+	m.rendererViewportDuration.WithLabelValues(style).Observe(duration)
 }
 
 func (m *MetricsManager) RecordImageCacheHit(name string) {
