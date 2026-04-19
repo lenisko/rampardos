@@ -325,6 +325,56 @@ func TestLoadPoolWritesPreparedStyleAtomically(t *testing.T) {
 	}
 }
 
+// TestNodePoolRendererRenderViewportImageRejectsBadPayload pins the
+// strict length check in RenderViewportImage. The fake worker
+// returns a canned payload that doesn't match width*height*4; the
+// strict path must error rather than wrap it as an NRGBA with
+// invalid stride.
+func TestNodePoolRendererRenderViewportImageRejectsBadPayload(t *testing.T) {
+	stylesDir := writeTestStyle(t, "basic")
+
+	npr, err := NewNodePoolRenderer(Config{
+		StylesDir:      stylesDir,
+		FontsDir:       t.TempDir(),
+		MbtilesFile:    "/tmp/fake.mbtiles",
+		PoolSize:       1,
+		WorkerLifetime: 100,
+		RenderTimeout:  5 * time.Second,
+		StartupTimeout: 2 * time.Second,
+		DiscoverStyles: func() ([]string, error) { return []string{"basic"}, nil },
+	}, func(styleID, preparedPath string, ratio int) func() (*worker, error) {
+		return func() (*worker, error) {
+			return spawnWorker(workerArgs{
+				binary:           "bash",
+				script:           "testdata/fake-worker-ok.sh",
+				styleID:          styleID,
+				handshakeTimeout: 2 * time.Second,
+			})
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer npr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err = npr.RenderViewportImage(ctx, ViewportRequest{
+		StyleID:   "basic",
+		Latitude:  51.5,
+		Longitude: 0.0,
+		Zoom:      14,
+		Width:     256,
+		Height:    256,
+		Scale:     1,
+		Format:    models.ImageFormatPNG,
+	})
+	if err == nil {
+		t.Fatal("expected error on short fake-worker payload")
+	}
+}
+
 func TestNodePoolRendererUnknownStyle(t *testing.T) {
 	stylesDir := writeTestStyle(t, "basic")
 

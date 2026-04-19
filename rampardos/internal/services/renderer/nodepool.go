@@ -161,9 +161,48 @@ func (npr *NodePoolRenderer) Render(ctx context.Context, req Request) ([]byte, e
 	return npr.renderViewportInternal(ctx, vp)
 }
 
-// RenderViewport dispatches an arbitrary viewport request directly.
+// RenderViewport dispatches an arbitrary viewport request directly,
+// returning the encoded bytes in the requested format.
 func (npr *NodePoolRenderer) RenderViewport(ctx context.Context, req ViewportRequest) ([]byte, error) {
-	return npr.renderViewportInternal(ctx, req)
+	img, err := npr.RenderViewportImage(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	scale := int(req.Scale)
+	if scale < 1 {
+		scale = 1
+	}
+	return encodeRGBAImage(img, req.Width*scale, req.Height*scale, req.Format)
+}
+
+// RenderViewportImage dispatches a viewport request and returns the
+// raw decoded *image.NRGBA. Lets callers skip the PNG encode when
+// their next step is a draw operation rather than a disk write.
+func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req ViewportRequest) (*image.NRGBA, error) {
+	scale := int(req.Scale)
+	if scale < 1 {
+		scale = 1
+	}
+	pool, err := npr.getOrCreatePool(req.StyleID, req.Scale)
+	if err != nil {
+		return nil, err
+	}
+	frame := requestFrameForViewport(req)
+	rgba, err := pool.dispatch(ctx, frame)
+	if err != nil {
+		return nil, err
+	}
+	width := req.Width * scale
+	height := req.Height * scale
+	if len(rgba) != width*height*4 {
+		return nil, fmt.Errorf("renderer: worker returned %d bytes, expected %d for %dx%d",
+			len(rgba), width*height*4, width, height)
+	}
+	return &image.NRGBA{
+		Pix:    rgba,
+		Stride: width * 4,
+		Rect:   image.Rect(0, 0, width, height),
+	}, nil
 }
 
 func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req ViewportRequest) ([]byte, error) {
@@ -326,21 +365,21 @@ func encodeRGBA(rgba []byte, width, height int, format models.ImageFormat) ([]by
 	if len(rgba) != width*height*4 {
 		return rgba, nil
 	}
-
 	img := &image.NRGBA{
 		Pix:    rgba,
 		Stride: width * 4,
 		Rect:   image.Rect(0, 0, width, height),
 	}
+	return encodeRGBAImage(img, width, height, format)
+}
 
+// encodeRGBAImage is the shared encode path used by both the byte-
+// based renderer.Render entry points and any caller that already has
+// an *image.NRGBA in hand.
+func encodeRGBAImage(img *image.NRGBA, width, height int, format models.ImageFormat) ([]byte, error) {
 	var buf bytes.Buffer
 	switch format {
 	case models.ImageFormatPNG:
-		// Respect PNG_COMPRESSION_LEVEL. png.Encode() uses the default
-		// Encoder{} which is flate level 6 — ~4-6× slower than the "fast"
-		// setting applied everywhere else via saveImage. The renderer
-		// runs this on every maplibre-native tile/viewport, so the
-		// difference compounds.
 		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
@@ -359,6 +398,5 @@ func encodeRGBA(rgba []byte, width, height int, format models.ImageFormat) ([]by
 	default:
 		return nil, fmt.Errorf("renderer: unsupported format %q", format)
 	}
-
 	return buf.Bytes(), nil
 }
