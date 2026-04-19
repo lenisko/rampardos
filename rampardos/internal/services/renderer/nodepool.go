@@ -23,6 +23,27 @@ import (
 	"github.com/lenisko/rampardos/internal/services"
 )
 
+// rendererPNGBufferPool reuses png.EncoderBuffer across encodes so
+// the internal zlib writer and filter working buffers don't allocate
+// fresh per call. Kept local to the renderer package — the utils
+// package has its own pool for the HTTP-boundary encoder.
+var rendererPNGBufferPool rendererPNGEncoderBufferPool
+
+type rendererPNGEncoderBufferPool struct {
+	pool sync.Pool
+}
+
+func (p *rendererPNGEncoderBufferPool) Get() *png.EncoderBuffer {
+	if b, ok := p.pool.Get().(*png.EncoderBuffer); ok {
+		return b
+	}
+	return nil
+}
+
+func (p *rendererPNGEncoderBufferPool) Put(buf *png.EncoderBuffer) {
+	p.pool.Put(buf)
+}
+
 // poolKey builds the map key for a (style, scale) pool. Scale=1 pools
 // use the bare styleID for backward compatibility with log messages
 // and the canary render path.
@@ -387,8 +408,9 @@ func encodeRGBAImage(img *image.NRGBA, format models.ImageFormat) ([]byte, error
 		// flate level 6 — ~4-6× slower than the "fast" setting
 		// applied everywhere else via saveImage. The renderer runs
 		// this on every maplibre-native tile/viewport, so the
-		// difference compounds.
-		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+		// difference compounds. BufferPool reuses the internal
+		// zlib+filter state across encodes.
+		encoder := png.Encoder{CompressionLevel: png.BestSpeed, BufferPool: &rendererPNGBufferPool}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
 		}
