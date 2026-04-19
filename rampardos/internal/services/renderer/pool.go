@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/lenisko/rampardos/internal/services"
 )
 
 // stylePoolConfig configures a single per-style worker pool.
@@ -64,8 +66,12 @@ func newStylePool(cfg stylePoolConfig) (*stylePool, error) {
 // the result. If the worker has reached its render lifetime, it is
 // killed and replaced before being returned to the idle queue.
 func (p *stylePool) dispatch(ctx context.Context, requestJSON []byte) ([]byte, error) {
+	acquireStart := time.Now()
 	select {
 	case w := <-p.idle:
+		if services.GlobalMetrics != nil {
+			services.GlobalMetrics.RecordRendererPoolAcquire(p.cfg.styleID, time.Since(acquireStart).Seconds(), len(p.idle))
+		}
 		p.mu.Lock()
 		p.lastPID = w.handshake.PID
 		p.mu.Unlock()
@@ -75,15 +81,21 @@ func (p *stylePool) dispatch(ctx context.Context, requestJSON []byte) ([]byte, e
 		// Decide whether to return this worker to the pool, recycle
 		// it, or drop it.
 		replace := false
+		replaceReason := ""
 		if err != nil {
 			// Any error kills the worker — safer than trying to
 			// recover, and the pool refills the slot.
 			replace = true
+			replaceReason = services.WorkerReplacementError
 		} else if int(w.renders.Load()) >= p.cfg.workerLifetime {
 			replace = true
+			replaceReason = services.WorkerReplacementLifetime
 		}
 
 		if replace {
+			if services.GlobalMetrics != nil {
+				services.GlobalMetrics.RecordRendererWorkerReplacement(p.cfg.styleID, replaceReason)
+			}
 			w.kill()
 			// Best-effort spawn replacement; if it fails we still
 			// return the error to the caller but log asynchronously.
