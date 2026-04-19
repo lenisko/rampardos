@@ -450,6 +450,24 @@ func loadImage(path string) (image.Image, error) {
 	return img, err
 }
 
+// toNRGBA normalises a decoded image to *image.NRGBA so later
+// draw.Draw calls into an NRGBA canvas hit the fast same-type copy
+// instead of the generic drawMask path. Identity return for images
+// already NRGBA (vector-tile PNGs decode to NRGBA natively). Pays
+// one draw.Draw on first decode for YCbCr (JPEG, e.g. mapbox
+// satellite tiles) and RGBA (no-alpha PNG) sources; the converted
+// NRGBA is what the caller caches, so the conversion is amortised
+// across every subsequent stitch that hits the LRU.
+func toNRGBA(img image.Image) *image.NRGBA {
+	if n, ok := img.(*image.NRGBA); ok {
+		return n
+	}
+	b := img.Bounds()
+	dst := image.NewNRGBA(b)
+	draw.Draw(dst, b, img, b.Min, draw.Src)
+	return dst
+}
+
 // loadImageWithRetry loads an image, retrying once via redownload if
 // corrupted. Consults GlobalTileImageCache first — pprof showed PNG
 // decode of already-disk-cached tiles dominating base-map stitching
@@ -483,6 +501,11 @@ func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, 
 	}
 
 	if err == nil && img != nil {
+		// Normalise once to NRGBA. Stitch canvases are NRGBA, so
+		// caching non-NRGBA (YCbCr from JPEG, RGBA from opaque PNG)
+		// would force draw.Draw into the generic drawMask path on
+		// every hit. Do the conversion at the LRU boundary instead.
+		img = toNRGBA(img)
 		if services.GlobalMetrics != nil {
 			services.GlobalMetrics.RecordTileDecode(services.TileDecodeSourceDisk, time.Since(start).Seconds())
 		}
