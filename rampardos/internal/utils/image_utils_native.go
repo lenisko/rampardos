@@ -234,69 +234,6 @@ func drawCircle(dc *gg.Context, staticMap models.StaticMap, circle models.Circle
 	}
 }
 
-// drawMarker draws a single marker onto dc. Returns false (and does not draw)
-// if the marker is outside the visible area or cannot be loaded.
-func drawMarker(dc *gg.Context, staticMap models.StaticMap, marker models.Marker, sm *SphericalMercator, scale uint8) bool {
-	realOffset := getRealOffset(
-		models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
-		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-		staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
-	)
-
-	// Skip markers outside the visible area
-	if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
-		abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
-		return false
-	}
-
-	markerPath := getMarkerPath(marker)
-	if marker.FallbackURL != "" {
-		if _, err := os.Stat(markerPath); os.IsNotExist(err) {
-			markerPath = getFallbackMarkerPath(marker)
-		}
-	}
-
-	// Always resize marker to target dimensions (matching ImageMagick behavior)
-	targetWidth := int(marker.Width) * int(scale)
-	targetHeight := int(marker.Height) * int(scale)
-
-	// Try to get from in-memory cache first
-	var markerImg image.Image
-	if services.GlobalCacheIndex != nil && targetWidth > 0 && targetHeight > 0 {
-		if cached, ok := services.GlobalCacheIndex.GetMarkerImage(markerPath, targetWidth, targetHeight); ok {
-			markerImg = cached
-		}
-	}
-
-	// Load and resize if not cached
-	if markerImg == nil {
-		var err error
-		markerImg, err = loadImage(markerPath)
-		if err != nil {
-			return false // Skip markers that can't be loaded
-		}
-
-		if targetWidth > 0 && targetHeight > 0 {
-			markerImg = resizeImage(markerImg, targetWidth, targetHeight)
-			// Cache the resized image
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
-			}
-		}
-	}
-
-	// Calculate position (ImageMagick uses -gravity Center, so offset is from center)
-	// The marker should be centered at (centerX + offsetX, centerY + offsetY)
-	centerX := dc.Width() / 2
-	centerY := dc.Height() / 2
-
-	// Draw marker at position (top-left corner calculation)
-	drawX := centerX + realOffset.x - markerImg.Bounds().Dx()/2
-	drawY := centerY + realOffset.y - markerImg.Bounds().Dy()/2
-	dc.DrawImage(markerImg, drawX, drawY)
-	return true
-}
-
 // GenerateStaticMapFromImage renders overlays on top of baseImg and
 // returns the resulting image.Image. Unlike GenerateStaticMapNative
 // it neither reads from nor writes to disk — the caller owns
@@ -310,9 +247,13 @@ func drawMarker(dc *gg.Context, staticMap models.StaticMap, marker models.Marker
 // copy is same-type memcpy, marker draws are same-type fast path,
 // encode is direct NRGBA output.
 //
-// Polygon/circle cases fall back to gg because gg's anti-aliased
-// rasterisers are worth the conversion tax for primitives we'd
-// otherwise have to reimplement by hand.
+// When polygons/circles are present we use gg for its anti-aliased
+// rasterisers but stamp markers afterwards on the NRGBA canvas.
+// gg.DrawImage(NRGBA-marker onto RGBA-canvas) hits xdraw's slow
+// transform_RGBA_NRGBA_Over path (~50ms under dense-marker load);
+// drawMarkerNRGBA on an NRGBA canvas hits draw.Draw's same-type
+// fast path instead, and the RGBA→NRGBA conversion we'd do anyway
+// now earns its keep by unlocking this faster marker stamp.
 func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator) (image.Image, error) {
 	scale := staticMap.Scale
 	if scale == 0 {
@@ -336,17 +277,12 @@ func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image,
 	for _, circle := range staticMap.Circles {
 		drawCircle(dc, staticMap, circle, sm, scale)
 	}
-	for _, marker := range staticMap.Markers {
-		drawMarker(dc, staticMap, marker, sm, scale)
-	}
 
-	// gg's internal canvas is *image.RGBA. Downstream consumers
-	// (multi grid compose via appendImages, and the final
-	// EncodeImage call) are NRGBA-oriented, so returning RGBA
-	// forces slow-path draw+encode on every follower. Pay one
-	// RGBA→NRGBA conversion here so appendImages hits its fast
-	// same-type path and png.Encode skips the un-premultiply pass.
-	return toNRGBA(dc.Image()), nil
+	canvas := toNRGBA(dc.Image())
+	for _, marker := range staticMap.Markers {
+		drawMarkerNRGBA(canvas, staticMap, marker, sm, scale)
+	}
+	return canvas, nil
 }
 
 // drawMarkersNative renders markers directly onto a fresh NRGBA copy
@@ -369,9 +305,9 @@ func drawMarkersNative(staticMap models.StaticMap, baseImg image.Image, sm *Sphe
 	return canvas
 }
 
-// drawMarkerNRGBA mirrors drawMarker but stamps the marker onto an
-// NRGBA canvas via draw.Draw instead of going through a gg.Context.
-// Same position/skip/fallback logic; same marker-cache interaction.
+// drawMarkerNRGBA stamps a single marker onto an NRGBA canvas via
+// draw.Draw (NRGBA→NRGBA Over fast path). Skips the marker when
+// outside the visible area or when loading fails.
 func drawMarkerNRGBA(canvas *image.NRGBA, staticMap models.StaticMap, marker models.Marker, sm *SphericalMercator, scale uint8) {
 	realOffset := getRealOffset(
 		models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
