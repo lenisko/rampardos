@@ -8,10 +8,11 @@ visible in the code.
 - One worker pool per `(styleID, scale)` tuple. Scale is baked into the
   maplibre-native `ratio` at pool construction — not a per-request parameter.
   Pools are created lazily by `getOrCreatePool(styleID, scale)`.
-- For local styles: integer zoom → tile stitching (unless
-  `LOCAL_STYLES_USE_VIEWPORT=true`, which routes it through native
-  viewport render). Fractional zoom → always native viewport render.
-  The dispatcher (`generateBaseStaticMap`) picks the branch on
+- For local styles: default is native viewport render for all zooms
+  (`LOCAL_STYLES_USE_VIEWPORT=true` by default). Set to `false` to route
+  integer-zoom requests through tile stitching; fractional zoom is
+  always viewport-rendered regardless. The dispatcher
+  (`generateBaseStaticMap`) picks the branch on
   `isFractional(zoom) || h.localUseViewport`.
 - External styles can't use viewport render — they always tile-stitch,
   with fractional zoom approximated to the nearest integer.
