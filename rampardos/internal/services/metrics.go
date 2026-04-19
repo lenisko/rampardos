@@ -107,8 +107,9 @@ const (
 	TileSourceLocal    = "local"
 	TileSourceExternal = "external"
 
-	ImageCacheTile   = "tile"
-	ImageCacheMarker = "marker"
+	ImageCacheTile      = "tile"
+	ImageCacheMarker    = "marker"
+	ImageCacheComposite = "composite"
 
 	TileDecodeSourceRAMLRU = "ram_lru"
 	TileDecodeSourceDisk   = "disk"
