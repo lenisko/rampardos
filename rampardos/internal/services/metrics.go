@@ -64,6 +64,13 @@ type MetricsManager struct {
 	imageCacheHits   *prometheus.CounterVec
 	imageCacheMisses *prometheus.CounterVec
 
+	// Tile generation time split by source: disk cache hit, local
+	// render via maplibre-native, or external download. Covers every
+	// GenerateTile call including internal ones from the static-map
+	// stitcher (which bypass the /tile HTTP handler and therefore
+	// don't land in rampardos_request_duration_seconds{type="tile"}).
+	tileGenerateDuration *prometheus.HistogramVec
+
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
 
@@ -200,6 +207,12 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_image_cache_misses_total",
 			Help: "Misses on the in-memory decoded-image LRUs. A miss forces a file read + image.Decode.",
 		}, []string{"cache"}),
+
+		tileGenerateDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_tile_generate_duration_seconds",
+			Help:    "Time spent producing a tile. source=cache is a disk hit; source=local is a maplibre-native render; source=external is an upstream download. Includes stitcher-initiated calls that skip the /tile HTTP handler.",
+			Buckets: []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+		}, []string{"style", "source"}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
@@ -363,6 +376,13 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 	} else {
 		m.cacheMissTotal.WithLabelValues("staticmap").Inc()
 	}
+}
+
+// RecordTileGenerate records how long a single GenerateTile call
+// took, labelled by the style and the source that produced the
+// tile (cache | local | external).
+func (m *MetricsManager) RecordTileGenerate(style, source string, duration float64) {
+	m.tileGenerateDuration.WithLabelValues(style, source).Observe(duration)
 }
 
 // RecordImageCacheHit records a hit on an in-memory image LRU.
