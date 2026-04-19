@@ -49,15 +49,24 @@ func (c *CacheIndex) SetMarkerImageCacheSize(size int) {
 	}
 }
 
-// GetMarkerImage retrieves a cached resized marker image by path and target size
+// GetMarkerImage retrieves a cached resized marker image by path and target size.
+// Records hit/miss to GlobalMetrics when set.
 func (c *CacheIndex) GetMarkerImage(path string, width, height int) (image.Image, bool) {
 	key := markerImageKey(path, width, height)
 	c.markerImagesMu.Lock()
-	defer c.markerImagesMu.Unlock()
 
 	if elem, ok := c.markerImages[key]; ok {
 		c.markerImagesLRU.MoveToFront(elem)
-		return elem.Value.(*markerImageEntry).image, true
+		img := elem.Value.(*markerImageEntry).image
+		c.markerImagesMu.Unlock()
+		if GlobalMetrics != nil {
+			GlobalMetrics.RecordImageCacheHit("marker")
+		}
+		return img, true
+	}
+	c.markerImagesMu.Unlock()
+	if GlobalMetrics != nil {
+		GlobalMetrics.RecordImageCacheMiss("marker")
 	}
 	return nil, false
 }
