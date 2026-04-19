@@ -279,13 +279,29 @@ func drawMarker(dc *gg.Context, staticMap models.StaticMap, marker models.Marker
 // returns the resulting image.Image. Unlike GenerateStaticMapNative
 // it neither reads from nor writes to disk — the caller owns
 // persistence.
+//
+// When the only drawables are markers (poracle's common shape),
+// skip gg entirely: gg.NewContextForImage copies the NRGBA base
+// into an internal RGBA canvas (slow-path NRGBA→RGBA) and its
+// output is RGBA too, which forces an un-premultiply pass on PNG
+// encode. The marker-only fast path stays NRGBA end-to-end — base
+// copy is same-type memcpy, marker draws are same-type fast path,
+// encode is direct NRGBA output.
+//
+// Polygon/circle cases fall back to gg because gg's anti-aliased
+// rasterisers are worth the conversion tax for primitives we'd
+// otherwise have to reimplement by hand.
 func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator) (image.Image, error) {
-	dc := gg.NewContextForImage(baseImg)
-
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
 	}
+
+	if len(staticMap.Polygons) == 0 && len(staticMap.Circles) == 0 {
+		return drawMarkersNative(staticMap, baseImg, sm, scale), nil
+	}
+
+	dc := gg.NewContextForImage(baseImg)
 
 	for _, polygon := range staticMap.Polygons {
 		if len(polygon.Path) == 0 {
@@ -303,6 +319,81 @@ func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image,
 	}
 
 	return dc.Image(), nil
+}
+
+// drawMarkersNative renders markers directly onto a fresh NRGBA copy
+// of baseImg. Skips gg's RGBA round-trip. Caller must not pass a
+// baseImg from a shared cache without expecting the output to be a
+// new canvas — we copy baseImg rather than mutate it so the LRU
+// entry stays clean.
+func drawMarkersNative(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator, scale uint8) image.Image {
+	b := baseImg.Bounds()
+	canvas := image.NewNRGBA(b)
+	// Same-type NRGBA→NRGBA Src copy hits the fast memcpy path when
+	// baseImg is NRGBA (the common case after the tile-normalisation
+	// change); otherwise falls back to the generic path for this
+	// one-off copy but subsequent marker draws stay NRGBA-native.
+	draw.Draw(canvas, b, baseImg, b.Min, draw.Src)
+
+	for _, marker := range staticMap.Markers {
+		drawMarkerNRGBA(canvas, staticMap, marker, sm, scale)
+	}
+	return canvas
+}
+
+// drawMarkerNRGBA mirrors drawMarker but stamps the marker onto an
+// NRGBA canvas via draw.Draw instead of going through a gg.Context.
+// Same position/skip/fallback logic; same marker-cache interaction.
+func drawMarkerNRGBA(canvas *image.NRGBA, staticMap models.StaticMap, marker models.Marker, sm *SphericalMercator, scale uint8) {
+	realOffset := getRealOffset(
+		models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
+		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+		staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
+	)
+
+	if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
+		abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
+		return
+	}
+
+	markerPath := getMarkerPath(marker)
+	if marker.FallbackURL != "" {
+		if _, err := os.Stat(markerPath); os.IsNotExist(err) {
+			markerPath = getFallbackMarkerPath(marker)
+		}
+	}
+
+	targetWidth := int(marker.Width) * int(scale)
+	targetHeight := int(marker.Height) * int(scale)
+
+	var markerImg image.Image
+	if services.GlobalCacheIndex != nil && targetWidth > 0 && targetHeight > 0 {
+		if cached, ok := services.GlobalCacheIndex.GetMarkerImage(markerPath, targetWidth, targetHeight); ok {
+			markerImg = cached
+		}
+	}
+	if markerImg == nil {
+		var err error
+		markerImg, err = loadImage(markerPath)
+		if err != nil {
+			return
+		}
+		if targetWidth > 0 && targetHeight > 0 {
+			markerImg = resizeImage(markerImg, targetWidth, targetHeight)
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
+			}
+		}
+	}
+
+	centerX := canvas.Bounds().Dx() / 2
+	centerY := canvas.Bounds().Dy() / 2
+	drawX := centerX + realOffset.x - markerImg.Bounds().Dx()/2
+	drawY := centerY + realOffset.y - markerImg.Bounds().Dy()/2
+
+	mb := markerImg.Bounds()
+	dstRect := image.Rect(drawX, drawY, drawX+mb.Dx(), drawY+mb.Dy())
+	draw.Draw(canvas, dstRect, markerImg, mb.Min, draw.Over)
 }
 
 // GenerateStaticMapNative adds markers, polygons, and circles to a base map using native Go
