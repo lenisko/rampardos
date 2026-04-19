@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,13 +54,61 @@ func serveFile(w http.ResponseWriter, r *http.Request, path string) {
 	http.ServeFile(w, r, path)
 }
 
-// handlePregenerateResponse handles pregenerate query param and saves regeneratable data if needed.
-// Returns true if pregenerate was handled (caller should return), false to continue with normal response.
-func handlePregenerateResponse(w http.ResponseWriter, r *http.Request, path string, data any) bool {
+// handlePregenerateResponseFile handles the pregenerate query param for
+// file-based responses (used by MultiStaticMapHandler until Task 8).
+// The file at path must already exist on disk before this is called.
+// Returns true if pregenerate was handled (caller should return).
+func handlePregenerateResponseFile(w http.ResponseWriter, r *http.Request, path string, data any) bool {
 	pregenerate := r.URL.Query().Get("pregenerate") == "true"
 	if !pregenerate {
 		return false
 	}
+
+	regeneratable := r.URL.Query().Get("regeneratable") == "true"
+	if regeneratable {
+		regeneratablePath := fmt.Sprintf("Cache/Regeneratable/%s.json", filepath.Base(path))
+		if _, err := os.Stat(regeneratablePath); os.IsNotExist(err) {
+			if jsonData, err := json.Marshal(data); err == nil {
+				fileutil.AtomicWriteFile(regeneratablePath, jsonData, 0644)
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(filepath.Base(path)))
+	return true
+}
+
+// handlePregenerateResponseBytes is the single disk-write site in
+// the bytes-first pipeline. When pregenerate=true it writes the
+// encoded image to `path` and enqueues the corresponding
+// deletion/ownership in the expiry queue. Returns true if
+// pregenerate was handled (caller should return).
+//
+// The enqueue lives here (not at the handler level) because
+// writes-to-disk and expiry-registration must be one-to-one —
+// enqueueing a path the caller never wrote was a footgun in the
+// pre-bytes-first pipeline and no longer exists in this one.
+func handlePregenerateResponseBytes(
+	w http.ResponseWriter,
+	r *http.Request,
+	path string,
+	data any,
+	encoded []byte,
+	ttl time.Duration,
+	basePath string,
+) bool {
+	pregenerate := r.URL.Query().Get("pregenerate") == "true"
+	if !pregenerate {
+		return false
+	}
+
+	if err := fileutil.AtomicWriteFile(path, encoded, 0o644); err != nil {
+		slog.Error("pregenerate write failed", "path", path, "error", err)
+		http.Error(w, "pregenerate failed", http.StatusInternalServerError)
+		return true
+	}
+	enqueueWithBase(services.GlobalExpiryQueue, ttl, path, basePath)
 
 	regeneratable := r.URL.Query().Get("regeneratable") == "true"
 	if regeneratable {

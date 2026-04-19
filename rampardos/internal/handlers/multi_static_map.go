@@ -195,7 +195,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				if err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, componentOpts); err != nil {
+				if _, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, componentOpts); err != nil {
 					errOnce.Do(func() {
 						genErr = err
 					})
@@ -279,7 +279,7 @@ func (h *MultiStaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter,
 }
 
 func (h *MultiStaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, multiStaticMap models.MultiStaticMap, path string) {
-	if handlePregenerateResponse(w, r, path, multiStaticMap) {
+	if handlePregenerateResponseFile(w, r, path, multiStaticMap) {
 		return
 	}
 	serveFile(w, r, path)

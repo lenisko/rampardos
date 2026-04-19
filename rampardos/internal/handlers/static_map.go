@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/services/renderer"
@@ -151,19 +150,30 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 
 // GenerateOpts controls caching behaviour for component map generation.
 type GenerateOpts struct {
-	NoCache    bool          // if true, delete files immediately after the caller is done
+	NoCache    bool          // if true, skip LRU cache lookup
 	TTL        time.Duration // if > 0, queue files for deletion after this duration
 }
 
-// GenerateStaticMap generates a static map (used by MultiStaticMapHandler).
-// Concurrent requests for the same map are deduplicated via singleflight.
-func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) error {
+// GenerateStaticMap generates a static map and returns the decoded
+// image. Used by MultiStaticMapHandler to skip the PNG round-trip
+// that would otherwise happen between component generation and
+// grid composition. Concurrent requests for the same map are
+// deduplicated via singleflight; the sfg return value is the
+// image pointer so followers share the leader's result without
+// re-encoding.
+//
+// Expiry-queue enqueue has been moved out of this function. In the
+// bytes-first pipeline nothing is written to disk on this path —
+// persistence and its matching expiry enqueue now live exclusively
+// in handlePregenerateResponseBytes, the sole disk-write site.
+func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) (image.Image, error) {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
+	_ = basePath // retained for symmetry; ensureBase will key on it
 
-	if !opts.NoCache {
-		if _, err := os.Stat(path); err == nil {
-			return nil
+	if !opts.NoCache && services.GlobalCompositeImageCache != nil {
+		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+			return cached, nil
 		}
 	}
 
@@ -172,29 +182,25 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	// cancelling its ctx would abort generation for every follower that
 	// is still live. Values (deadlines, trace IDs) still flow through.
 	genCtx := context.WithoutCancel(ctx)
-	_, err, _ := h.sfg.Do(path, func() (any, error) {
-		if !opts.NoCache {
-			if _, err := os.Stat(path); err == nil {
-				return nil, nil
+	v, err, _ := h.sfg.Do(path, func() (any, error) {
+		if !opts.NoCache && services.GlobalCompositeImageCache != nil {
+			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+				return cached, nil
 			}
 		}
-		return nil, h.generateStaticMap(genCtx, path, basePath, staticMap)
+		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap)
+		if err != nil {
+			return nil, err
+		}
+		if services.GlobalCompositeImageCache != nil {
+			services.GlobalCompositeImageCache.Add(path, img)
+		}
+		return img, nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// Every generation enqueues its intent so the extend-only queue
-	// resolves concurrent nocache vs TTL vs cached races correctly.
-	if opts.NoCache {
-		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
-	} else if opts.TTL > 0 {
-		enqueueWithBase(services.GlobalExpiryQueue, opts.TTL, path, basePath)
-	} else {
-		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, basePath)
-	}
-
-	return nil
+	return v.(image.Image), nil
 }
 
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
@@ -243,36 +249,26 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	// Check if cached — os.Stat is authoritative. The prior cache
-	// index could outlive its on-disk file and serve a stale "true"
-	// that led to a 404 on the subsequent ServeFile.
-	cached := false
-	if !skipCache {
-		if _, err := os.Stat(path); err == nil {
-			cached = true
-		}
-	}
-
-	if cached {
-		duration := time.Since(startTime).Seconds()
-		slog.Debug("Served static map (cached)", "file", filepath.Base(path))
-		h.statsController.StaticMapServed(false, path, staticMap.Style)
-		services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, true, duration)
-		h.generateResponse(w, r, staticMap, path)
-		return
-	}
-
 	// Deduplicate concurrent requests for the same static map via
 	// singleflight. Two poracle webhooks for the same spawn arriving
 	// simultaneously will only generate once. Detach the caller's
 	// cancellation so a leader disconnect does not abort the shared
 	// render for concurrent followers.
 	genCtx := context.WithoutCancel(r.Context())
-	_, genErr, _ := h.sfg.Do(path, func() (any, error) {
-		if _, err := os.Stat(path); err == nil {
-			return nil, nil
+	v, genErr, _ := h.sfg.Do(path, func() (any, error) {
+		if !skipCache && services.GlobalCompositeImageCache != nil {
+			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+				return cached, nil
+			}
 		}
-		return nil, h.generateStaticMap(genCtx, path, basePath, staticMap)
+		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap)
+		if err != nil {
+			return nil, err
+		}
+		if services.GlobalCompositeImageCache != nil {
+			services.GlobalCompositeImageCache.Add(path, img)
+		}
+		return img, nil
 	})
 
 	if genErr != nil {
@@ -281,30 +277,31 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		http.Error(w, genErr.Error(), http.StatusInternalServerError)
 		return
 	}
+	img := v.(image.Image)
+	encoded, err := utils.EncodeImage(img, filepath.Ext(path))
+	if err != nil {
+		slog.Error("Failed to encode static map", "error", err)
+		services.GlobalMetrics.RecordError("staticmap", "encode_failed")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	duration := time.Since(startTime).Seconds()
 	h.statsController.StaticMapServed(true, path, staticMap.Style)
 	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
 
+	// Resolve effective TTL once. Only used if pregenerate writes
+	// the file; otherwise it governs nothing.
+	ttl := effectiveTTL(skipCache, ttlSeconds)
+
 	if skipCache {
 		slog.Debug("Served static map (nocache)", "file", filepath.Base(path), "duration", duration)
-		serveFile(w, r, path)
-		// nocacheBaseTTLFloor protects in-flight pregenerate+ttl subscribers.
-		enqueueWithBase(services.GlobalExpiryQueue, nocacheBaseTTLFloor, path, basePath)
+		serveStaticMapBytes(w, r, path, encoded)
 		return
 	}
 
 	slog.Debug("Served static map (generated)", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds)
-	h.generateResponse(w, r, staticMap, path)
-
-	if ttlSeconds > 0 {
-		enqueueWithBase(services.GlobalExpiryQueue, time.Duration(ttlSeconds)*time.Second, path, basePath)
-	} else {
-		// No explicit TTL: mark as owned by CacheCleaner so a
-		// concurrent nocache request's short floor can't shorten
-		// this file's lifetime.
-		enqueueWithBase(services.GlobalExpiryQueue, services.OwnedThreshold, path, basePath)
-	}
+	h.generateResponse(w, r, staticMap, path, encoded, ttl, basePath)
 }
 
 func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *http.Request, id string) {
@@ -382,35 +379,22 @@ func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.Stat
 	return v.(image.Image), nil
 }
 
-func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap) error {
-	ensureDir(filepath.Dir(path))
-
-	if _, err := h.ensureBase(ctx, staticMap, basePath); err != nil {
-		return err
+func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap) (image.Image, error) {
+	baseImg, err := h.ensureBase(ctx, staticMap, basePath)
+	if err != nil {
+		return nil, err
 	}
 
 	hasDrawables := len(staticMap.Markers) > 0 || len(staticMap.Polygons) > 0 || len(staticMap.Circles) > 0
 
-	// If no drawables, just use base
 	if !hasDrawables {
-		// Copy or link base to path
-		if path != basePath {
-			data, err := os.ReadFile(basePath)
-			if err != nil {
-				return err
-			}
-			return fileutil.AtomicWriteFile(path, data, 0644)
-		}
-		return nil
+		return baseImg, nil
 	}
 
-	// Download markers if needed
 	if err := h.downloadMarkers(ctx, staticMap); err != nil {
-		return err
+		return nil, err
 	}
-
-	// Generate with drawables
-	return utils.GenerateStaticMap(staticMap, basePath, path, h.sphericalMercator)
+	return utils.GenerateStaticMapFromImage(staticMap, baseImg, h.sphericalMercator)
 }
 
 func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) (image.Image, error) {
@@ -689,11 +673,36 @@ func extractDomain(url string) string {
 	return "?"
 }
 
-func (h *StaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap, path string) {
-	if handlePregenerateResponse(w, r, path, staticMap) {
+func (h *StaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap, path string, encoded []byte, ttl time.Duration, basePath string) {
+	if handlePregenerateResponseBytes(w, r, path, staticMap, encoded, ttl, basePath) {
 		return
 	}
-	serveFile(w, r, path)
+	serveStaticMapBytes(w, r, path, encoded)
+}
+
+// serveStaticMapBytes sets cache-control header and serves the encoded
+// image bytes via http.ServeContent, enabling range requests and
+// conditional GET (If-None-Match / If-Modified-Since).
+func serveStaticMapBytes(w http.ResponseWriter, r *http.Request, path string, encoded []byte) {
+	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
+	http.ServeContent(w, r, filepath.Base(path), time.Now(), bytes.NewReader(encoded))
+}
+
+// effectiveTTL resolves query-param state into the duration that
+// governs disk-file lifetime when pregenerate=true writes a file.
+// Only used when there will actually be a file on disk.
+func effectiveTTL(skipCache bool, ttlSeconds int) time.Duration {
+	if skipCache {
+		// The nocache+pregenerate combo is rewritten earlier to
+		// skipCache=false + ttlSeconds=30; if skipCache is still
+		// true here, there is no pregenerate and no file. The
+		// returned value is unused.
+		return nocacheBaseTTLFloor
+	}
+	if ttlSeconds > 0 {
+		return time.Duration(ttlSeconds) * time.Second
+	}
+	return services.OwnedThreshold
 }
 
 func (h *StaticMapHandler) renderTemplate(ctx context.Context, template string, params map[string][]string) (*models.StaticMap, error) {
