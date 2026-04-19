@@ -58,6 +58,12 @@ type MetricsManager struct {
 	// Cache size metrics
 	cacheSizeBytes *prometheus.GaugeVec
 
+	// In-memory image cache metrics (marker LRU, tile LRU). Distinct
+	// from the on-disk {cache_hits,misses}_total{type=...} counters:
+	// these measure whether a decoded image was reused from memory.
+	imageCacheHits   *prometheus.CounterVec
+	imageCacheMisses *prometheus.CounterVec
+
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
 
@@ -184,6 +190,16 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_cache_size_bytes",
 			Help: "Size of cache directories in bytes",
 		}, []string{"folder"}),
+
+		imageCacheHits: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_image_cache_hits_total",
+			Help: "Hits on the in-memory decoded-image LRUs. cache=tile covers the base-map stitch path; cache=marker covers resized marker overlays.",
+		}, []string{"cache"}),
+
+		imageCacheMisses: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_image_cache_misses_total",
+			Help: "Misses on the in-memory decoded-image LRUs. A miss forces a file read + image.Decode.",
+		}, []string{"cache"}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
@@ -347,6 +363,17 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 	} else {
 		m.cacheMissTotal.WithLabelValues("staticmap").Inc()
 	}
+}
+
+// RecordImageCacheHit records a hit on an in-memory image LRU.
+// name is a low-cardinality label like "tile" or "marker".
+func (m *MetricsManager) RecordImageCacheHit(name string) {
+	m.imageCacheHits.WithLabelValues(name).Inc()
+}
+
+// RecordImageCacheMiss records a miss on an in-memory image LRU.
+func (m *MetricsManager) RecordImageCacheMiss(name string) {
+	m.imageCacheMisses.WithLabelValues(name).Inc()
 }
 
 // RecordMarkerRequest records a marker request

@@ -158,6 +158,10 @@ func main() {
 		services.GlobalCacheIndex.SetMarkerImageCacheSize(cfg.MarkerImageCacheSize)
 	}
 
+	// Initialize the decoded-tile LRU. Skip the PNG decode on every
+	// base-map stitch — pprof showed image.Decode at 54% of CPU.
+	services.InitGlobalTileImageCache(cfg.TileImageCacheSize)
+
 	// Initialize image settings
 	services.InitImageSettings(cfg)
 

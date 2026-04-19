@@ -45,9 +45,10 @@ type Config struct {
 	// Image processing settings
 	DefaultImageFormat   string // "png", "jpeg", or "webp" (default: png)
 	OverrideClientFormat bool   // If true, ignore client format and use DefaultImageFormat
-	PNGCompressionLevel  string // "fast" or "best" (default: best)
+	PNGCompressionLevel  string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
 	ImageQuality         int    // JPEG/WebP quality 1-100 (default: 90)
 	MarkerImageCacheSize int    // Max resized marker images to cache (default: 500)
+	TileImageCacheSize   int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
 
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
@@ -102,9 +103,10 @@ func Load() *Config {
 
 		DefaultImageFormat:   getEnv("DEFAULT_IMAGE_FORMAT", "png"),
 		OverrideClientFormat: getEnvBool("OVERRIDE_CLIENT_FORMAT", false),
-		PNGCompressionLevel:  getEnv("PNG_COMPRESSION_LEVEL", "best"),
+		PNGCompressionLevel:  getEnv("PNG_COMPRESSION_LEVEL", "fast"),
 		ImageQuality:         getEnvInt("IMAGE_QUALITY", 90),
 		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 500),
+		TileImageCacheSize:   getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
 
