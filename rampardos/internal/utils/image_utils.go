@@ -19,16 +19,6 @@ func GenerateBaseStaticMap(staticMap models.StaticMap, tilePaths []string, offse
 	return GenerateBaseStaticMapNative(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
 }
 
-// GenerateStaticMap adds markers, polygons, and circles to a base map
-func GenerateStaticMap(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
-	return GenerateStaticMapNative(staticMap, basePath, path, sm)
-}
-
-// GenerateMultiStaticMap combines multiple static maps into a grid
-func GenerateMultiStaticMap(multiStaticMap models.MultiStaticMap, path string) error {
-	return GenerateMultiStaticMapNative(multiStaticMap, path)
-}
-
 type offsetResult struct {
 	x, y int
 }

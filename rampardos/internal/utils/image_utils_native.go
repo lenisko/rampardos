@@ -11,7 +11,6 @@ import (
 	"image/png"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -343,23 +342,16 @@ func drawMarkerNRGBA(canvas *image.NRGBA, staticMap models.StaticMap, marker mod
 	draw.Draw(canvas, dstRect, markerImg, mb.Min, draw.Over)
 }
 
-// GenerateStaticMapNative adds markers, polygons, and circles to a base map using native Go
-func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
-	baseImg, err := loadImage(basePath)
-	if err != nil {
-		return fmt.Errorf("failed to load base image: %w", err)
-	}
-	img, err := GenerateStaticMapFromImage(staticMap, baseImg, sm)
-	if err != nil {
-		return err
-	}
-	return saveImage(path, img)
-}
-
 // GenerateMultiStaticMapFromImages composes a grid from already-
 // decoded component images. Caller is responsible for the []Image
 // ordering matching multiStaticMap.Grid[…].Maps[…] iteration order.
 // Returns the composed image; caller owns encoding + persistence.
+//
+// Matches ImageMagick's -append/+append behaviour used by the
+// original Swift implementation: each image in a grid group is
+// sequentially appended to the cumulative result, and images are
+// scaled to match the append dimension (height for +append/right,
+// width for -append/bottom) so the seams align cleanly.
 func GenerateMultiStaticMapFromImages(multiStaticMap models.MultiStaticMap, componentImages []image.Image) (image.Image, error) {
 	var groupImages []image.Image
 	var groupDirections []models.CombineDirection
@@ -396,32 +388,6 @@ func GenerateMultiStaticMapFromImages(multiStaticMap models.MultiStaticMap, comp
 		result = appendImages(result, groupImages[i], dir)
 	}
 	return result, nil
-}
-
-// GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go.
-//
-// This matches ImageMagick's -append/+append behaviour used by the
-// original Swift implementation: each image in a grid group is
-// sequentially appended to the cumulative result, and images are
-// scaled to match the append dimension (height for +append/right,
-// width for -append/bottom) so the seams align cleanly.
-func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path string) error {
-	var componentImages []image.Image
-	for _, grid := range multiStaticMap.Grid {
-		for _, m := range grid.Maps {
-			mapPath := m.Map.Path()
-			img, err := loadImage(mapPath)
-			if err != nil {
-				return fmt.Errorf("failed to load map %s: %w", mapPath, err)
-			}
-			componentImages = append(componentImages, img)
-		}
-	}
-	result, err := GenerateMultiStaticMapFromImages(multiStaticMap, componentImages)
-	if err != nil {
-		return err
-	}
-	return saveImage(path, result)
 }
 
 // appendImages combines two images in the given direction, scaling the
@@ -552,52 +518,6 @@ func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, 
 		}
 	}
 	return img, err
-}
-
-// saveImage saves an image to a file atomically. It writes to a
-// temporary file then renames, so concurrent readers never see a
-// partially-encoded image.
-func saveImage(path string, img image.Image) error {
-	os.MkdirAll(filepath.Dir(path), 0o755)
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.*")
-	if err != nil {
-		return err
-	}
-
-	ext := strings.ToLower(filepath.Ext(path))
-	var encodeErr error
-	switch ext {
-	case ".jpg", ".jpeg":
-		quality := 90
-		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
-			quality = services.GlobalImageSettings.ImageQuality
-		}
-		encodeErr = jpeg.Encode(f, img, &jpeg.Options{Quality: quality})
-	case ".webp":
-		quality := 90
-		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
-			quality = services.GlobalImageSettings.ImageQuality
-		}
-		encodeErr = webp.Encode(f, img, webp.Options{Quality: quality})
-	default:
-		encoder := &png.Encoder{CompressionLevel: png.BestCompression, BufferPool: &pngBufferPool}
-		if services.GlobalImageSettings != nil {
-			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
-		}
-		encodeErr = encoder.Encode(f, img)
-	}
-
-	tmpName := f.Name()
-	f.Close()
-	if encodeErr != nil {
-		os.Remove(tmpName)
-		return encodeErr
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	return nil
 }
 
 // resizeImage resizes an image to the target dimensions
