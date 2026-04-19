@@ -47,7 +47,7 @@ type Config struct {
 	OverrideClientFormat bool   // If true, ignore client format and use DefaultImageFormat
 	PNGCompressionLevel  string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
 	ImageQuality         int    // JPEG/WebP quality 1-100 (default: 90)
-	MarkerImageCacheSize int    // Max resized marker images to cache (default: 2000)
+	MarkerImageCacheSize int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
 	TileImageCacheSize   int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
 	CompositeImageCacheSize int // Max base+staticmap images cached in memory (default: 200, 0 disables). Each entry ~640 KB for 400×400 NRGBA; 200 ≈ 128 MB.
 

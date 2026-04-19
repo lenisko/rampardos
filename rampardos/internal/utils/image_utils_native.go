@@ -239,21 +239,11 @@ func drawCircle(dc *gg.Context, staticMap models.StaticMap, circle models.Circle
 // it neither reads from nor writes to disk — the caller owns
 // persistence.
 //
-// When the only drawables are markers (poracle's common shape),
-// skip gg entirely: gg.NewContextForImage copies the NRGBA base
-// into an internal RGBA canvas (slow-path NRGBA→RGBA) and its
-// output is RGBA too, which forces an un-premultiply pass on PNG
-// encode. The marker-only fast path stays NRGBA end-to-end — base
-// copy is same-type memcpy, marker draws are same-type fast path,
-// encode is direct NRGBA output.
-//
-// When polygons/circles are present we use gg for its anti-aliased
-// rasterisers but stamp markers afterwards on the NRGBA canvas.
-// gg.DrawImage(NRGBA-marker onto RGBA-canvas) hits xdraw's slow
-// transform_RGBA_NRGBA_Over path (~50ms under dense-marker load);
-// drawMarkerNRGBA on an NRGBA canvas hits draw.Draw's same-type
-// fast path instead, and the RGBA→NRGBA conversion we'd do anyway
-// now earns its keep by unlocking this faster marker stamp.
+// Marker-only requests skip gg entirely and stay NRGBA end-to-end.
+// When polygons or circles are present we use gg for its anti-aliased
+// rasterisers, convert its RGBA canvas to NRGBA, then stamp markers
+// on the NRGBA canvas so marker draws hit draw.Draw's same-type path
+// instead of xdraw's RGBA→NRGBA transform.
 func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator) (image.Image, error) {
 	scale := staticMap.Scale
 	if scale == 0 {
@@ -285,18 +275,11 @@ func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image,
 	return canvas, nil
 }
 
-// drawMarkersNative renders markers directly onto a fresh NRGBA copy
-// of baseImg. Skips gg's RGBA round-trip. Caller must not pass a
-// baseImg from a shared cache without expecting the output to be a
-// new canvas — we copy baseImg rather than mutate it so the LRU
-// entry stays clean.
+// drawMarkersNative renders markers onto a fresh NRGBA copy of
+// baseImg. Skips gg's RGBA round-trip.
 func drawMarkersNative(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator, scale uint8) image.Image {
 	b := baseImg.Bounds()
 	canvas := image.NewNRGBA(b)
-	// Same-type NRGBA→NRGBA Src copy hits the fast memcpy path when
-	// baseImg is NRGBA (the common case after the tile-normalisation
-	// change); otherwise falls back to the generic path for this
-	// one-off copy but subsequent marker draws stay NRGBA-native.
 	draw.Draw(canvas, b, baseImg, b.Min, draw.Src)
 
 	for _, marker := range staticMap.Markers {
