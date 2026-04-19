@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
@@ -123,37 +124,41 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	return saveImage(path, cropped)
 }
 
-// GenerateStaticMapNative adds markers, polygons, and circles to a base map using native Go
-func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
-	// Load base image
-	baseImg, err := loadImage(basePath)
-	if err != nil {
-		return fmt.Errorf("failed to load base image: %w", err)
-	}
+// drawPolygon draws a single polygon (fill + optional stroke) onto dc.
+func drawPolygon(dc *gg.Context, staticMap models.StaticMap, polygon models.Polygon, sm *SphericalMercator, scale uint8) error {
+	// Set fill color
+	fillColor := parseColor(polygon.FillColor)
+	dc.SetColor(fillColor)
 
-	// Create drawing context
-	dc := gg.NewContextForImage(baseImg)
-
-	scale := staticMap.Scale
-	if scale == 0 {
-		scale = 1
-	}
-
-	// Process polygons
-	for _, polygon := range staticMap.Polygons {
-		if len(polygon.Path) == 0 {
-			continue
+	// Draw polygon path
+	for i, coord := range polygon.Path {
+		if len(coord) != 2 {
+			return fmt.Errorf("expecting two values to form a coordinate but got %d", len(coord))
 		}
+		point := getRealOffset(
+			models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
+			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+			staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+		)
+		x := float64(point.x + int(staticMap.Width/2*uint16(scale)))
+		y := float64(point.y + int(staticMap.Height/2*uint16(scale)))
 
-		// Set fill color
-		fillColor := parseColor(polygon.FillColor)
-		dc.SetColor(fillColor)
+		if i == 0 {
+			dc.MoveTo(x, y)
+		} else {
+			dc.LineTo(x, y)
+		}
+	}
+	dc.ClosePath()
+	dc.Fill()
 
-		// Draw polygon path
+	// Draw stroke
+	if polygon.StrokeWidth > 0 {
+		strokeColor := parseColor(polygon.StrokeColor)
+		dc.SetColor(strokeColor)
+		dc.SetLineWidth(float64(polygon.StrokeWidth))
+
 		for i, coord := range polygon.Path {
-			if len(coord) != 2 {
-				return fmt.Errorf("expecting two values to form a coordinate but got %d", len(coord))
-			}
 			point := getRealOffset(
 				models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
 				models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
@@ -169,126 +174,187 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 			}
 		}
 		dc.ClosePath()
-		dc.Fill()
-
-		// Draw stroke
-		if polygon.StrokeWidth > 0 {
-			strokeColor := parseColor(polygon.StrokeColor)
-			dc.SetColor(strokeColor)
-			dc.SetLineWidth(float64(polygon.StrokeWidth))
-
-			for i, coord := range polygon.Path {
-				point := getRealOffset(
-					models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
-					models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-					staticMap.Zoom, staticMap.Scale, 0, 0, sm,
-				)
-				x := float64(point.x + int(staticMap.Width/2*uint16(scale)))
-				y := float64(point.y + int(staticMap.Height/2*uint16(scale)))
-
-				if i == 0 {
-					dc.MoveTo(x, y)
-				} else {
-					dc.LineTo(x, y)
-				}
-			}
-			dc.ClosePath()
-			dc.Stroke()
-		}
+		dc.Stroke()
 	}
+	return nil
+}
 
-	// Process circles
-	for _, circle := range staticMap.Circles {
-		coord := models.Coordinate{Latitude: circle.Latitude, Longitude: circle.Longitude}
-		point := getRealOffset(
-			coord,
-			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-			staticMap.Zoom, staticMap.Scale, 0, 0, sm,
-		)
-		radiusCoord := coord.CoordinateAt(circle.Radius, 0)
-		radius := float64(getRealOffset(coord, radiusCoord, staticMap.Zoom, staticMap.Scale, 0, 0, sm).y)
+// drawCircle draws a single circle (fill + optional stroke) onto dc.
+func drawCircle(dc *gg.Context, staticMap models.StaticMap, circle models.Circle, sm *SphericalMercator, scale uint8) {
+	coord := models.Coordinate{Latitude: circle.Latitude, Longitude: circle.Longitude}
+	point := getRealOffset(
+		coord,
+		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+		staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+	)
+	radiusCoord := coord.CoordinateAt(circle.Radius, 0)
+	radius := float64(getRealOffset(coord, radiusCoord, staticMap.Zoom, staticMap.Scale, 0, 0, sm).y)
 
-		x := float64(point.x + int(staticMap.Width)*int(scale)/2)
-		y := float64(point.y + int(staticMap.Height)*int(scale)/2)
+	x := float64(point.x + int(staticMap.Width)*int(scale)/2)
+	y := float64(point.y + int(staticMap.Height)*int(scale)/2)
 
-		// Fill circle
-		fillColor := parseColor(circle.FillColor)
-		dc.SetColor(fillColor)
+	// Fill circle
+	fillColor := parseColor(circle.FillColor)
+	dc.SetColor(fillColor)
+	dc.DrawCircle(x, y, radius)
+	dc.Fill()
+
+	// Stroke circle
+	if circle.StrokeWidth > 0 {
+		strokeColor := parseColor(circle.StrokeColor)
+		dc.SetColor(strokeColor)
+		dc.SetLineWidth(float64(circle.StrokeWidth))
 		dc.DrawCircle(x, y, radius)
-		dc.Fill()
+		dc.Stroke()
+	}
+}
 
-		// Stroke circle
-		if circle.StrokeWidth > 0 {
-			strokeColor := parseColor(circle.StrokeColor)
-			dc.SetColor(strokeColor)
-			dc.SetLineWidth(float64(circle.StrokeWidth))
-			dc.DrawCircle(x, y, radius)
-			dc.Stroke()
+// drawMarker draws a single marker onto dc. Returns false (and does not draw)
+// if the marker is outside the visible area or cannot be loaded.
+func drawMarker(dc *gg.Context, staticMap models.StaticMap, marker models.Marker, sm *SphericalMercator, scale uint8) bool {
+	realOffset := getRealOffset(
+		models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
+		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+		staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
+	)
+
+	// Skip markers outside the visible area
+	if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
+		abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
+		return false
+	}
+
+	markerPath := getMarkerPath(marker)
+	if marker.FallbackURL != "" {
+		if _, err := os.Stat(markerPath); os.IsNotExist(err) {
+			markerPath = getFallbackMarkerPath(marker)
 		}
 	}
 
-	// Process markers
-	for _, marker := range staticMap.Markers {
-		realOffset := getRealOffset(
-			models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
-			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-			staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
-		)
+	// Always resize marker to target dimensions (matching ImageMagick behavior)
+	targetWidth := int(marker.Width) * int(scale)
+	targetHeight := int(marker.Height) * int(scale)
 
-		// Skip markers outside the visible area
-		if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
-			abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
+	// Try to get from in-memory cache first
+	var markerImg image.Image
+	if services.GlobalCacheIndex != nil && targetWidth > 0 && targetHeight > 0 {
+		if cached, ok := services.GlobalCacheIndex.GetMarkerImage(markerPath, targetWidth, targetHeight); ok {
+			markerImg = cached
+		}
+	}
+
+	// Load and resize if not cached
+	if markerImg == nil {
+		var err error
+		markerImg, err = loadImage(markerPath)
+		if err != nil {
+			return false // Skip markers that can't be loaded
+		}
+
+		if targetWidth > 0 && targetHeight > 0 {
+			markerImg = resizeImage(markerImg, targetWidth, targetHeight)
+			// Cache the resized image
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
+			}
+		}
+	}
+
+	// Calculate position (ImageMagick uses -gravity Center, so offset is from center)
+	// The marker should be centered at (centerX + offsetX, centerY + offsetY)
+	centerX := dc.Width() / 2
+	centerY := dc.Height() / 2
+
+	// Draw marker at position (top-left corner calculation)
+	drawX := centerX + realOffset.x - markerImg.Bounds().Dx()/2
+	drawY := centerY + realOffset.y - markerImg.Bounds().Dy()/2
+	dc.DrawImage(markerImg, drawX, drawY)
+	return true
+}
+
+// GenerateStaticMapFromImage renders overlays on top of baseImg and
+// returns the resulting image.Image. Unlike GenerateStaticMapNative
+// it neither reads from nor writes to disk — the caller owns
+// persistence.
+func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator) (image.Image, error) {
+	dc := gg.NewContextForImage(baseImg)
+
+	scale := staticMap.Scale
+	if scale == 0 {
+		scale = 1
+	}
+
+	for _, polygon := range staticMap.Polygons {
+		if len(polygon.Path) == 0 {
 			continue
 		}
-
-		markerPath := getMarkerPath(marker)
-		if marker.FallbackURL != "" {
-			if _, err := os.Stat(markerPath); os.IsNotExist(err) {
-				markerPath = getFallbackMarkerPath(marker)
-			}
+		if err := drawPolygon(dc, staticMap, polygon, sm, scale); err != nil {
+			return nil, err
 		}
-
-		// Always resize marker to target dimensions (matching ImageMagick behavior)
-		targetWidth := int(marker.Width) * int(scale)
-		targetHeight := int(marker.Height) * int(scale)
-
-		// Try to get from in-memory cache first
-		var markerImg image.Image
-		if services.GlobalCacheIndex != nil && targetWidth > 0 && targetHeight > 0 {
-			if cached, ok := services.GlobalCacheIndex.GetMarkerImage(markerPath, targetWidth, targetHeight); ok {
-				markerImg = cached
-			}
-		}
-
-		// Load and resize if not cached
-		if markerImg == nil {
-			var err error
-			markerImg, err = loadImage(markerPath)
-			if err != nil {
-				continue // Skip markers that can't be loaded
-			}
-
-			if targetWidth > 0 && targetHeight > 0 {
-				markerImg = resizeImage(markerImg, targetWidth, targetHeight)
-				// Cache the resized image
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
-				}
-			}
-		}
-
-		// Calculate position (ImageMagick uses -gravity Center, so offset is from center)
-		// The marker should be centered at (centerX + offsetX, centerY + offsetY)
-		centerX := dc.Width() / 2
-		centerY := dc.Height() / 2
-
-		// Draw marker at position (top-left corner calculation)
-		drawX := centerX + realOffset.x - markerImg.Bounds().Dx()/2
-		drawY := centerY + realOffset.y - markerImg.Bounds().Dy()/2
-		dc.DrawImage(markerImg, drawX, drawY)
+	}
+	for _, circle := range staticMap.Circles {
+		drawCircle(dc, staticMap, circle, sm, scale)
+	}
+	for _, marker := range staticMap.Markers {
+		drawMarker(dc, staticMap, marker, sm, scale)
 	}
 
-	return saveImage(path, dc.Image())
+	return dc.Image(), nil
+}
+
+// GenerateStaticMapNative adds markers, polygons, and circles to a base map using native Go
+func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
+	baseImg, err := loadImage(basePath)
+	if err != nil {
+		return fmt.Errorf("failed to load base image: %w", err)
+	}
+	img, err := GenerateStaticMapFromImage(staticMap, baseImg, sm)
+	if err != nil {
+		return err
+	}
+	return saveImage(path, img)
+}
+
+// GenerateMultiStaticMapFromImages composes a grid from already-
+// decoded component images. Caller is responsible for the []Image
+// ordering matching multiStaticMap.Grid[…].Maps[…] iteration order.
+// Returns the composed image; caller owns encoding + persistence.
+func GenerateMultiStaticMapFromImages(multiStaticMap models.MultiStaticMap, componentImages []image.Image) (image.Image, error) {
+	var groupImages []image.Image
+	var groupDirections []models.CombineDirection
+
+	idx := 0
+	for _, grid := range multiStaticMap.Grid {
+		var composite image.Image
+		for _, m := range grid.Maps {
+			if idx >= len(componentImages) {
+				return nil, fmt.Errorf("component image %d missing (have %d)", idx, len(componentImages))
+			}
+			img := componentImages[idx]
+			idx++
+			if m.Direction == models.CombineDirectionFirst || composite == nil {
+				composite = img
+				continue
+			}
+			composite = appendImages(composite, img, m.Direction)
+		}
+		if composite != nil {
+			groupImages = append(groupImages, composite)
+			groupDirections = append(groupDirections, grid.Direction)
+		}
+	}
+	if len(groupImages) == 0 {
+		return nil, fmt.Errorf("no images to combine")
+	}
+	result := groupImages[0]
+	for i := 1; i < len(groupImages); i++ {
+		dir := groupDirections[i]
+		if dir == models.CombineDirectionFirst {
+			dir = models.CombineDirectionRight
+		}
+		result = appendImages(result, groupImages[i], dir)
+	}
+	return result, nil
 }
 
 // GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go.
@@ -299,49 +365,21 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 // scaled to match the append dimension (height for +append/right,
 // width for -append/bottom) so the seams align cleanly.
 func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path string) error {
-	// Build each grid group as a composite image, then combine groups.
-	var groupImages []image.Image
-	var groupDirections []models.CombineDirection
-
+	var componentImages []image.Image
 	for _, grid := range multiStaticMap.Grid {
-		var composite image.Image
-
 		for _, m := range grid.Maps {
 			mapPath := m.Map.Path()
 			img, err := loadImage(mapPath)
 			if err != nil {
 				return fmt.Errorf("failed to load map %s: %w", mapPath, err)
 			}
-
-			if m.Direction == models.CombineDirectionFirst || composite == nil {
-				// First image in the group — this is the anchor.
-				composite = img
-				continue
-			}
-
-			composite = appendImages(composite, img, m.Direction)
-		}
-
-		if composite != nil {
-			groupImages = append(groupImages, composite)
-			groupDirections = append(groupDirections, grid.Direction)
+			componentImages = append(componentImages, img)
 		}
 	}
-
-	if len(groupImages) == 0 {
-		return fmt.Errorf("no images to combine")
+	result, err := GenerateMultiStaticMapFromImages(multiStaticMap, componentImages)
+	if err != nil {
+		return err
 	}
-
-	// Combine all grid groups together.
-	result := groupImages[0]
-	for i := 1; i < len(groupImages); i++ {
-		dir := groupDirections[i]
-		if dir == models.CombineDirectionFirst {
-			dir = models.CombineDirectionRight
-		}
-		result = appendImages(result, groupImages[i], dir)
-	}
-
 	return saveImage(path, result)
 }
 
@@ -582,4 +620,40 @@ func parseColor(s string) color.Color {
 
 	// Use NRGBA for correct alpha handling
 	return color.NRGBA{r, g, b, a}
+}
+
+// EncodeImage serializes img to the appropriate byte representation
+// inferred from pathExt (".png", ".jpg"/".jpeg", ".webp"). Used when
+// the pipeline has an image in hand and needs bytes for an HTTP
+// response or a disk write.
+func EncodeImage(img image.Image, pathExt string) ([]byte, error) {
+	var buf bytes.Buffer
+	ext := strings.ToLower(pathExt)
+	switch ext {
+	case ".jpg", ".jpeg":
+		quality := 90
+		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
+			quality = services.GlobalImageSettings.ImageQuality
+		}
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+			return nil, err
+		}
+	case ".webp":
+		quality := 90
+		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
+			quality = services.GlobalImageSettings.ImageQuality
+		}
+		if err := webp.Encode(&buf, img, webp.Options{Quality: quality}); err != nil {
+			return nil, err
+		}
+	default:
+		encoder := &png.Encoder{CompressionLevel: png.BestSpeed}
+		if services.GlobalImageSettings != nil {
+			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
+		}
+		if err := encoder.Encode(&buf, img); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
 }
