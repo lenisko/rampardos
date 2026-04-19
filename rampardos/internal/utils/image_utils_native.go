@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fogleman/gg"
@@ -24,6 +25,27 @@ import (
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
+
+// pngBufferPool reuses png.EncoderBuffer across encodes so the
+// internal zlib writer and filter working buffers don't allocate
+// fresh per call. Encoder instances themselves are lightweight
+// (just CompressionLevel + a pointer); the pool is what matters.
+var pngBufferPool pngEncoderBufferPool
+
+type pngEncoderBufferPool struct {
+	pool sync.Pool
+}
+
+func (p *pngEncoderBufferPool) Get() *png.EncoderBuffer {
+	if b, ok := p.pool.Get().(*png.EncoderBuffer); ok {
+		return b
+	}
+	return nil
+}
+
+func (p *pngEncoderBufferPool) Put(buf *png.EncoderBuffer) {
+	p.pool.Put(buf)
+}
 
 // GenerateBaseStaticMapNative combines tiles into a base static map and
 // returns the cropped image. The caller owns persistence — in the
@@ -639,7 +661,7 @@ func saveImage(path string, img image.Image) error {
 		}
 		encodeErr = webp.Encode(f, img, webp.Options{Quality: quality})
 	default:
-		encoder := &png.Encoder{CompressionLevel: png.BestCompression}
+		encoder := &png.Encoder{CompressionLevel: png.BestCompression, BufferPool: &pngBufferPool}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
 		}
@@ -770,7 +792,7 @@ func EncodeImage(img image.Image, pathExt string) ([]byte, error) {
 			return nil, err
 		}
 	default:
-		encoder := &png.Encoder{CompressionLevel: png.BestSpeed}
+		encoder := &png.Encoder{CompressionLevel: png.BestSpeed, BufferPool: &pngBufferPool}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
 		}
