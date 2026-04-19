@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"image"
 	"math"
 	"strings"
 
@@ -11,9 +12,11 @@ import (
 // TileRedownloader is a callback to re-download a corrupted tile
 type TileRedownloader func(tilePath string) error
 
-// GenerateBaseStaticMap combines tiles into a base static map
-func GenerateBaseStaticMap(staticMap models.StaticMap, tilePaths []string, path string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) error {
-	return GenerateBaseStaticMapNative(staticMap, tilePaths, path, offsetX, offsetY, hasScale, redownload)
+// GenerateBaseStaticMap combines tiles into a base static map image.
+// Caller owns persistence; the returned image can be cached in the
+// composite LRU and served from memory.
+func GenerateBaseStaticMap(staticMap models.StaticMap, tilePaths []string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) (image.Image, error) {
+	return GenerateBaseStaticMapNative(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
 }
 
 // GenerateStaticMap adds markers, polygons, and circles to a base map

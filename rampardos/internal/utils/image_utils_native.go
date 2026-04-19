@@ -25,10 +25,13 @@ import (
 	_ "golang.org/x/image/webp"
 )
 
-// GenerateBaseStaticMapNative combines tiles into a base static map using native Go
-func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string, path string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) error {
+// GenerateBaseStaticMapNative combines tiles into a base static map and
+// returns the cropped image. The caller owns persistence — in the
+// bytes-first pipeline the stitched base lives only in the composite
+// image LRU, not on disk.
+func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) (image.Image, error) {
 	if len(tilePaths) == 0 {
-		return fmt.Errorf("no tiles to combine")
+		return nil, fmt.Errorf("no tiles to combine")
 	}
 
 	// Sort tile paths for consistent ordering
@@ -43,7 +46,7 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	for _, tilePath := range sortedPaths {
 		img, err := loadImageWithRetry(tilePath, redownload)
 		if err != nil {
-			return fmt.Errorf("failed to load tile %s: %w", tilePath, err)
+			return nil, fmt.Errorf("failed to load tile %s: %w", tilePath, err)
 		}
 		tiles = append(tiles, img)
 		if tileWidth == 0 {
@@ -121,7 +124,7 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	draw.Draw(cropped, cropped.Bounds(), combined,
 		image.Point{X: imgWidthOffset, Y: imgHeightOffset}, draw.Src)
 
-	return saveImage(path, cropped)
+	return cropped, nil
 }
 
 // drawPolygon draws a single polygon (fill + optional stroke) onto dc.
