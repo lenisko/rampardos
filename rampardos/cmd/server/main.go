@@ -233,9 +233,16 @@ func main() {
 	// these expose internal state and pprof.Profile ties up a goroutine
 	// for 30s per call. Sub-profiles (heap, goroutine, allocs, block,
 	// mutex, threadcreate) are routed through pprof.Index.
+	//
+	// The pprof routes detach the caller's request deadline — pprof.Profile
+	// and pprof.Trace honour `?seconds=N` up to arbitrary durations, but
+	// the global custommw.Timeout(cfg.RequestTimeout) above cancels
+	// r.Context() at REQUEST_TIMEOUT (default 10s) and would cut a
+	// 60-second profile short without any error surfaced to the client.
 	if cfg.PprofEnabled {
 		slog.Warn("pprof endpoints enabled", "path", "/debug/pprof")
 		r.Route("/debug/pprof", func(r chi.Router) {
+			r.Use(detachRequestTimeout)
 			r.Get("/", pprof.Index)
 			r.Get("/cmdline", pprof.Cmdline)
 			r.Get("/profile", pprof.Profile)
@@ -412,4 +419,16 @@ func absPath(rel string) string {
 		return rel // best-effort fallback
 	}
 	return abs
+}
+
+// detachRequestTimeout strips the upstream deadline and cancellation
+// set by custommw.Timeout so handlers that legitimately sample for
+// arbitrary durations (pprof.Profile, pprof.Trace) can honour their
+// own `?seconds=N` parameter instead of being cut short at
+// REQUEST_TIMEOUT. context.WithoutCancel preserves values (trace
+// IDs, auth), only detaching the cancel/deadline chain.
+func detachRequestTimeout(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithoutCancel(r.Context())))
+	})
 }
