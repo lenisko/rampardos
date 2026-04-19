@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/services/renderer"
@@ -89,19 +90,19 @@ func (h *TileHandler) Get(w http.ResponseWriter, r *http.Request) {
 func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y int, scale uint8, format models.ImageFormat) (*TileResult, error) {
 	path := fmt.Sprintf("Cache/Tile/%s-%d-%d-%d-%d.%s", style, z, x, y, scale, format)
 
-	// Check if cached
+	start := time.Now()
 	if _, err := os.Stat(path); err == nil {
-		start := time.Now()
 		h.statsController.TileServed(false, path, style)
-		services.GlobalMetrics.RecordTileGenerate(style, "cache", time.Since(start).Seconds())
+		services.GlobalMetrics.RecordTileGenerate(style, services.TileSourceCache, time.Since(start).Seconds())
 		return &TileResult{Path: path, Cached: true}, nil
 	}
 
 	// singleflight: only one goroutine generates a given tile at a time.
 	// Others wait and get the same result (or the same error). The
-	// leader records the generation duration via the "source"-specific
-	// branch below; followers piggyback on the leader's work and do
-	// not double-count (only the leader's callback runs).
+	// leader times its own work inside the callback; followers
+	// piggyback on the leader's result and do not double-count.
+	var sfSource string
+	var sfStart time.Time
 	_, err, _ := h.sfg.Do(path, func() (any, error) {
 		// Double-check cache inside singleflight (another request may
 		// have populated it between our outer check and acquiring the
@@ -110,9 +111,8 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 			return nil, nil
 		}
 
-		start := time.Now()
+		sfStart = time.Now()
 
-		// External styles: download from remote URL template.
 		if extStyle := h.stylesController.GetExternalStyle(style); extStyle != nil {
 			scaleString := ""
 			if scale != 1 {
@@ -126,12 +126,11 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 			tileURL = strings.ReplaceAll(tileURL, "{@scale}", scaleString)
 			tileURL = strings.ReplaceAll(tileURL, "{format}", string(format))
 
-			dlErr := services.DownloadFile(ctx, tileURL, path, "image", 0)
-			services.GlobalMetrics.RecordTileGenerate(style, "external", time.Since(start).Seconds())
-			return nil, dlErr
+			sfSource = services.TileSourceExternal
+			return nil, services.DownloadFile(ctx, tileURL, path, "image", 0)
 		}
 
-		// Local styles: render in-process via the Renderer.
+		sfSource = services.TileSourceLocal
 		encoded, err := h.renderer.Render(ctx, renderer.Request{
 			StyleID: style,
 			Z:       z, X: x, Y: y,
@@ -139,13 +138,13 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 			Format:  format,
 		})
 		if err != nil {
-			services.GlobalMetrics.RecordTileGenerate(style, "local", time.Since(start).Seconds())
 			return nil, err
 		}
-		writeErr := atomicWriteFile(path, encoded, 0o644)
-		services.GlobalMetrics.RecordTileGenerate(style, "local", time.Since(start).Seconds())
-		return nil, writeErr
+		return nil, fileutil.AtomicWriteFile(path, encoded, 0o644)
 	})
+	if sfSource != "" {
+		services.GlobalMetrics.RecordTileGenerate(style, sfSource, time.Since(sfStart).Seconds())
+	}
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate tile %s/%d/%d/%d: %w", style, z, x, y, err)

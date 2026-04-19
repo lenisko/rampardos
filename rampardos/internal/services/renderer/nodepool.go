@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gen2brain/webp"
+	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
 )
 
@@ -115,38 +116,6 @@ func NewNodePoolRenderer(cfg Config, sf SpawnFactory) (*NodePoolRenderer, error)
 	}, nil
 }
 
-// atomicWritePrepared writes the prepared style JSON via a tempfile +
-// rename so readers (workers spawned by the same or a concurrent
-// loadPool) only ever observe a complete file. ReloadStyles calls
-// loadPool outside any lock, so plain os.WriteFile's truncate window
-// would let a racing reader see a zero-length or partial file.
-func atomicWritePrepared(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Chmod(tmp, 0o644); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
 // loadPool reads the on-disk style.json, rewrites it via PrepareStyle,
 // writes the prepared version next to the original, and creates a
 // stylePool with the given spawn closure.
@@ -162,8 +131,12 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 		return nil, fmt.Errorf("prepare style: %w", err)
 	}
 
+	// Atomic write via tempfile + rename: ReloadStyles calls loadPool
+	// outside any lock, so plain os.WriteFile's truncate window would
+	// let a worker spawning in parallel read a zero-length or partial
+	// style.prepared.json.
 	preparedPath := filepath.Join(npr.cfg.StylesDir, id, "style.prepared.json")
-	if err := atomicWritePrepared(preparedPath, prepared); err != nil {
+	if err := fileutil.AtomicWriteFile(preparedPath, prepared, 0o644); err != nil {
 		return nil, fmt.Errorf("write prepared style: %w", err)
 	}
 

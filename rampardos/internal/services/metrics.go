@@ -78,6 +78,18 @@ type MetricsManager struct {
 	tileserverRestarts prometheus.Counter
 }
 
+// Low-cardinality label values used across metric recordings.
+// Keeping them as constants prevents typos silently splitting a
+// counter into multiple dimensions.
+const (
+	TileSourceCache    = "cache"
+	TileSourceLocal    = "local"
+	TileSourceExternal = "external"
+
+	ImageCacheTile   = "tile"
+	ImageCacheMarker = "marker"
+)
+
 var (
 	GlobalMetrics *MetricsManager
 	metricsOnce   sync.Once
@@ -378,20 +390,14 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 	}
 }
 
-// RecordTileGenerate records how long a single GenerateTile call
-// took, labelled by the style and the source that produced the
-// tile (cache | local | external).
 func (m *MetricsManager) RecordTileGenerate(style, source string, duration float64) {
 	m.tileGenerateDuration.WithLabelValues(style, source).Observe(duration)
 }
 
-// RecordImageCacheHit records a hit on an in-memory image LRU.
-// name is a low-cardinality label like "tile" or "marker".
 func (m *MetricsManager) RecordImageCacheHit(name string) {
 	m.imageCacheHits.WithLabelValues(name).Inc()
 }
 
-// RecordImageCacheMiss records a miss on an in-memory image LRU.
 func (m *MetricsManager) RecordImageCacheMiss(name string) {
 	m.imageCacheMisses.WithLabelValues(name).Inc()
 }

@@ -60,13 +60,13 @@ func (c *CacheIndex) GetMarkerImage(path string, width, height int) (image.Image
 		img := elem.Value.(*markerImageEntry).image
 		c.markerImagesMu.Unlock()
 		if GlobalMetrics != nil {
-			GlobalMetrics.RecordImageCacheHit("marker")
+			GlobalMetrics.RecordImageCacheHit(ImageCacheMarker)
 		}
 		return img, true
 	}
 	c.markerImagesMu.Unlock()
 	if GlobalMetrics != nil {
-		GlobalMetrics.RecordImageCacheMiss("marker")
+		GlobalMetrics.RecordImageCacheMiss(ImageCacheMarker)
 	}
 	return nil, false
 }
