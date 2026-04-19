@@ -40,6 +40,12 @@ type StaticMapHandler struct {
 	sfg               singleflight.Group // dedup concurrent generates for same final path
 	baseSfg           singleflight.Group // dedup concurrent base renders for same basePath
 
+	// localUseViewport routes local-style integer-zoom bases through
+	// RenderViewport instead of tile stitching when the tile working
+	// set is too large to benefit from the cache. Wired from
+	// config.LocalStylesUseViewport.
+	localUseViewport bool
+
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
 	// record dispatch without touching tileserver-gl or disk.
@@ -49,13 +55,14 @@ type StaticMapHandler struct {
 }
 
 // NewStaticMapHandler creates a new static map handler
-func NewStaticMapHandler(r renderer.Renderer, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController) *StaticMapHandler {
+func NewStaticMapHandler(r renderer.Renderer, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController, localUseViewport bool) *StaticMapHandler {
 	h := &StaticMapHandler{
 		renderer:          r,
 		tileHandler:       tileHandler,
 		statsController:   statsController,
 		stylesController:  stylesController,
 		sphericalMercator: utils.NewSphericalMercator(),
+		localUseViewport:  localUseViewport,
 	}
 	h.generateBaseStaticMapFromAPIFn = h.generateBaseStaticMapFromAPI
 	h.generateBaseStaticMapFromTilesFn = h.generateBaseStaticMapFromTiles
@@ -388,10 +395,11 @@ func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap 
 
 	if extStyle == nil {
 		// Local style: fractional zoom → viewport render (native float zoom).
-		// Integer zoom → tile stitching (cacheable via Cache/Tile).
+		// Integer zoom → tile stitching (cacheable via Cache/Tile), unless
+		// localUseViewport is set to skip the tile pipeline entirely.
 		// Scale>1 uses per-scale worker pools (ratio=scale) so tiles
 		// have correct geographic extent; stitching works normally.
-		if isFractional(staticMap.Zoom) {
+		if isFractional(staticMap.Zoom) || h.localUseViewport {
 			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap, basePath)
 		}
 		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)

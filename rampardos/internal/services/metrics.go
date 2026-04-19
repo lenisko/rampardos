@@ -71,6 +71,13 @@ type MetricsManager struct {
 	// don't land in rampardos_request_duration_seconds{type="tile"}).
 	tileGenerateDuration *prometheus.HistogramVec
 
+	// Tile decode time split by source: RAM LRU hit (memcpy + lock)
+	// vs disk read + image.Decode. Measures the step between
+	// "tile bytes are available" and "decoded *image.NRGBA in hand"
+	// so we can see whether further format work (alternate on-disk
+	// encoding) would meaningfully reduce per-stitch CPU.
+	tileDecodeDuration *prometheus.HistogramVec
+
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
 
@@ -88,6 +95,9 @@ const (
 
 	ImageCacheTile   = "tile"
 	ImageCacheMarker = "marker"
+
+	TileDecodeSourceRAMLRU = "ram_lru"
+	TileDecodeSourceDisk   = "disk"
 )
 
 var (
@@ -225,6 +235,12 @@ func newMetricsManager() *MetricsManager {
 			Help:    "Time spent producing a tile. source=cache is a disk hit; source=local is a maplibre-native render; source=external is an upstream download. Includes stitcher-initiated calls that skip the /tile HTTP handler.",
 			Buckets: []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
 		}, []string{"style", "source"}),
+
+		tileDecodeDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_tile_decode_duration_seconds",
+			Help:    "Time to produce a decoded *image.NRGBA for a tile. source=ram_lru is a memory cache hit (lock + memcpy); source=disk is a file read + image.Decode on miss.",
+			Buckets: []float64{0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"source"}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
@@ -392,6 +408,10 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 
 func (m *MetricsManager) RecordTileGenerate(style, source string, duration float64) {
 	m.tileGenerateDuration.WithLabelValues(style, source).Observe(duration)
+}
+
+func (m *MetricsManager) RecordTileDecode(source string, duration float64) {
+	m.tileDecodeDuration.WithLabelValues(source).Observe(duration)
 }
 
 func (m *MetricsManager) RecordImageCacheHit(name string) {
