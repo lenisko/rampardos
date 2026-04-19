@@ -436,6 +436,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 		pitch = *staticMap.Pitch
 	}
 
+	start := time.Now()
 	encoded, err := h.renderer.RenderViewport(ctx, renderer.ViewportRequest{
 		StyleID:   staticMap.Style,
 		Longitude: staticMap.Longitude,
@@ -448,6 +449,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 		Scale:     scale,
 		Format:    staticMap.GetFormat(),
 	})
+	services.GlobalMetrics.RecordRendererViewport(staticMap.Style, time.Since(start).Seconds())
 	if err != nil {
 		return fmt.Errorf("renderer viewport: %w", err)
 	}
