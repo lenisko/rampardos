@@ -159,14 +159,14 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 	leaderErr := make(chan error, 1)
 	followerErr := make(chan error, 1)
 
-	go func() { leaderErr <- h.GenerateStaticMap(leaderCtx, sm, GenerateOpts{}) }()
+	go func() { _, err := h.GenerateStaticMap(leaderCtx, sm, GenerateOpts{}); leaderErr <- err }()
 
 	// Wait for the leader to enter the renderFn so we know it has the
 	// sfg slot. The follower arriving after this is guaranteed to
 	// attach to the same sfg group.
 	<-entered
 
-	go func() { followerErr <- h.GenerateStaticMap(followerCtx, sm, GenerateOpts{}) }()
+	go func() { _, err := h.GenerateStaticMap(followerCtx, sm, GenerateOpts{}); followerErr <- err }()
 
 	// Give the follower time to subscribe to the sfg group.
 	time.Sleep(20 * time.Millisecond)
