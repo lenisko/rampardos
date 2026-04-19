@@ -47,7 +47,7 @@ type Config struct {
 	OverrideClientFormat bool   // If true, ignore client format and use DefaultImageFormat
 	PNGCompressionLevel  string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
 	ImageQuality         int    // JPEG/WebP quality 1-100 (default: 90)
-	MarkerImageCacheSize int    // Max resized marker images to cache (default: 500)
+	MarkerImageCacheSize int    // Max resized marker images to cache (default: 2000)
 	TileImageCacheSize   int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
 	CompositeImageCacheSize int // Max base+staticmap images cached in memory (default: 200, 0 disables). Each entry ~640 KB for 400×400 NRGBA; 200 ≈ 128 MB.
 
@@ -115,13 +115,13 @@ func Load() *Config {
 		OverrideClientFormat: getEnvBool("OVERRIDE_CLIENT_FORMAT", false),
 		PNGCompressionLevel:  getEnv("PNG_COMPRESSION_LEVEL", "fast"),
 		ImageQuality:         getEnvInt("IMAGE_QUALITY", 90),
-		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 500),
+		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
 		TileImageCacheSize:   getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
 		CompositeImageCacheSize: getEnvInt("COMPOSITE_IMAGE_CACHE_SIZE", 200),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
 
-		LocalStylesUseViewport: getEnvBool("LOCAL_STYLES_USE_VIEWPORT", false),
+		LocalStylesUseViewport: getEnvBool("LOCAL_STYLES_USE_VIEWPORT", true),
 
 		PprofEnabled: getEnvBool("PPROF_ENABLED", false),
 
