@@ -146,13 +146,14 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	}
 	mapCount := len(mapsToGenerate)
 
-	// Flow through nocache/ttl to component map generation.
+	// Flow TTL to component generation. nocache collapses to the
+	// 30-second TTL floor for any pregenerate-side persistence;
+	// explicit ttl wins when larger.
 	componentOpts := GenerateOpts{}
-	if skipCache {
-		componentOpts.NoCache = true
-	}
 	if ttlSeconds > 0 {
 		componentOpts.TTL = time.Duration(ttlSeconds) * time.Second
+	} else if skipCache {
+		componentOpts.TTL = nocacheBaseTTLFloor
 	}
 
 	// singleflight: deduplicate the entire generate+combine operation
@@ -161,7 +162,10 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	// composite render for concurrent followers.
 	genCtx := context.WithoutCancel(r.Context())
 	v, sfErr, _ := h.sfg.Do(path, func() (any, error) {
-		if !skipCache && services.GlobalCompositeImageCache != nil {
+		// skipCache (from ?nocache=true) governs disk lifetime in the
+		// pregenerate path, not in-memory reuse — concurrent multi
+		// requests always share the LRU.
+		if services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 				return cached, nil
 			}
@@ -223,15 +227,8 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	h.statsController.StaticMapServed(true, path, "multi")
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
-	ttl := effectiveTTL(skipCache, ttlSeconds)
-
-	if skipCache {
-		slog.Debug("Served multi-static map (nocache)", "file", filepath.Base(path), "maps", mapCount, "duration", duration)
-		serveStaticMapBytes(w, r, path, encoded)
-		return
-	}
-
-	slog.Debug("Served multi-static map (generated)", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds)
+	ttl := effectiveTTL(ttlSeconds)
+	slog.Debug("Served multi-static map", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds, "nocache", skipCache)
 	h.generateResponse(w, r, multiStaticMap, path, encoded, ttl, path)
 }
 
