@@ -318,7 +318,13 @@ func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image,
 		drawMarker(dc, staticMap, marker, sm, scale)
 	}
 
-	return dc.Image(), nil
+	// gg's internal canvas is *image.RGBA. Downstream consumers
+	// (multi grid compose via appendImages, and the final
+	// EncodeImage call) are NRGBA-oriented, so returning RGBA
+	// forces slow-path draw+encode on every follower. Pay one
+	// RGBA→NRGBA conversion here so appendImages hits its fast
+	// same-type path and png.Encode skips the un-premultiply pass.
+	return toNRGBA(dc.Image()), nil
 }
 
 // drawMarkersNative renders markers directly onto a fresh NRGBA copy
