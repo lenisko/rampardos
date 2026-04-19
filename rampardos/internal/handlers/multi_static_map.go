@@ -146,16 +146,6 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	}
 	mapCount := len(mapsToGenerate)
 
-	// Flow TTL to component generation. nocache collapses to the
-	// 30-second TTL floor for any pregenerate-side persistence;
-	// explicit ttl wins when larger.
-	componentOpts := GenerateOpts{}
-	if ttlSeconds > 0 {
-		componentOpts.TTL = time.Duration(ttlSeconds) * time.Second
-	} else if skipCache {
-		componentOpts.TTL = nocacheBaseTTLFloor
-	}
-
 	// singleflight: deduplicate the entire generate+combine operation
 	// for identical multistaticmap requests. Detach the caller's
 	// cancellation so a leader disconnect does not abort the shared
@@ -184,7 +174,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				img, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, componentOpts)
+				img, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm)
 				if err != nil {
 					errOnce.Do(func() { genErr = err })
 					return

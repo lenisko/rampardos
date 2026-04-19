@@ -61,8 +61,8 @@ func raceTestHandler(t *testing.T, renderFn func(ctx context.Context, sm models.
 		stylesController:  stubStylesController{ext: nil},
 		sphericalMercator: utils.NewSphericalMercator(),
 	}
-	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, _ *models.Style) (image.Image, error) {
-		return renderFn(ctx, sm, basePath)
+	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, _ *models.Style) (image.Image, error) {
+		return renderFn(ctx, sm, sm.BasePath())
 	}
 	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap) (image.Image, error) {
 		return renderFn(ctx, sm, sm.BasePath())
@@ -159,14 +159,14 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 	leaderErr := make(chan error, 1)
 	followerErr := make(chan error, 1)
 
-	go func() { _, err := h.GenerateStaticMap(leaderCtx, sm, GenerateOpts{}); leaderErr <- err }()
+	go func() { _, err := h.GenerateStaticMap(leaderCtx, sm); leaderErr <- err }()
 
 	// Wait for the leader to enter the renderFn so we know it has the
 	// sfg slot. The follower arriving after this is guaranteed to
 	// attach to the same sfg group.
 	<-entered
 
-	go func() { _, err := h.GenerateStaticMap(followerCtx, sm, GenerateOpts{}); followerErr <- err }()
+	go func() { _, err := h.GenerateStaticMap(followerCtx, sm); followerErr <- err }()
 
 	// Give the follower time to subscribe to the sfg group.
 	time.Sleep(20 * time.Millisecond)

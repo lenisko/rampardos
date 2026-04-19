@@ -61,7 +61,7 @@ func newDispatchHandlerForTest(t *testing.T, ext *models.Style, rec *dispatchRec
 		rec.fromAPI++
 		return image.NewNRGBA(image.Rect(0, 0, 1, 1)), nil
 	}
-	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) (image.Image, error) {
+	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, extStyle *models.Style) (image.Image, error) {
 		rec.fromTiles++
 		rec.lastExt = extStyle
 		return image.NewNRGBA(image.Rect(0, 0, 1, 1)), nil

@@ -53,7 +53,7 @@ type StaticMapHandler struct {
 	// sets these to the real methods below; tests override them to
 	// record dispatch without touching the renderer or disk.
 	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap) (image.Image, error)
-	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) (image.Image, error)
+	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, extStyle *models.Style) (image.Image, error)
 	logExternalViewportApproxFn      func(sm models.StaticMap)
 }
 
@@ -148,19 +148,6 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 	h.handlePregeneratedRequest(w, r, id)
 }
 
-// GenerateOpts controls caching behaviour for component map generation.
-// In the bytes-first pipeline the in-memory LRU is always consulted;
-// nocache semantics collapse to "use a short TTL" on the pregenerate
-// disk-write path, which the caller expresses directly via TTL.
-type GenerateOpts struct {
-	// TTL governs disk-file deletion for pregenerate requests. Has
-	// no effect on non-pregenerate paths — those never write a file.
-	// Callers conveying the ?nocache=true semantic set this to
-	// nocacheBaseTTLFloor (30 s); zero leaves pregenerate files under
-	// the CacheCleaner's OwnedThreshold age sweep.
-	TTL time.Duration
-}
-
 // GenerateStaticMap generates a static map and returns the decoded
 // image. Used by MultiStaticMapHandler to skip the PNG round-trip
 // that would otherwise happen between component generation and
@@ -169,18 +156,18 @@ type GenerateOpts struct {
 // image pointer so followers share the leader's result without
 // re-encoding.
 //
-// Expiry-queue enqueue has been moved out of this function. In the
-// bytes-first pipeline nothing is written to disk on this path —
-// persistence and its matching expiry enqueue now live exclusively
-// in handlePregenerateResponseBytes, the sole disk-write site.
-func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) (image.Image, error) {
+// In the bytes-first pipeline nothing is written to disk on this
+// path — persistence and its matching expiry enqueue live
+// exclusively in handlePregenerateResponseBytes, the sole
+// disk-write site. TTL / nocache flags therefore apply only at the
+// pregenerate boundary and are not plumbed through here.
+func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap) (image.Image, error) {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
-	// NoCache governs disk-file lifetime at the pregenerate layer, not
-	// in-memory reuse. Weather-alert fan-out hits this path with
-	// nocache=true and the whole point is that N siblings share the
-	// single render via the LRU.
+	// LRU always consulted. Weather-alert fan-out hits this path
+	// with identical URLs and the whole point is that N siblings
+	// share the single render via the cache.
 	if services.GlobalCompositeImageCache != nil {
 		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 			return cached, nil
@@ -417,13 +404,13 @@ func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap 
 		if isFractional(staticMap.Zoom) || h.localUseViewport {
 			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap)
 		}
-		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
+		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
 	}
 
 	if isFractional(staticMap.Zoom) {
 		h.logExternalViewportApproxFn(staticMap)
 	}
-	return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
+	return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
 }
 
 func (h *StaticMapHandler) logExternalViewportApprox(sm models.StaticMap) {
@@ -470,7 +457,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 	return img, nil
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, basePath string, extStyle *models.Style) (image.Image, error) {
+func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, extStyle *models.Style) (image.Image, error) {
 	// Calculate tiles needed
 	center := models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude}
 	zoom := int(staticMap.Zoom)
@@ -575,23 +562,10 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 		return err
 	}
 
-	// Combine tiles and write basePath to disk.
-	if err := utils.GenerateBaseStaticMap(staticMap, tilePaths, basePath, offsetX, offsetY, hasScale, redownload); err != nil {
-		return nil, err
-	}
-
-	// Read the written file back and decode so callers can draw on the
-	// in-memory canvas directly. One extra decode is acceptable here —
-	// this is the external-style cold path that writes basePath anyway.
-	encoded, err := os.ReadFile(basePath)
-	if err != nil {
-		return nil, fmt.Errorf("read stitched base: %w", err)
-	}
-	img, _, err := image.Decode(bytes.NewReader(encoded))
-	if err != nil {
-		return nil, fmt.Errorf("decode stitched base: %w", err)
-	}
-	return img, nil
+	// Stitch tiles into the base image. The LRU (populated by
+	// ensureBase up the stack) is now the sole cross-request cache
+	// for stitched bases; no disk persistence on this path.
+	return utils.GenerateBaseStaticMap(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
 }
 
 func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models.StaticMap) error {
