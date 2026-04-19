@@ -466,12 +466,47 @@ func toNRGBA(img image.Image) *image.NRGBA {
 	switch s := img.(type) {
 	case *image.NRGBA:
 		return s
+	case *image.RGBA:
+		return rgbaToNRGBA(s)
 	case *image.YCbCr:
 		return ycbcrToNRGBA(s)
 	}
 	b := img.Bounds()
 	dst := image.NewNRGBA(b)
 	draw.Draw(dst, b, img, b.Min, draw.Src)
+	return dst
+}
+
+// rgbaToNRGBA unpremultiplies a *image.RGBA into *image.NRGBA by
+// direct byte access. Hot path for the fogleman/gg output (gg's
+// canvas is *image.RGBA); the fully-opaque case short-circuits to
+// a memcpy since div-by-255 is identity when alpha is 255.
+func rgbaToNRGBA(src *image.RGBA) *image.NRGBA {
+	b := src.Bounds()
+	dst := image.NewNRGBA(b)
+	w, h := b.Dx(), b.Dy()
+	for y := 0; y < h; y++ {
+		sRow := src.Pix[y*src.Stride : y*src.Stride+w*4]
+		dRow := dst.Pix[y*dst.Stride : y*dst.Stride+w*4]
+		for x := 0; x < w*4; x += 4 {
+			r, g, bl, a := sRow[x+0], sRow[x+1], sRow[x+2], sRow[x+3]
+			switch a {
+			case 0:
+				// dst already zeroed by NewNRGBA
+			case 0xFF:
+				dRow[x+0], dRow[x+1], dRow[x+2], dRow[x+3] = r, g, bl, 0xFF
+			default:
+				// Unpremultiply. uint32 math with 0xFFFF multiplier
+				// mirrors color.NRGBAModel's rounding — draw.Draw's
+				// generic path uses the same formula via .RGBA().
+				aa := uint32(a)
+				dRow[x+0] = uint8((uint32(r) * 0xFFFF / aa) >> 8)
+				dRow[x+1] = uint8((uint32(g) * 0xFFFF / aa) >> 8)
+				dRow[x+2] = uint8((uint32(bl) * 0xFFFF / aa) >> 8)
+				dRow[x+3] = a
+			}
+		}
+	}
 	return dst
 }
 
