@@ -463,12 +463,37 @@ func loadImage(path string) (image.Image, error) {
 // NRGBA is what the caller caches, so the conversion is amortised
 // across every subsequent stitch that hits the LRU.
 func toNRGBA(img image.Image) *image.NRGBA {
-	if n, ok := img.(*image.NRGBA); ok {
-		return n
+	switch s := img.(type) {
+	case *image.NRGBA:
+		return s
+	case *image.YCbCr:
+		return ycbcrToNRGBA(s)
 	}
 	b := img.Bounds()
 	dst := image.NewNRGBA(b)
 	draw.Draw(dst, b, img, b.Min, draw.Src)
+	return dst
+}
+
+// ycbcrToNRGBA converts a YCbCr image to NRGBA by direct pixel
+// access. Faster than draw.Draw because it bypasses the generic
+// RGBA64At/SetRGBA64 dispatch. Hot path for mapbox satellite tiles,
+// which decode as *image.YCbCr.
+func ycbcrToNRGBA(src *image.YCbCr) *image.NRGBA {
+	b := src.Bounds()
+	dst := image.NewNRGBA(b)
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			yi := src.YOffset(x, y)
+			ci := src.COffset(x, y)
+			r, g, bl := color.YCbCrToRGB(src.Y[yi], src.Cb[ci], src.Cr[ci])
+			di := dst.PixOffset(x, y)
+			dst.Pix[di+0] = r
+			dst.Pix[di+1] = g
+			dst.Pix[di+2] = bl
+			dst.Pix[di+3] = 0xFF
+		}
+	}
 	return dst
 }
 
