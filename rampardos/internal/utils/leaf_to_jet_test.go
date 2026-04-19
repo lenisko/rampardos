@@ -23,17 +23,27 @@ func TestLeafToJetConverter(t *testing.T) {
 		{
 			name:     "if not nil",
 			leaf:     `#if(var != nil):content#endif`,
-			expected: `{{ if var != nil }}content{{ end }}`,
+			expected: `{{ if isset(var) }}content{{ end }}`,
 		},
 		{
 			name:     "if nil",
 			leaf:     `#if(var == nil):content#endif`,
-			expected: `{{ if var == nil }}content{{ end }}`,
+			expected: `{{ if !isset(var) }}content{{ end }}`,
+		},
+		{
+			name:     "if not nil nested property",
+			leaf:     `#if(obj.prop != nil):content#endif`,
+			expected: `{{ if isset(obj.prop) }}content{{ end }}`,
 		},
 		{
 			name:     "if else",
 			leaf:     `#if(var != nil):yes#else:no#endif`,
-			expected: `{{ if var != nil }}yes{{ else }}no{{ end }}`,
+			expected: `{{ if isset(var) }}yes{{ else }}no{{ end }}`,
+		},
+		{
+			name:     "boolean and with nil check",
+			leaf:     `#if(a != nil && b == "x"):ok#endif`,
+			expected: `{{ if isset(a) && b == "x" }}ok{{ end }}`,
 		},
 		{
 			name:     "if elseif else",
