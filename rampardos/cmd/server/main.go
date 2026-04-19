@@ -173,7 +173,7 @@ func main() {
 
 	// Initialize handlers
 	tileHandler := handlers.NewTileHandler(renderEngine, statsController, stylesController)
-	staticMapHandler := handlers.NewStaticMapHandler(renderEngine, tileHandler, statsController, stylesController)
+	staticMapHandler := handlers.NewStaticMapHandler(renderEngine, tileHandler, statsController, stylesController, cfg.LocalStylesUseViewport)
 	multiStaticMapHandler := handlers.NewMultiStaticMapHandler(staticMapHandler, statsController)
 	stylesHandler := handlers.NewStylesHandler(stylesController)
 	fontsHandler := handlers.NewFontsHandler(fontsController)

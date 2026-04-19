@@ -53,6 +53,15 @@ type Config struct {
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
 
+	// LocalStylesUseViewport bypasses tile stitching for local-style
+	// integer-zoom static maps, sending a single RenderViewport call
+	// to the Node renderer instead. Avoids the tile caching layer
+	// entirely for local styles — valuable when the tile working set
+	// exceeds the RAM LRU and most stitches decode-and-discard.
+	// External styles always tile-stitch (upstream providers can't
+	// render an arbitrary viewport).
+	LocalStylesUseViewport bool
+
 	// Diagnostics
 	PprofEnabled bool // Mount net/http/pprof under /debug/pprof. Off by default — endpoints expose profiling data and pprof.Profile holds a goroutine for 30s per call.
 
@@ -109,6 +118,8 @@ func Load() *Config {
 		TileImageCacheSize:   getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
+
+		LocalStylesUseViewport: getEnvBool("LOCAL_STYLES_USE_VIEWPORT", false),
 
 		PprofEnabled: getEnvBool("PPROF_ENABLED", false),
 

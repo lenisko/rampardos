@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/fogleman/gg"
 	"github.com/gen2brain/webp"
@@ -416,11 +417,16 @@ func loadImage(path string) (image.Image, error) {
 // staticmaps. A corrupted-file retry invalidates the cached entry.
 func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, error) {
 	if services.GlobalTileImageCache != nil {
+		start := time.Now()
 		if img, ok := services.GlobalTileImageCache.Get(path); ok {
+			if services.GlobalMetrics != nil {
+				services.GlobalMetrics.RecordTileDecode(services.TileDecodeSourceRAMLRU, time.Since(start).Seconds())
+			}
 			return img, nil
 		}
 	}
 
+	start := time.Now()
 	img, err := loadImage(path)
 	if err != nil && redownload != nil {
 		slog.Warn("Corrupted tile detected, attempting redownload", "path", path, "error", err)
@@ -435,8 +441,13 @@ func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, 
 		slog.Info("Tile redownload successful", "path", path)
 	}
 
-	if err == nil && img != nil && services.GlobalTileImageCache != nil {
-		services.GlobalTileImageCache.Add(path, img)
+	if err == nil && img != nil {
+		if services.GlobalMetrics != nil {
+			services.GlobalMetrics.RecordTileDecode(services.TileDecodeSourceDisk, time.Since(start).Seconds())
+		}
+		if services.GlobalTileImageCache != nil {
+			services.GlobalTileImageCache.Add(path, img)
+		}
 	}
 	return img, err
 }
