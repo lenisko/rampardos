@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"image"
 	"math"
 	"os"
 	"path/filepath"
@@ -56,14 +57,14 @@ func newDispatchHandlerForTest(t *testing.T, ext *models.Style, rec *dispatchRec
 	h := &StaticMapHandler{
 		stylesController: stubStylesController{ext: ext},
 	}
-	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap, basePath string) error {
+	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap) (image.Image, error) {
 		rec.fromAPI++
-		return nil
+		return image.NewNRGBA(image.Rect(0, 0, 1, 1)), nil
 	}
-	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) error {
+	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) (image.Image, error) {
 		rec.fromTiles++
 		rec.lastExt = extStyle
-		return nil
+		return image.NewNRGBA(image.Rect(0, 0, 1, 1)), nil
 	}
 	h.logExternalViewportApproxFn = func(sm models.StaticMap) {
 		rec.lastWarn = true
@@ -85,7 +86,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		rec := &dispatchRecord{}
 		h := newDispatchHandlerForTest(t, nil, rec)
 		sm := models.StaticMap{Style: "local", Zoom: 14, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromTiles != 1 || rec.fromAPI != 0 {
@@ -104,7 +105,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		ext := &models.Style{ID: "ext", URL: "https://x/y/{z}/{x}/{y}.png"}
 		h := newDispatchHandlerForTest(t, ext, rec)
 		sm := models.StaticMap{Style: "ext", Zoom: 14, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromTiles != 1 || rec.fromAPI != 0 {
@@ -122,7 +123,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		rec := &dispatchRecord{}
 		h := newDispatchHandlerForTest(t, nil, rec)
 		sm := models.StaticMap{Style: "local", Zoom: 14.7, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromAPI != 1 || rec.fromTiles != 0 {
@@ -138,7 +139,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 		ext := &models.Style{ID: "ext", URL: "https://x/y/{z}/{x}/{y}.png"}
 		h := newDispatchHandlerForTest(t, ext, rec)
 		sm := models.StaticMap{Style: "ext", Zoom: 14.7, Width: 512, Height: 512}
-		if err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
+		if _, err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
 			t.Fatal(err)
 		}
 		if rec.fromTiles != 1 || rec.fromAPI != 0 {
@@ -151,9 +152,7 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 }
 
 func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
-	fake := &renderer.Fake{
-		Canned: []byte{0x89, 'P', 'N', 'G', 0, 0, 0, 0},
-	}
+	fake := &renderer.Fake{}
 	h := &StaticMapHandler{
 		renderer:         fake,
 		stylesController: stubStylesController{ext: nil},
@@ -161,9 +160,6 @@ func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
 	h.generateBaseStaticMapFromAPIFn = h.generateBaseStaticMapFromAPI
 	h.generateBaseStaticMapFromTilesFn = h.generateBaseStaticMapFromTiles
 	h.logExternalViewportApproxFn = h.logExternalViewportApprox
-
-	tmp := t.TempDir()
-	basePath := filepath.Join(tmp, "base.png")
 
 	sm := models.StaticMap{
 		Style:     "local",
@@ -174,9 +170,12 @@ func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
 		Height:    512,
 		Scale:     1,
 	}
-	err := h.generateBaseStaticMapFromAPI(context.Background(), sm, basePath)
+	img, err := h.generateBaseStaticMapFromAPI(context.Background(), sm)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if img == nil {
+		t.Fatal("expected non-nil image")
 	}
 
 	if len(fake.Calls) != 1 {
@@ -188,14 +187,5 @@ func TestGenerateBaseStaticMapFromAPIUsesRenderer(t *testing.T) {
 	}
 	if call.Viewport.Zoom != 14.7 {
 		t.Errorf("zoom: got %v, want 14.7", call.Viewport.Zoom)
-	}
-
-	// Verify bytes landed on disk.
-	got, err := os.ReadFile(basePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) == 0 {
-		t.Errorf("basePath is empty")
 	}
 }

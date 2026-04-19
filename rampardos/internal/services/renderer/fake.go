@@ -3,6 +3,7 @@ package renderer
 import (
 	"context"
 	"errors"
+	"image"
 	"sync"
 )
 
@@ -70,6 +71,13 @@ func (f *Fake) RenderViewport(ctx context.Context, req ViewportRequest) ([]byte,
 		return append([]byte(nil), f.Canned...), nil
 	}
 	return []byte{0x00}, nil
+}
+
+func (f *Fake) RenderViewportImage(ctx context.Context, req ViewportRequest) (*image.NRGBA, error) {
+	f.mu.Lock()
+	f.Calls = append(f.Calls, FakeCall{Kind: "RenderViewport", Viewport: req})
+	f.mu.Unlock()
+	return image.NewNRGBA(image.Rect(0, 0, 1, 1)), nil
 }
 
 func (f *Fake) ReloadStyles(ctx context.Context) error {
