@@ -32,8 +32,6 @@ type tileImageEntry struct {
 	img image.Image
 }
 
-// NewTileImageCache creates a TileImageCache with the given capacity.
-// A size of 0 makes the cache a no-op.
 func NewTileImageCache(size int) *TileImageCache {
 	return &TileImageCache{
 		entries: make(map[string]*list.Element),
@@ -42,8 +40,6 @@ func NewTileImageCache(size int) *TileImageCache {
 	}
 }
 
-// Get returns the cached image for key, or (nil, false) on miss.
-// Touches recency on hit. Records hit/miss to GlobalMetrics when set.
 func (c *TileImageCache) Get(key string) (image.Image, bool) {
 	c.mu.Lock()
 	if c.maxSize <= 0 {
@@ -56,7 +52,7 @@ func (c *TileImageCache) Get(key string) (image.Image, bool) {
 	if !ok {
 		c.mu.Unlock()
 		if GlobalMetrics != nil {
-			GlobalMetrics.RecordImageCacheMiss("tile")
+			GlobalMetrics.RecordImageCacheMiss(ImageCacheTile)
 		}
 		return nil, false
 	}
@@ -64,13 +60,11 @@ func (c *TileImageCache) Get(key string) (image.Image, bool) {
 	img := elem.Value.(*tileImageEntry).img
 	c.mu.Unlock()
 	if GlobalMetrics != nil {
-		GlobalMetrics.RecordImageCacheHit("tile")
+		GlobalMetrics.RecordImageCacheHit(ImageCacheTile)
 	}
 	return img, true
 }
 
-// Add inserts or refreshes key → img. Evicts the oldest entry when
-// capacity is reached. No-op when the cache is disabled (size 0).
 func (c *TileImageCache) Add(key string, img image.Image) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -91,8 +85,6 @@ func (c *TileImageCache) Add(key string, img image.Image) {
 	c.entries[key] = elem
 }
 
-// SetSize changes the cache capacity, evicting the oldest entries
-// until the length fits. SetSize(0) empties and disables the cache.
 func (c *TileImageCache) SetSize(size int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -116,8 +108,6 @@ func (c *TileImageCache) evictOldestLocked() {
 // before InitGlobalTileImageCache runs; callers must nil-check.
 var GlobalTileImageCache *TileImageCache
 
-// InitGlobalTileImageCache installs the global tile image cache with
-// the given capacity.
 func InitGlobalTileImageCache(size int) {
 	GlobalTileImageCache = NewTileImageCache(size)
 }

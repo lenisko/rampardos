@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/services/renderer"
@@ -368,7 +369,7 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 			if err != nil {
 				return err
 			}
-			return atomicWriteFile(path, data, 0644)
+			return fileutil.AtomicWriteFile(path, data, 0644)
 		}
 		return nil
 	}
@@ -444,7 +445,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 	}
 
 	ensureDir(filepath.Dir(basePath))
-	if err := atomicWriteFile(basePath, encoded, 0o644); err != nil {
+	if err := fileutil.AtomicWriteFile(basePath, encoded, 0o644); err != nil {
 		return fmt.Errorf("write base path: %w", err)
 	}
 	return nil
