@@ -553,7 +553,10 @@ func appendImages(base, addition image.Image, direction models.CombineDirection)
 // CatmullRom interpolation.
 func scaleImage(src image.Image, width, height int) image.Image {
 	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+	// Src not Over: dst is a freshly allocated zero-alpha NRGBA, so the
+	// composited result is identical, and Src unlocks xdraw's NRGBA
+	// fast path on the Y pass (scaleY_NRGBA_Src vs scaleY_RGBA64Image_Src).
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Src, nil)
 	return dst
 }
 
@@ -684,7 +687,8 @@ func saveImage(path string, img image.Image) error {
 // resizeImage resizes an image to the target dimensions
 func resizeImage(img image.Image, width, height int) image.Image {
 	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
-	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Over, nil)
+	// Src not Over: see scaleImage comment — same rationale.
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Src, nil)
 	return dst
 }
 
