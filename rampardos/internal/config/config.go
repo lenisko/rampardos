@@ -52,6 +52,9 @@ type Config struct {
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
 
+	// Diagnostics
+	PprofEnabled bool // Mount net/http/pprof under /debug/pprof. Off by default — endpoints expose profiling data and pprof.Profile holds a goroutine for 30s per call.
+
 	// Pyroscope settings
 	PyroscopeServerAddress        string
 	PyroscopeApplicationName      string
@@ -104,6 +107,8 @@ func Load() *Config {
 		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 500),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
+
+		PprofEnabled: getEnvBool("PPROF_ENABLED", false),
 
 		PyroscopeServerAddress:        getEnv("PYROSCOPE_SERVER_ADDRESS", ""),
 		PyroscopeApplicationName:      getEnv("PYROSCOPE_APPLICATION_NAME", "tileserver-cache"),
