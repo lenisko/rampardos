@@ -20,6 +20,7 @@ import (
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
+	"github.com/lenisko/rampardos/internal/services"
 )
 
 // poolKey builds the map key for a (style, scale) pool. Scale=1 pools
@@ -335,7 +336,16 @@ func encodeRGBA(rgba []byte, width, height int, format models.ImageFormat) ([]by
 	var buf bytes.Buffer
 	switch format {
 	case models.ImageFormatPNG:
-		if err := png.Encode(&buf, img); err != nil {
+		// Respect PNG_COMPRESSION_LEVEL. png.Encode() uses the default
+		// Encoder{} which is flate level 6 — ~4-6× slower than the "fast"
+		// setting applied everywhere else via saveImage. The renderer
+		// runs this on every maplibre-native tile/viewport, so the
+		// difference compounds.
+		encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+		if services.GlobalImageSettings != nil {
+			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
+		}
+		if err := encoder.Encode(&buf, img); err != nil {
 			return nil, fmt.Errorf("renderer: png encode: %w", err)
 		}
 	case models.ImageFormatJPG, models.ImageFormatJPEG:
