@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"log/slog"
 	"math"
 	"net/http"
@@ -48,9 +52,9 @@ type StaticMapHandler struct {
 
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
-	// record dispatch without touching tileserver-gl or disk.
-	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap, basePath string) error
-	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) error
+	// record dispatch without touching the renderer or disk.
+	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap) (image.Image, error)
+	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, basePath string, extStyle *models.Style) (image.Image, error)
 	logExternalViewportApproxFn      func(sm models.StaticMap)
 }
 
@@ -336,33 +340,52 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 	h.handleRequest(w, r, staticMap)
 }
 
-// ensureBase renders basePath if it's missing on disk. Concurrent
-// callers for the same basePath are deduplicated via baseSfg, so
-// sibling requests (same viewport, different overlays) do not
-// duplicate base rendering. The cache index is not consulted — a
-// stale entry could falsely claim the base existed while it had
-// been removed by CacheCleaner or an external actor, leading the
-// subsequent read to fail.
+// ensureBase renders basePath if it's missing. Concurrent callers for
+// the same basePath are deduplicated via baseSfg, so sibling requests
+// (same viewport, different overlays) do not duplicate base rendering.
+//
+// LRU fast path: GlobalCompositeImageCache is checked before the
+// singleflight so burst-sharing across requests avoids the disk stat.
 //
 // Singleflight key correctness: basePath == BasePath() ==
 // hash(WithoutDrawables()), so two callers share a slot iff their
 // base-rendering inputs (style/lat/lon/zoom/w/h/scale/bearing/pitch/
 // format) are identical. Base generation reads none of Markers,
 // Polygons, or Circles, so merging the renders is safe.
-func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string) error {
-	_, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
-		if _, err := os.Stat(basePath); err == nil {
-			return nil, nil
+func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string) (image.Image, error) {
+	// LRU fast path — covers the cross-request burst-sharing case
+	// that the short-TTL disk cache used to handle.
+	if services.GlobalCompositeImageCache != nil {
+		if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
+			return img, nil
 		}
-		return nil, h.generateBaseStaticMap(ctx, staticMap, basePath)
+	}
+
+	v, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
+		if services.GlobalCompositeImageCache != nil {
+			if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
+				return img, nil
+			}
+		}
+		img, err := h.generateBaseStaticMap(ctx, staticMap, basePath)
+		if err != nil {
+			return nil, err
+		}
+		if services.GlobalCompositeImageCache != nil {
+			services.GlobalCompositeImageCache.Add(basePath, img)
+		}
+		return img, nil
 	})
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return v.(image.Image), nil
 }
 
 func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap) error {
 	ensureDir(filepath.Dir(path))
 
-	if err := h.ensureBase(ctx, staticMap, basePath); err != nil {
+	if _, err := h.ensureBase(ctx, staticMap, basePath); err != nil {
 		return err
 	}
 
@@ -390,22 +413,19 @@ func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath
 	return utils.GenerateStaticMap(staticMap, basePath, path, h.sphericalMercator)
 }
 
-func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) error {
-	extStyle := h.stylesController.GetExternalStyle(staticMap.Style) // nil for local styles
+func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) (image.Image, error) {
+	extStyle := h.stylesController.GetExternalStyle(staticMap.Style)
 
 	if extStyle == nil {
 		// Local style: fractional zoom → viewport render (native float zoom).
 		// Integer zoom → tile stitching (cacheable via Cache/Tile), unless
 		// localUseViewport is set to skip the tile pipeline entirely.
-		// Scale>1 uses per-scale worker pools (ratio=scale) so tiles
-		// have correct geographic extent; stitching works normally.
 		if isFractional(staticMap.Zoom) || h.localUseViewport {
-			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap, basePath)
+			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap)
 		}
 		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, basePath, extStyle)
 	}
 
-	// External styles: tile stitching (no viewport endpoint available).
 	if isFractional(staticMap.Zoom) {
 		h.logExternalViewportApproxFn(staticMap)
 	}
@@ -421,7 +441,7 @@ func (h *StaticMapHandler) logExternalViewportApprox(sm models.StaticMap) {
 	)
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap, basePath string) error {
+func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap) (image.Image, error) {
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
@@ -437,7 +457,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 	}
 
 	start := time.Now()
-	encoded, err := h.renderer.RenderViewport(ctx, renderer.ViewportRequest{
+	img, err := h.renderer.RenderViewportImage(ctx, renderer.ViewportRequest{
 		StyleID:   staticMap.Style,
 		Longitude: staticMap.Longitude,
 		Latitude:  staticMap.Latitude,
@@ -451,17 +471,12 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 	})
 	services.GlobalMetrics.RecordRendererViewport(staticMap.Style, time.Since(start).Seconds())
 	if err != nil {
-		return fmt.Errorf("renderer viewport: %w", err)
+		return nil, fmt.Errorf("renderer viewport: %w", err)
 	}
-
-	ensureDir(filepath.Dir(basePath))
-	if err := fileutil.AtomicWriteFile(basePath, encoded, 0o644); err != nil {
-		return fmt.Errorf("write base path: %w", err)
-	}
-	return nil
+	return img, nil
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, basePath string, extStyle *models.Style) error {
+func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, basePath string, extStyle *models.Style) (image.Image, error) {
 	// Calculate tiles needed
 	center := models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude}
 	zoom := int(staticMap.Zoom)
@@ -533,7 +548,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 	for range totalTiles {
 		slot := <-results
 		if slot.err != nil {
-			return fmt.Errorf("failed to generate tile: %w", slot.err)
+			return nil, fmt.Errorf("failed to generate tile: %w", slot.err)
 		}
 		tilePaths[slot.index] = slot.path
 	}
@@ -566,8 +581,23 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 		return err
 	}
 
-	// Combine tiles
-	return utils.GenerateBaseStaticMap(staticMap, tilePaths, basePath, offsetX, offsetY, hasScale, redownload)
+	// Combine tiles and write basePath to disk.
+	if err := utils.GenerateBaseStaticMap(staticMap, tilePaths, basePath, offsetX, offsetY, hasScale, redownload); err != nil {
+		return nil, err
+	}
+
+	// Read the written file back and decode so callers can draw on the
+	// in-memory canvas directly. One extra decode is acceptable here —
+	// this is the external-style cold path that writes basePath anyway.
+	encoded, err := os.ReadFile(basePath)
+	if err != nil {
+		return nil, fmt.Errorf("read stitched base: %w", err)
+	}
+	img, _, err := image.Decode(bytes.NewReader(encoded))
+	if err != nil {
+		return nil, fmt.Errorf("decode stitched base: %w", err)
+	}
+	return img, nil
 }
 
 func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models.StaticMap) error {

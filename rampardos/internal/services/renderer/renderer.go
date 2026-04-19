@@ -8,6 +8,7 @@ package renderer
 
 import (
 	"context"
+	"image"
 	"time"
 
 	"github.com/lenisko/rampardos/internal/models"
@@ -30,6 +31,13 @@ type Renderer interface {
 	// any tile-level cache; the caller is responsible for any
 	// higher-level caching.
 	RenderViewport(ctx context.Context, req ViewportRequest) ([]byte, error)
+
+	// RenderViewportImage is like RenderViewport but returns the
+	// decoded image.Image directly, avoiding a round-trip through
+	// encoded bytes. Callers that intend to composite the result
+	// in memory (e.g. the static-map overlay step) should prefer
+	// this over RenderViewport + image.Decode.
+	RenderViewportImage(ctx context.Context, req ViewportRequest) (*image.NRGBA, error)
 
 	// ReloadStyles tears down and rebuilds backend state so that
 	// subsequent renders see the latest on-disk style/mbtiles content.

@@ -46,7 +46,7 @@ func raceTestStaticMap() models.StaticMap {
 // generators route through renderFn. The "local" style means
 // generateBaseStaticMap takes the tiles branch at integer zoom;
 // renderFn is wired into both tile and API hooks for safety.
-func raceTestHandler(t *testing.T, renderFn func(ctx context.Context, sm models.StaticMap, basePath string) error) (*StaticMapHandler, func()) {
+func raceTestHandler(t *testing.T, renderFn func(ctx context.Context, sm models.StaticMap, basePath string) (image.Image, error)) (*StaticMapHandler, func()) {
 	t.Helper()
 	oldDir, err := os.Getwd()
 	if err != nil {
@@ -61,10 +61,12 @@ func raceTestHandler(t *testing.T, renderFn func(ctx context.Context, sm models.
 		stylesController:  stubStylesController{ext: nil},
 		sphericalMercator: utils.NewSphericalMercator(),
 	}
-	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, _ *models.Style) error {
+	h.generateBaseStaticMapFromTilesFn = func(ctx context.Context, sm models.StaticMap, basePath string, _ *models.Style) (image.Image, error) {
 		return renderFn(ctx, sm, basePath)
 	}
-	h.generateBaseStaticMapFromAPIFn = renderFn
+	h.generateBaseStaticMapFromAPIFn = func(ctx context.Context, sm models.StaticMap) (image.Image, error) {
+		return renderFn(ctx, sm, sm.BasePath())
+	}
 	h.logExternalViewportApproxFn = func(sm models.StaticMap) {}
 
 	return h, func() { _ = os.Chdir(oldDir) }
@@ -75,12 +77,17 @@ func raceTestHandler(t *testing.T, renderFn func(ctx context.Context, sm models.
 // calls must trigger a fresh render, not a 500 or a skipped render.
 func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 	var renders atomic.Int32
-	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) error {
+	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) (image.Image, error) {
 		renders.Add(1)
+		img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+		img.Set(0, 0, color.RGBA{A: 255})
 		if err := os.MkdirAll(filepath.Dir(basePath), 0o755); err != nil {
-			return err
+			return nil, err
 		}
-		return os.WriteFile(basePath, raceFakePNG(t), 0o644)
+		if err := os.WriteFile(basePath, raceFakePNG(t), 0o644); err != nil {
+			return nil, err
+		}
+		return img, nil
 	}
 	h, cleanup := raceTestHandler(t, renderFn)
 	defer cleanup()
@@ -89,7 +96,7 @@ func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 	basePath := sm.BasePath()
 	ctx := context.Background()
 
-	if err := h.ensureBase(ctx, sm, basePath); err != nil {
+	if _, err := h.ensureBase(ctx, sm, basePath); err != nil {
 		t.Fatalf("first ensureBase: %v", err)
 	}
 	if got := renders.Load(); got != 1 {
@@ -103,7 +110,7 @@ func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 		t.Fatalf("remove base: %v", err)
 	}
 
-	if err := h.ensureBase(ctx, sm, basePath); err != nil {
+	if _, err := h.ensureBase(ctx, sm, basePath); err != nil {
 		t.Fatalf("ensureBase after delete: %v", err)
 	}
 	if got := renders.Load(); got != 2 {
@@ -122,16 +129,21 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 1)
 
-	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) error {
+	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) (image.Image, error) {
 		entered <- struct{}{}
 		select {
 		case <-gate:
+			img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+			img.Set(0, 0, color.RGBA{A: 255})
 			if err := os.MkdirAll(filepath.Dir(basePath), 0o755); err != nil {
-				return err
+				return nil, err
 			}
-			return os.WriteFile(basePath, raceFakePNG(t), 0o644)
+			if err := os.WriteFile(basePath, raceFakePNG(t), 0o644); err != nil {
+				return nil, err
+			}
+			return img, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 	h, cleanup := raceTestHandler(t, renderFn)
@@ -205,14 +217,19 @@ func TestEnsureBaseSingleflightDedupesSiblings(t *testing.T) {
 	reached := make(chan struct{}, N+1)
 	gate := make(chan struct{})
 
-	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) error {
+	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) (image.Image, error) {
 		renders.Add(1)
 		reached <- struct{}{}
 		<-gate
+		img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+		img.Set(0, 0, color.RGBA{A: 255})
 		if err := os.MkdirAll(filepath.Dir(basePath), 0o755); err != nil {
-			return err
+			return nil, err
 		}
-		return os.WriteFile(basePath, raceFakePNG(t), 0o644)
+		if err := os.WriteFile(basePath, raceFakePNG(t), 0o644); err != nil {
+			return nil, err
+		}
+		return img, nil
 	}
 	h, cleanup := raceTestHandler(t, renderFn)
 	defer cleanup()
@@ -227,7 +244,7 @@ func TestEnsureBaseSingleflightDedupesSiblings(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			started <- struct{}{}
-			if err := h.ensureBase(ctx, sm, basePath); err != nil {
+			if _, err := h.ensureBase(ctx, sm, basePath); err != nil {
 				t.Errorf("ensureBase: %v", err)
 			}
 		}()
