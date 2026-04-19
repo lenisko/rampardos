@@ -64,6 +64,9 @@ func (c *CompositeImageCache) Add(key string, img image.Image) {
 	if c.maxSize <= 0 {
 		return
 	}
+	if img == nil {
+		return
+	}
 	if elem, ok := c.entries[key]; ok {
 		elem.Value.(*compositeImageEntry).img = img
 		c.lru.MoveToFront(elem)

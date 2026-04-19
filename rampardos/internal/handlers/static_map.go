@@ -169,7 +169,6 @@ type GenerateOpts struct {
 func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, opts GenerateOpts) (image.Image, error) {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
-	_ = basePath // retained for symmetry; ensureBase will key on it
 
 	if !opts.NoCache && services.GlobalCompositeImageCache != nil {
 		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {

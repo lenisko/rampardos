@@ -62,9 +62,13 @@ visible in the code.
 - `staticMap.BasePath()` is the LRU key for base images;
   `staticMap.Path()` for final staticmaps. Both stable across
   process lifetime.
-- **Disk writes happen only for `?pregenerate=true`.** External-style
-  (Mapbox) tile stitching still writes basePath to disk because its
-  inner tile cache lives on disk.
+- **Disk writes happen only for `?pregenerate=true`** on the
+  non-external hot path. External-style (Mapbox) tile stitching
+  continues to write basePath to disk because its inner tile cache
+  lives on disk; that write has no matching `enqueueWithBase` call —
+  the file is age-swept by `CacheCleaner` on `Cache/Static` rather
+  than scheduled for deletion. It's the one acknowledged exception
+  to the one-to-one disk-write-and-enqueue rule below.
 - **Enqueue invariant:** `services.GlobalExpiryQueue.Add` (via
   `enqueueWithBase`) is only called from
   `handlePregenerateResponseBytes`, right next to the
