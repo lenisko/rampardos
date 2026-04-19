@@ -89,6 +89,131 @@ func TestToNRGBAIdentityForNRGBA(t *testing.T) {
 	}
 }
 
+// TestRGBAToNRGBAMatchesDrawDraw locks in that the hand-coded
+// RGBA→NRGBA converter produces byte-identical output to the
+// generic image/draw.Draw path it replaces. This is the shape
+// fogleman/gg's internal canvas takes when polygons or circles
+// are in the staticmap request.
+func TestRGBAToNRGBAMatchesDrawDraw(t *testing.T) {
+	cases := []struct {
+		name string
+		w, h int
+		fill func(x, y int) color.RGBA
+	}{
+		{
+			name: "all opaque",
+			w:    32, h: 32,
+			fill: func(x, y int) color.RGBA {
+				return color.RGBA{R: byte(x * 7), G: byte(y * 5), B: byte((x + y) * 3), A: 0xFF}
+			},
+		},
+		{
+			name: "all transparent",
+			w:    16, h: 16,
+			fill: func(x, y int) color.RGBA { return color.RGBA{} },
+		},
+		{
+			name: "mixed alpha",
+			w:    64, h: 64,
+			fill: func(x, y int) color.RGBA {
+				a := byte(((x + y) * 4) | 1)
+				// premultiplied: r/g/b must be <= a
+				return color.RGBA{R: a / 3, G: a / 2, B: a, A: a}
+			},
+		},
+		{
+			name: "semi-transparent solid",
+			w:    16, h: 16,
+			fill: func(x, y int) color.RGBA {
+				return color.RGBA{R: 0x40, G: 0x20, B: 0x80, A: 0x80}
+			},
+		},
+		{
+			name: "odd bounds",
+			w:    17, h: 13,
+			fill: func(x, y int) color.RGBA {
+				return color.RGBA{R: byte(x), G: byte(y), B: byte(x ^ y), A: 0xFF}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := image.NewRGBA(image.Rect(0, 0, tc.w, tc.h))
+			for y := 0; y < tc.h; y++ {
+				for x := 0; x < tc.w; x++ {
+					src.SetRGBA(x, y, tc.fill(x, y))
+				}
+			}
+
+			want := image.NewNRGBA(src.Bounds())
+			draw.Draw(want, want.Bounds(), src, src.Bounds().Min, draw.Src)
+
+			got := rgbaToNRGBA(src)
+
+			if got.Bounds() != want.Bounds() {
+				t.Fatalf("bounds mismatch: got %v want %v", got.Bounds(), want.Bounds())
+			}
+			for i := range want.Pix {
+				if got.Pix[i] != want.Pix[i] {
+					y := i / got.Stride
+					x := (i % got.Stride) / 4
+					chan4 := i % 4
+					t.Fatalf("pixel mismatch at (%d,%d) chan %d: got %d want %d",
+						x, y, chan4, got.Pix[i], want.Pix[i])
+				}
+			}
+		})
+	}
+}
+
+// TestToNRGBADispatchesRGBAFastPath checks toNRGBA routes RGBA
+// through rgbaToNRGBA and not the generic draw.Draw fallback.
+func TestToNRGBADispatchesRGBAFastPath(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 32; x++ {
+			src.SetRGBA(x, y, color.RGBA{R: byte(x * 4), G: byte(y * 4), B: 0x80, A: 0xFF})
+		}
+	}
+
+	want := image.NewNRGBA(src.Bounds())
+	draw.Draw(want, want.Bounds(), src, src.Bounds().Min, draw.Src)
+
+	got := toNRGBA(src)
+
+	for i := range want.Pix {
+		if got.Pix[i] != want.Pix[i] {
+			t.Fatalf("pixel %d: got %d want %d", i, got.Pix[i], want.Pix[i])
+		}
+	}
+}
+
+// BenchmarkRGBAToNRGBA compares the hand-coded converter against
+// the draw.Draw fallback on a gg-sized (400×400) opaque canvas —
+// the typical staticmap output before NRGBA normalisation.
+func BenchmarkRGBAToNRGBA(b *testing.B) {
+	src := image.NewRGBA(image.Rect(0, 0, 400, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 400; x++ {
+			src.SetRGBA(x, y, color.RGBA{R: byte(x), G: byte(y), B: byte(x ^ y), A: 0xFF})
+		}
+	}
+
+	b.Run("hand-coded", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = rgbaToNRGBA(src)
+		}
+	})
+	b.Run("draw.Draw", func(b *testing.B) {
+		bounds := src.Bounds()
+		for i := 0; i < b.N; i++ {
+			dst := image.NewNRGBA(bounds)
+			draw.Draw(dst, bounds, src, bounds.Min, draw.Src)
+		}
+	})
+}
+
 // BenchmarkYCbCrToNRGBA compares the hand-coded converter against
 // the draw.Draw fallback on a tile-sized (256×256) YCbCr input —
 // the shape mapbox satellite tiles decode to.
