@@ -168,10 +168,6 @@ func (npr *NodePoolRenderer) RenderViewport(ctx context.Context, req ViewportReq
 	if err != nil {
 		return nil, err
 	}
-	scale := int(req.Scale)
-	if scale < 1 {
-		scale = 1
-	}
 	return encodeRGBAImage(img, req.Format)
 }
 
