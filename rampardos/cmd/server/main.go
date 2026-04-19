@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -227,6 +228,23 @@ func main() {
 
 	// Metrics endpoint
 	r.Handle("/metrics", promhttp.Handler())
+
+	// pprof endpoints for live profiling, gated by PPROF_ENABLED because
+	// these expose internal state and pprof.Profile ties up a goroutine
+	// for 30s per call. Sub-profiles (heap, goroutine, allocs, block,
+	// mutex, threadcreate) are routed through pprof.Index.
+	if cfg.PprofEnabled {
+		slog.Warn("pprof endpoints enabled", "path", "/debug/pprof")
+		r.Route("/debug/pprof", func(r chi.Router) {
+			r.Get("/", pprof.Index)
+			r.Get("/cmdline", pprof.Cmdline)
+			r.Get("/profile", pprof.Profile)
+			r.Get("/symbol", pprof.Symbol)
+			r.Post("/symbol", pprof.Symbol)
+			r.Get("/trace", pprof.Trace)
+			r.Get("/{name}", pprof.Index)
+		})
+	}
 
 	// Admin routes (protected by Basic Auth)
 	r.Route("/admin", func(r chi.Router) {
