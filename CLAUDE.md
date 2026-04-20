@@ -8,6 +8,12 @@ visible in the code.
 - One worker pool per `(styleID, scale)` tuple. Scale is baked into the
   maplibre-native `ratio` at pool construction — not a per-request parameter.
   Pools are created lazily by `getOrCreatePool(styleID, scale)`.
+- **Two-level concurrency:** `cfg.PoolSize` (RENDERER_POOL_SIZE) is a
+  **global** semaphore capping concurrent renders across *all* pools, not a
+  per-pool size. `cfg.StylePoolSize` (STYLE_POOL_SIZE, default=PoolSize) is
+  the per-pool worker count. Without the global cap, N styles × M scales ×
+  PoolSize workers could oversubscribe CPU; the semaphore keeps the ceiling
+  at PoolSize regardless of how many pools exist.
 - For local styles: default is native viewport render for all zooms
   (`LOCAL_STYLES_USE_VIEWPORT=true` by default). Set to `false` to route
   integer-zoom requests through tile stitching; fractional zoom is

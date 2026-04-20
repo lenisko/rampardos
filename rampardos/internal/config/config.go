@@ -16,7 +16,8 @@ type Config struct {
 	RendererBackend        string        // "node-pool"
 	RendererNodeBinary     string        // path to node
 	RendererWorkerScript   string        // path to render-worker.js
-	RendererPoolSize       int           // concurrent workers per style
+	RendererPoolSize       int           // global cap on concurrent renders (semaphore size)
+	RendererStylePoolSize  int           // workers per (style, scale) pool (default: RendererPoolSize)
 	RendererRenderTimeout  time.Duration // per-render deadline
 	RendererWorkerLifetime int           // renders per worker before recycle
 	RendererStartupTimeout time.Duration // max handshake wait
@@ -88,6 +89,7 @@ func Load() *Config {
 		RendererNodeBinary:     getEnv("RENDERER_NODE_BINARY", "node"),
 		RendererWorkerScript:   getEnv("RENDERER_WORKER_SCRIPT", "/app/render-worker/render-worker.js"),
 		RendererPoolSize:       getEnvInt("RENDERER_POOL_SIZE", 0),
+		RendererStylePoolSize:  getEnvInt("STYLE_POOL_SIZE", 0),
 		RendererRenderTimeout:  getEnvSeconds("RENDERER_TIMEOUT_SECONDS", 15),
 		RendererWorkerLifetime: getEnvInt("RENDERER_WORKER_LIFETIME", 500),
 		RendererStartupTimeout: getEnvSeconds("RENDERER_STARTUP_TIMEOUT_SECONDS", 10),
