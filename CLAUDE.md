@@ -26,15 +26,16 @@ visible in the code.
 
 ## Cache intent: nocache, TTL, owned
 
+- `nocache=true` bypasses the composite LRU **read** (forces a fresh
+  render) but still writes the result back and still dedupes concurrent
+  siblings via singleflight. It does not touch the tile or marker
+  caches — those have their own freshness rules.
+- `nocache=true` + `pregenerate=true` with no explicit `ttl` defaults
+  `ttl=30` so the returned URL lives long enough for the consumer to
+  fetch the file. `nocache` itself doesn't affect the disk lifetime.
 - The expiry queue is **extend-only**: a shorter TTL never shortens an
-  existing entry. This is the only reason concurrent nocache / TTL /
-  owned requests don't delete each other's files.
-- `nocacheBaseTTLFloor` (30s) is the minimum lifetime even for
-  `nocache=true`, so a burst of concurrent pregenerate+ttl subscribers
-  can still fetch the base.
-- `nocache=true` + `pregenerate=true` silently converts to `ttl=30`.
-  Returning a URL means the consumer needs time to fetch — immediate
-  delete would 404 them.
+  existing entry. This is the only reason concurrent TTL / owned
+  requests don't delete each other's files.
 - `OwnedThreshold` requires a `CacheCleaner` for the target folder. With
   no cleaner, `Unown` is never called and the owned set grows for the
   process lifetime.
