@@ -143,12 +143,36 @@ func NewNodePoolRenderer(cfg Config, sf SpawnFactory) (*NodePoolRenderer, error)
 		return nil, fmt.Errorf("renderer: discover styles: %w", err)
 	}
 
-	return &NodePoolRenderer{
+	npr := &NodePoolRenderer{
 		cfg:          cfg,
 		spawnFactory: sf,
 		sem:          semaphore.NewWeighted(int64(cfg.PoolSize)),
 		pools:        make(map[string]*stylePool),
-	}, nil
+	}
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.SetRendererGlobalCapacity(cfg.PoolSize)
+	}
+	return npr, nil
+}
+
+// acquireGlobal acquires the process-wide render-concurrency semaphore
+// and records the wait + in-flight gauges. Paired with releaseGlobal.
+func (npr *NodePoolRenderer) acquireGlobal(ctx context.Context) error {
+	start := time.Now()
+	if err := npr.sem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.RecordRendererGlobalAcquire(time.Since(start).Seconds())
+	}
+	return nil
+}
+
+func (npr *NodePoolRenderer) releaseGlobal() {
+	npr.sem.Release(1)
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.DecRendererGlobalInFlight()
+	}
 }
 
 // loadPool reads the on-disk style.json, rewrites it via PrepareStyle,
@@ -179,6 +203,7 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 
 	return newStylePool(stylePoolConfig{
 		styleID:          id,
+		scaleLabel:       strconv.Itoa(ratio),
 		poolSize:         npr.cfg.StylePoolSize,
 		workerLifetime:   npr.cfg.WorkerLifetime,
 		handshakeTimeout: npr.cfg.StartupTimeout,
@@ -217,10 +242,10 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 	if err != nil {
 		return nil, err
 	}
-	if err := npr.sem.Acquire(ctx, 1); err != nil {
+	if err := npr.acquireGlobal(ctx); err != nil {
 		return nil, err
 	}
-	defer npr.sem.Release(1)
+	defer npr.releaseGlobal()
 	frame := requestFrameForViewport(req)
 	rgba, err := pool.dispatch(ctx, frame)
 	if err != nil {
@@ -257,10 +282,10 @@ func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req Vie
 		return nil, err
 	}
 
-	if err := npr.sem.Acquire(ctx, 1); err != nil {
+	if err := npr.acquireGlobal(ctx); err != nil {
 		return nil, err
 	}
-	defer npr.sem.Release(1)
+	defer npr.releaseGlobal()
 
 	// Send LOGICAL dimensions to the worker. The worker's map was
 	// constructed with ratio=scale, so it produces width*ratio ×

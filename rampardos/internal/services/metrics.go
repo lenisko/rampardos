@@ -88,9 +88,16 @@ type MetricsManager struct {
 	// every local staticmap base is a live renderer call — there is no
 	// disk-cache buffer — so visibility into whether the Node workers
 	// are the bottleneck matters.
-	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker
+	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker in (style, scale) pool
 	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
 	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
+
+	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
+	// concurrent renders across all pools; complements the per-pool
+	// saturation metrics above.
+	rendererGlobalCapacity    prometheus.Gauge
+	rendererGlobalInFlight    prometheus.Gauge
+	rendererGlobalAcquireWait prometheus.Histogram
 
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
@@ -264,23 +271,39 @@ func newMetricsManager() *MetricsManager {
 			Name:    "rampardos_renderer_viewport_duration_seconds",
 			Help:    "Time spent inside renderer.RenderViewport, covering fractional-zoom bases and the LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass. Includes maplibre-native render + encode + IPC; excludes the caller's disk write.",
 			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
-		}, []string{"style"}),
+		}, []string{"style", "scale"}),
 
 		rendererPoolAcquireWait: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pool_acquire_wait_seconds",
-			Help:    "Time a dispatch call spent waiting for an idle worker. Sustained high percentiles indicate the pool is saturated; under healthy load this should be dominated by the sub-ms bucket.",
+			Help:    "Time a dispatch call spent waiting for an idle worker in its (style, scale) pool. Sustained high percentiles indicate the pool is saturated; under healthy load this should be dominated by the sub-ms bucket.",
 			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
-		}, []string{"style"}),
+		}, []string{"style", "scale"}),
 
 		rendererPoolIdleWorkers: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_renderer_pool_idle_workers",
-			Help: "Idle workers snapshotted at the moment a dispatch acquires one. 0 means the pool was fully busy when this dispatch entered.",
-		}, []string{"style"}),
+			Help: "Idle workers snapshotted at the moment a dispatch acquires one from the (style, scale) pool. 0 means the pool was fully busy when this dispatch entered.",
+		}, []string{"style", "scale"}),
 
 		rendererWorkerReplacements: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_worker_replacements_total",
 			Help: "Worker processes killed and respawned. reason=error counts abnormal dispatch failures; reason=lifetime counts routine recycling after workerLifetime renders.",
-		}, []string{"style", "reason"}),
+		}, []string{"style", "scale", "reason"}),
+
+		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_global_capacity",
+			Help: "Maximum concurrent renders across all (style, scale) pools (RENDERER_POOL_SIZE). Static; set once at renderer init.",
+		}),
+
+		rendererGlobalInFlight: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_global_in_flight",
+			Help: "Active renders holding the global concurrency semaphore. Scrape together with rampardos_renderer_global_capacity for utilisation.",
+		}),
+
+		rendererGlobalAcquireWait: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_global_acquire_wait_seconds",
+			Help:    "Time a dispatch spent waiting for the global concurrency semaphore before even attempting the per-pool acquire. Non-zero percentiles indicate the global cap is the limiting factor, not a specific pool.",
+			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
+		}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
@@ -454,17 +477,35 @@ func (m *MetricsManager) RecordTileDecode(source string, duration float64) {
 	m.tileDecodeDuration.WithLabelValues(source).Observe(duration)
 }
 
-func (m *MetricsManager) RecordRendererViewport(style string, duration float64) {
-	m.rendererViewportDuration.WithLabelValues(style).Observe(duration)
+func (m *MetricsManager) RecordRendererViewport(style, scale string, duration float64) {
+	m.rendererViewportDuration.WithLabelValues(style, scale).Observe(duration)
 }
 
-func (m *MetricsManager) RecordRendererPoolAcquire(style string, waitSeconds float64, idleAfter int) {
-	m.rendererPoolAcquireWait.WithLabelValues(style).Observe(waitSeconds)
-	m.rendererPoolIdleWorkers.WithLabelValues(style).Set(float64(idleAfter))
+func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeconds float64, idleAfter int) {
+	m.rendererPoolAcquireWait.WithLabelValues(style, scale).Observe(waitSeconds)
+	m.rendererPoolIdleWorkers.WithLabelValues(style, scale).Set(float64(idleAfter))
 }
 
-func (m *MetricsManager) RecordRendererWorkerReplacement(style, reason string) {
-	m.rendererWorkerReplacements.WithLabelValues(style, reason).Inc()
+func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
+	m.rendererWorkerReplacements.WithLabelValues(style, scale, reason).Inc()
+}
+
+// SetRendererGlobalCapacity is called once at renderer init to expose
+// the global concurrency cap (RENDERER_POOL_SIZE).
+func (m *MetricsManager) SetRendererGlobalCapacity(capacity int) {
+	m.rendererGlobalCapacity.Set(float64(capacity))
+}
+
+// RecordRendererGlobalAcquire is called once per successful semaphore
+// acquire, passing how long the caller waited. Paired with
+// DecRendererGlobalInFlight on release.
+func (m *MetricsManager) RecordRendererGlobalAcquire(waitSeconds float64) {
+	m.rendererGlobalAcquireWait.Observe(waitSeconds)
+	m.rendererGlobalInFlight.Inc()
+}
+
+func (m *MetricsManager) DecRendererGlobalInFlight() {
+	m.rendererGlobalInFlight.Dec()
 }
 
 func (m *MetricsManager) RecordImageCacheHit(name string) {

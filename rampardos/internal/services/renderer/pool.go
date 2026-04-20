@@ -12,6 +12,7 @@ import (
 // stylePoolConfig configures a single per-style worker pool.
 type stylePoolConfig struct {
 	styleID          string
+	scaleLabel       string // ratio as string ("1", "2") for Prometheus labels
 	poolSize         int
 	workerLifetime   int
 	handshakeTimeout time.Duration
@@ -70,7 +71,7 @@ func (p *stylePool) dispatch(ctx context.Context, requestJSON []byte) ([]byte, e
 	select {
 	case w := <-p.idle:
 		if services.GlobalMetrics != nil {
-			services.GlobalMetrics.RecordRendererPoolAcquire(p.cfg.styleID, time.Since(acquireStart).Seconds(), len(p.idle))
+			services.GlobalMetrics.RecordRendererPoolAcquire(p.cfg.styleID, p.cfg.scaleLabel, time.Since(acquireStart).Seconds(), len(p.idle))
 		}
 		p.mu.Lock()
 		p.lastPID = w.handshake.PID
@@ -94,7 +95,7 @@ func (p *stylePool) dispatch(ctx context.Context, requestJSON []byte) ([]byte, e
 
 		if replace {
 			if services.GlobalMetrics != nil {
-				services.GlobalMetrics.RecordRendererWorkerReplacement(p.cfg.styleID, replaceReason)
+				services.GlobalMetrics.RecordRendererWorkerReplacement(p.cfg.styleID, p.cfg.scaleLabel, replaceReason)
 			}
 			w.kill()
 			// Best-effort spawn replacement; if it fails we still
