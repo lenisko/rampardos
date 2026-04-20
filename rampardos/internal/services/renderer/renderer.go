@@ -81,7 +81,8 @@ type Config struct {
 	NodeBinary     string        // "node" if on PATH; else absolute path
 	WorkerScript   string        // absolute path to render-worker.js
 	WorkerModules  string        // absolute path to node_modules dir the worker should load from. Typically separate from WorkerScript — e.g. the script lives in rampardos/ and node_modules is installed under /app/render-worker/ at Docker build time.
-	PoolSize       int           // concurrent workers per style (default: runtime.GOMAXPROCS(0))
+	PoolSize       int           // global cap on concurrent renders across all pools (default: runtime.GOMAXPROCS(0)). Bounds CPU oversubscription when many (style, scale) pools exist.
+	StylePoolSize  int           // workers per (style, scale) pool (default: PoolSize). Controls memory footprint per pool, not concurrent renders — the global PoolSize semaphore gates that.
 	RenderTimeout  time.Duration // per-request deadline (default: 15s)
 	WorkerLifetime int           // max renders per worker before recycling (default: 500)
 	StartupTimeout time.Duration // max time to wait for a worker handshake (default: 10s)

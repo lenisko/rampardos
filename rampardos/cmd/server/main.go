@@ -97,6 +97,7 @@ func main() {
 		NodeBinary:     cfg.RendererNodeBinary,
 		WorkerScript:   cfg.RendererWorkerScript,
 		PoolSize:       cfg.RendererPoolSize,
+		StylePoolSize:  cfg.RendererStylePoolSize,
 		RenderTimeout:  cfg.RendererRenderTimeout,
 		WorkerLifetime: cfg.RendererWorkerLifetime,
 		StartupTimeout: cfg.RendererStartupTimeout,

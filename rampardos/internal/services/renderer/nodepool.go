@@ -21,6 +21,7 @@ import (
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	"golang.org/x/sync/semaphore"
 )
 
 // rendererPNGBufferPool reuses png.EncoderBuffer across encodes so
@@ -97,11 +98,19 @@ func DefaultSpawnFactory(cfg Config) SpawnFactory {
 }
 
 // NodePoolRenderer is the production Renderer. It maintains one
-// stylePool per configured style, prepares style.json on disk, and
-// encodes raw RGBA output from workers to PNG/JPEG/WebP.
+// stylePool per configured (style, scale) tuple, prepares style.json
+// on disk, and encodes raw RGBA output from workers to PNG/JPEG/WebP.
+//
+// Concurrency is gated at two levels: a global semaphore (cfg.PoolSize)
+// caps the number of renders running simultaneously across all pools
+// — necessary because per-pool worker counts would otherwise multiply
+// by (styles × scales) and oversubscribe CPU. Each pool is still sized
+// by cfg.StylePoolSize to govern memory, but the semaphore is the
+// true concurrency ceiling.
 type NodePoolRenderer struct {
 	cfg          Config
 	spawnFactory SpawnFactory
+	sem          *semaphore.Weighted
 
 	mu    sync.RWMutex
 	pools map[string]*stylePool
@@ -115,6 +124,9 @@ func NewNodePoolRenderer(cfg Config, sf SpawnFactory) (*NodePoolRenderer, error)
 	// Apply defaults.
 	if cfg.PoolSize <= 0 {
 		cfg.PoolSize = runtime.GOMAXPROCS(0)
+	}
+	if cfg.StylePoolSize <= 0 {
+		cfg.StylePoolSize = cfg.PoolSize
 	}
 	if cfg.WorkerLifetime <= 0 {
 		cfg.WorkerLifetime = 500
@@ -134,6 +146,7 @@ func NewNodePoolRenderer(cfg Config, sf SpawnFactory) (*NodePoolRenderer, error)
 	return &NodePoolRenderer{
 		cfg:          cfg,
 		spawnFactory: sf,
+		sem:          semaphore.NewWeighted(int64(cfg.PoolSize)),
 		pools:        make(map[string]*stylePool),
 	}, nil
 }
@@ -166,7 +179,7 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 
 	return newStylePool(stylePoolConfig{
 		styleID:          id,
-		poolSize:         npr.cfg.PoolSize,
+		poolSize:         npr.cfg.StylePoolSize,
 		workerLifetime:   npr.cfg.WorkerLifetime,
 		handshakeTimeout: npr.cfg.StartupTimeout,
 		spawn:            spawn,
@@ -204,6 +217,10 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 	if err != nil {
 		return nil, err
 	}
+	if err := npr.sem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer npr.sem.Release(1)
 	frame := requestFrameForViewport(req)
 	rgba, err := pool.dispatch(ctx, frame)
 	if err != nil {
@@ -239,6 +256,11 @@ func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req Vie
 	if err != nil {
 		return nil, err
 	}
+
+	if err := npr.sem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer npr.sem.Release(1)
 
 	// Send LOGICAL dimensions to the worker. The worker's map was
 	// constructed with ratio=scale, so it produces width*ratio ×
@@ -287,7 +309,7 @@ func (npr *NodePoolRenderer) getOrCreatePool(styleID string, scale uint8) (*styl
 	}
 
 	ratio := int(scale)
-	slog.Info("Creating renderer pool on first use", "style", styleID, "ratio", ratio, "poolSize", npr.cfg.PoolSize)
+	slog.Info("Creating renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", npr.cfg.StylePoolSize, "globalRenderCap", npr.cfg.PoolSize)
 	pool, err := npr.loadPool(styleID, ratio)
 	if err != nil {
 		return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
