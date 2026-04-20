@@ -200,7 +200,7 @@ func main() {
 	statsView := views.NewStatsView(statsController, templateRenderer)
 	datasetsView := views.NewDatasetsView(datasetsController, openFreeMapService, datasetsHandler.GetDownloadManager(), templateRenderer)
 	fontsView := views.NewFontsView(fontsController, templateRenderer)
-	stylesView := views.NewStylesView(stylesController, templateRenderer)
+	stylesView := views.NewStylesView(stylesController, templateRenderer, cfg.PreviewLatitude, cfg.PreviewLongitude)
 	templatesView := views.NewTemplatesView(templatesController, templateRenderer)
 	convertView := views.NewConvertView(templateRenderer)
 
