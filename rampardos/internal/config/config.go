@@ -64,6 +64,12 @@ type Config struct {
 	// render an arbitrary viewport).
 	LocalStylesUseViewport bool
 
+	// Admin styles preview tile centre. Drives the /admin/styles
+	// preview thumbnails; choose a latitude/longitude representative
+	// of the operator's deployment region.
+	PreviewLatitude  float64
+	PreviewLongitude float64
+
 	// Diagnostics
 	PprofEnabled bool // Mount net/http/pprof under /debug/pprof. Off by default — endpoints expose profiling data and pprof.Profile holds a goroutine for 30s per call.
 
@@ -124,6 +130,9 @@ func Load() *Config {
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
 
 		LocalStylesUseViewport: getEnvBool("LOCAL_STYLES_USE_VIEWPORT", true),
+
+		PreviewLatitude:  getEnvFloat("PREVIEW_LATITUDE", 52.5200),
+		PreviewLongitude: getEnvFloat("PREVIEW_LONGITUDE", 13.4050),
 
 		PprofEnabled: getEnvBool("PPROF_ENABLED", false),
 
@@ -200,6 +209,18 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return i
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return f
 }
 
 func getEnvSeconds(key string, defaultValue int) time.Duration {
