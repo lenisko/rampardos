@@ -442,7 +442,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 		Scale:     scale,
 		Format:    staticMap.GetFormat(),
 	})
-	services.GlobalMetrics.RecordRendererViewport(staticMap.Style, time.Since(start).Seconds())
+	services.GlobalMetrics.RecordRendererViewport(staticMap.Style, strconv.Itoa(int(scale)), time.Since(start).Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("renderer viewport: %w", err)
 	}
