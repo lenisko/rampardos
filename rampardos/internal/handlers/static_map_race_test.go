@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lenisko/rampardos/internal/models"
+	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/utils"
 )
 
@@ -96,7 +97,7 @@ func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 	basePath := sm.BasePath()
 	ctx := context.Background()
 
-	if _, err := h.ensureBase(ctx, sm, basePath); err != nil {
+	if _, err := h.ensureBase(ctx, sm, basePath, false); err != nil {
 		t.Fatalf("first ensureBase: %v", err)
 	}
 	if got := renders.Load(); got != 1 {
@@ -110,7 +111,7 @@ func TestEnsureBaseDeletedBetweenCallsDoesNotError(t *testing.T) {
 		t.Fatalf("remove base: %v", err)
 	}
 
-	if _, err := h.ensureBase(ctx, sm, basePath); err != nil {
+	if _, err := h.ensureBase(ctx, sm, basePath, false); err != nil {
 		t.Fatalf("ensureBase after delete: %v", err)
 	}
 	if got := renders.Load(); got != 2 {
@@ -159,14 +160,14 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 	leaderErr := make(chan error, 1)
 	followerErr := make(chan error, 1)
 
-	go func() { _, err := h.GenerateStaticMap(leaderCtx, sm); leaderErr <- err }()
+	go func() { _, err := h.GenerateStaticMap(leaderCtx, sm, false); leaderErr <- err }()
 
 	// Wait for the leader to enter the renderFn so we know it has the
 	// sfg slot. The follower arriving after this is guaranteed to
 	// attach to the same sfg group.
 	<-entered
 
-	go func() { _, err := h.GenerateStaticMap(followerCtx, sm); followerErr <- err }()
+	go func() { _, err := h.GenerateStaticMap(followerCtx, sm, false); followerErr <- err }()
 
 	// Give the follower time to subscribe to the sfg group.
 	time.Sleep(20 * time.Millisecond)
@@ -190,6 +191,62 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 	}
 
 	<-leaderErr
+}
+
+// TestNoCacheForcesFreshRenderButPopulatesLRU locks in the
+// post-poracle-migration nocache semantics: nocache=true bypasses
+// the composite LRU read (forces a fresh render) but still writes
+// the result back so other callers benefit.
+func TestNoCacheForcesFreshRenderButPopulatesLRU(t *testing.T) {
+	prev := services.GlobalCompositeImageCache
+	services.GlobalCompositeImageCache = services.NewCompositeImageCache(16)
+	t.Cleanup(func() { services.GlobalCompositeImageCache = prev })
+
+	var renders atomic.Int32
+	renderFn := func(ctx context.Context, sm models.StaticMap, basePath string) (image.Image, error) {
+		renders.Add(1)
+		img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+		img.Set(0, 0, color.RGBA{A: 255})
+		return img, nil
+	}
+	h, cleanup := raceTestHandler(t, renderFn)
+	defer cleanup()
+
+	sm := raceTestStaticMap()
+	ctx := context.Background()
+
+	// First call: nothing cached, must render.
+	if _, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if got := renders.Load(); got != 1 {
+		t.Fatalf("after first call: want 1 render, got %d", got)
+	}
+
+	// Second call without nocache: must hit the LRU, not render again.
+	if _, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
+		t.Fatalf("cached call: %v", err)
+	}
+	if got := renders.Load(); got != 1 {
+		t.Fatalf("after cached call: LRU miss, want 1 render, got %d", got)
+	}
+
+	// Third call with nocache=true: must re-render despite hot LRU.
+	if _, err := h.GenerateStaticMap(ctx, sm, true); err != nil {
+		t.Fatalf("nocache call: %v", err)
+	}
+	if got := renders.Load(); got != 2 {
+		t.Fatalf("after nocache call: want 2 renders, got %d", got)
+	}
+
+	// Fourth call without nocache: nocache must have populated the LRU,
+	// so this hits cache — no new render.
+	if _, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
+		t.Fatalf("post-nocache cached call: %v", err)
+	}
+	if got := renders.Load(); got != 2 {
+		t.Fatalf("after post-nocache cached call: want 2 renders, got %d", got)
+	}
 }
 
 // TestEnsureBaseSingleflightDedupesSiblings locks in the baseSfg
@@ -244,7 +301,7 @@ func TestEnsureBaseSingleflightDedupesSiblings(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			started <- struct{}{}
-			if _, err := h.ensureBase(ctx, sm, basePath); err != nil {
+			if _, err := h.ensureBase(ctx, sm, basePath, false); err != nil {
 				t.Errorf("ensureBase: %v", err)
 			}
 		}()

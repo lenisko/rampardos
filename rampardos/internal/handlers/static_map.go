@@ -159,16 +159,16 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 // In the bytes-first pipeline nothing is written to disk on this
 // path — persistence and its matching expiry enqueue live
 // exclusively in handlePregenerateResponseBytes, the sole
-// disk-write site. TTL / nocache flags therefore apply only at the
-// pregenerate boundary and are not plumbed through here.
-func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap) (image.Image, error) {
+// disk-write site.
+//
+// nocache=true forces a fresh render by bypassing the composite LRU
+// read; the result is still written back (benefiting other callers)
+// and concurrent siblings still dedupe via singleflight.
+func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, nocache bool) (image.Image, error) {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
-	// LRU always consulted. Weather-alert fan-out hits this path
-	// with identical URLs and the whole point is that N siblings
-	// share the single render via the cache.
-	if services.GlobalCompositeImageCache != nil {
+	if !nocache && services.GlobalCompositeImageCache != nil {
 		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 			return cached, nil
 		}
@@ -180,12 +180,12 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	// is still live. Values (deadlines, trace IDs) still flow through.
 	genCtx := context.WithoutCancel(ctx)
 	v, err, _ := h.sfg.Do(path, func() (any, error) {
-		if services.GlobalCompositeImageCache != nil {
+		if !nocache && services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 				return cached, nil
 			}
 		}
-		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap)
+		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap, nocache)
 		if err != nil {
 			return nil, err
 		}
@@ -226,24 +226,19 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	defer services.GlobalMetrics.DecrementInFlight("staticmap")
 
 	// Cache control:
-	//   nocache=true — skip cache, serve image directly, delete immediately
-	//   ttl=N        — keep file for N seconds then delete (e.g. Telegram)
-	//   pregenerate=true + nocache=true — treated as ttl=30 so the file
-	//     lives long enough for the consumer to fetch via the returned URL
-	skipCache := r.URL.Query().Get("nocache") == "true"
+	//   nocache=true — force a fresh render (bypass composite LRU read)
+	//   ttl=N        — keep the disk file for N seconds (pregenerate only)
+	//   pregenerate=true + nocache=true + no ttl — default ttl to 30s so
+	//     the returned URL lives long enough for the consumer to fetch it
+	nocache := r.URL.Query().Get("nocache") == "true"
 	pregenerate := r.URL.Query().Get("pregenerate") == "true"
 	ttlStr := r.URL.Query().Get("ttl")
 	var ttlSeconds int
 	if ttlStr != "" {
 		ttlSeconds, _ = strconv.Atoi(ttlStr)
 	}
-	if skipCache && pregenerate {
-		// Can't delete immediately if we're returning a filename — the
-		// consumer needs time to fetch it. Convert to a short TTL.
-		skipCache = false
-		if ttlSeconds == 0 {
-			ttlSeconds = 30
-		}
+	if nocache && pregenerate && ttlSeconds == 0 {
+		ttlSeconds = 30
 	}
 
 	// Deduplicate concurrent requests for the same static map via
@@ -253,15 +248,12 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	// render for concurrent followers.
 	genCtx := context.WithoutCancel(r.Context())
 	v, genErr, _ := h.sfg.Do(path, func() (any, error) {
-		// skipCache (from ?nocache=true) governs disk lifetime in the
-		// pregenerate path, not in-memory reuse. Concurrent siblings
-		// always benefit from the LRU.
-		if services.GlobalCompositeImageCache != nil {
+		if !nocache && services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 				return cached, nil
 			}
 		}
-		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap)
+		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap, nocache)
 		if err != nil {
 			return nil, err
 		}
@@ -292,12 +284,10 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 
 	// ttl only has effect if pregenerate=true (handlePregenerateResponseBytes
 	// writes the file + enqueues it); otherwise the response is served
-	// from in-memory bytes with no disk artefact to expire. The
-	// nocache+pregenerate conversion above already folded nocache into
-	// ttlSeconds=30 for the pregenerate case.
+	// from in-memory bytes with no disk artefact to expire.
 	ttl := effectiveTTL(ttlSeconds)
 
-	slog.Debug("Served static map", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds, "nocache", skipCache)
+	slog.Debug("Served static map", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds, "nocache", nocache)
 	h.generateResponse(w, r, staticMap, path, encoded, ttl, basePath)
 }
 
@@ -346,17 +336,19 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 // base-rendering inputs (style/lat/lon/zoom/w/h/scale/bearing/pitch/
 // format) are identical. Base generation reads none of Markers,
 // Polygons, or Circles, so merging the renders is safe.
-func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string) (image.Image, error) {
+func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string, nocache bool) (image.Image, error) {
 	// LRU fast path — covers the cross-request burst-sharing case
-	// that the short-TTL disk cache used to handle.
-	if services.GlobalCompositeImageCache != nil {
+	// that the short-TTL disk cache used to handle. nocache skips
+	// the read to force a fresh render; sfg still dedupes concurrent
+	// siblings and the result is still written back.
+	if !nocache && services.GlobalCompositeImageCache != nil {
 		if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
 			return img, nil
 		}
 	}
 
 	v, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
-		if services.GlobalCompositeImageCache != nil {
+		if !nocache && services.GlobalCompositeImageCache != nil {
 			if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
 				return img, nil
 			}
@@ -376,8 +368,8 @@ func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.Stat
 	return v.(image.Image), nil
 }
 
-func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap) (image.Image, error) {
-	baseImg, err := h.ensureBase(ctx, staticMap, basePath)
+func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap, nocache bool) (image.Image, error) {
+	baseImg, err := h.ensureBase(ctx, staticMap, basePath, nocache)
 	if err != nil {
 		return nil, err
 	}

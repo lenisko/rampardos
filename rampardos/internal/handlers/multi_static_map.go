@@ -123,18 +123,17 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	services.GlobalMetrics.IncrementInFlight("multistaticmap")
 	defer services.GlobalMetrics.DecrementInFlight("multistaticmap")
 
-	skipCache := r.URL.Query().Get("nocache") == "true"
+	nocache := r.URL.Query().Get("nocache") == "true"
 	pregenerate := r.URL.Query().Get("pregenerate") == "true"
 	ttlStr := r.URL.Query().Get("ttl")
 	var ttlSeconds int
 	if ttlStr != "" {
 		ttlSeconds, _ = strconv.Atoi(ttlStr)
 	}
-	if skipCache && pregenerate {
-		skipCache = false
-		if ttlSeconds == 0 {
-			ttlSeconds = 30
-		}
+	if nocache && pregenerate && ttlSeconds == 0 {
+		// nocache+pregenerate: force fresh, but the returned URL still
+		// needs time for the consumer to fetch the file.
+		ttlSeconds = 30
 	}
 
 	// Collect all maps to generate
@@ -152,10 +151,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	// composite render for concurrent followers.
 	genCtx := context.WithoutCancel(r.Context())
 	v, sfErr, _ := h.sfg.Do(path, func() (any, error) {
-		// skipCache (from ?nocache=true) governs disk lifetime in the
-		// pregenerate path, not in-memory reuse — concurrent multi
-		// requests always share the LRU.
-		if services.GlobalCompositeImageCache != nil {
+		if !nocache && services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
 				return cached, nil
 			}
@@ -174,7 +170,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				img, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm)
+				img, err := h.staticMapHandler.GenerateStaticMap(genCtx, sm, nocache)
 				if err != nil {
 					errOnce.Do(func() { genErr = err })
 					return
@@ -218,7 +214,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	services.GlobalMetrics.RecordRequest("multistaticmap", "multi", false, duration)
 
 	ttl := effectiveTTL(ttlSeconds)
-	slog.Debug("Served multi-static map", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds, "nocache", skipCache)
+	slog.Debug("Served multi-static map", "file", filepath.Base(path), "maps", mapCount, "duration", duration, "ttl", ttlSeconds, "nocache", nocache)
 	h.generateResponse(w, r, multiStaticMap, path, encoded, ttl, path)
 }
 
