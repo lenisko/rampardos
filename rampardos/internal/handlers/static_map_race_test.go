@@ -160,14 +160,14 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 	leaderErr := make(chan error, 1)
 	followerErr := make(chan error, 1)
 
-	go func() { _, err := h.GenerateStaticMap(leaderCtx, sm, false); leaderErr <- err }()
+	go func() { _, _, err := h.GenerateStaticMap(leaderCtx, sm, false); leaderErr <- err }()
 
 	// Wait for the leader to enter the renderFn so we know it has the
 	// sfg slot. The follower arriving after this is guaranteed to
 	// attach to the same sfg group.
 	<-entered
 
-	go func() { _, err := h.GenerateStaticMap(followerCtx, sm, false); followerErr <- err }()
+	go func() { _, _, err := h.GenerateStaticMap(followerCtx, sm, false); followerErr <- err }()
 
 	// Give the follower time to subscribe to the sfg group.
 	time.Sleep(20 * time.Millisecond)
@@ -215,34 +215,43 @@ func TestNoCacheForcesFreshRenderButPopulatesLRU(t *testing.T) {
 	sm := raceTestStaticMap()
 	ctx := context.Background()
 
-	// First call: nothing cached, must render.
-	if _, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
+	// First call: nothing cached, must render and report cached=false.
+	if _, cached, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
 		t.Fatalf("first call: %v", err)
+	} else if cached {
+		t.Fatalf("first call: expected cached=false")
 	}
 	if got := renders.Load(); got != 1 {
 		t.Fatalf("after first call: want 1 render, got %d", got)
 	}
 
-	// Second call without nocache: must hit the LRU, not render again.
-	if _, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
+	// Second call without nocache: LRU hit, cached=true, no new render.
+	if _, cached, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
 		t.Fatalf("cached call: %v", err)
+	} else if !cached {
+		t.Fatalf("cached call: expected cached=true")
 	}
 	if got := renders.Load(); got != 1 {
 		t.Fatalf("after cached call: LRU miss, want 1 render, got %d", got)
 	}
 
 	// Third call with nocache=true: must re-render despite hot LRU.
-	if _, err := h.GenerateStaticMap(ctx, sm, true); err != nil {
+	// Reported as cached=false — we did the work.
+	if _, cached, err := h.GenerateStaticMap(ctx, sm, true); err != nil {
 		t.Fatalf("nocache call: %v", err)
+	} else if cached {
+		t.Fatalf("nocache call: expected cached=false")
 	}
 	if got := renders.Load(); got != 2 {
 		t.Fatalf("after nocache call: want 2 renders, got %d", got)
 	}
 
 	// Fourth call without nocache: nocache must have populated the LRU,
-	// so this hits cache — no new render.
-	if _, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
+	// so this hits cache — no new render, cached=true.
+	if _, cached, err := h.GenerateStaticMap(ctx, sm, false); err != nil {
 		t.Fatalf("post-nocache cached call: %v", err)
+	} else if !cached {
+		t.Fatalf("post-nocache cached call: expected cached=true")
 	}
 	if got := renders.Load(); got != 2 {
 		t.Fatalf("after post-nocache cached call: want 2 renders, got %d", got)

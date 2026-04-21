@@ -164,13 +164,19 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 // nocache=true forces a fresh render by bypassing the composite LRU
 // read; the result is still written back (benefiting other callers)
 // and concurrent siblings still dedupe via singleflight.
-func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, nocache bool) (image.Image, error) {
+//
+// Returns the image, a cached flag indicating whether the result
+// came from the composite LRU without re-rendering, and any error.
+// The cached flag is what the handler feeds to RecordRequest and
+// StaticMapServed so dashboard panels that split by cached="true"
+// (cache-hit rate, hit-latency separation) stay populated.
+func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, nocache bool) (image.Image, bool, error) {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
 	if !nocache && services.GlobalCompositeImageCache != nil {
 		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
-			return cached, nil
+			return cached, true, nil
 		}
 	}
 
@@ -178,11 +184,15 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	// runs the callback once for all joiners; if the leader disconnects,
 	// cancelling its ctx would abort generation for every follower that
 	// is still live. Values (deadlines, trace IDs) still flow through.
+	type sfgResult struct {
+		img    image.Image
+		cached bool
+	}
 	genCtx := context.WithoutCancel(ctx)
 	v, err, _ := h.sfg.Do(path, func() (any, error) {
 		if !nocache && services.GlobalCompositeImageCache != nil {
 			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
-				return cached, nil
+				return sfgResult{img: cached, cached: true}, nil
 			}
 		}
 		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap, nocache)
@@ -192,12 +202,13 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 		if services.GlobalCompositeImageCache != nil {
 			services.GlobalCompositeImageCache.Add(path, img)
 		}
-		return img, nil
+		return sfgResult{img: img, cached: false}, nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return v.(image.Image), nil
+	r := v.(sfgResult)
+	return r.img, r.cached, nil
 }
 
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
@@ -241,35 +252,13 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		ttlSeconds = 30
 	}
 
-	// Deduplicate concurrent requests for the same static map via
-	// singleflight. Two poracle webhooks for the same spawn arriving
-	// simultaneously will only generate once. Detach the caller's
-	// cancellation so a leader disconnect does not abort the shared
-	// render for concurrent followers.
-	genCtx := context.WithoutCancel(r.Context())
-	v, genErr, _ := h.sfg.Do(path, func() (any, error) {
-		if !nocache && services.GlobalCompositeImageCache != nil {
-			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
-				return cached, nil
-			}
-		}
-		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap, nocache)
-		if err != nil {
-			return nil, err
-		}
-		if services.GlobalCompositeImageCache != nil {
-			services.GlobalCompositeImageCache.Add(path, img)
-		}
-		return img, nil
-	})
-
+	img, cached, genErr := h.GenerateStaticMap(r.Context(), staticMap, nocache)
 	if genErr != nil {
 		slog.Error("Failed to generate static map", "error", genErr)
 		services.GlobalMetrics.RecordError("staticmap", "generation_failed")
 		http.Error(w, genErr.Error(), http.StatusInternalServerError)
 		return
 	}
-	img := v.(image.Image)
 	encoded, err := utils.EncodeImage(img, filepath.Ext(path))
 	if err != nil {
 		slog.Error("Failed to encode static map", "error", err)
@@ -279,8 +268,12 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	}
 
 	duration := time.Since(startTime).Seconds()
-	h.statsController.StaticMapServed(true, path, staticMap.Style)
-	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
+	// !cached feeds isNew to StatsController, which in turn drives the
+	// cached="true"/false dimension of rampardos_requests_total,
+	// rampardos_cache_hits_total{type="staticmap"}, and the cache-hit
+	// ratio surfaced in /admin/stats.
+	h.statsController.StaticMapServed(!cached, path, staticMap.Style)
+	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, cached, duration)
 
 	// ttl only has effect if pregenerate=true (handlePregenerateResponseBytes
 	// writes the file + enqueues it); otherwise the response is served
