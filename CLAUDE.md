@@ -26,6 +26,16 @@ visible in the code.
 - Worker receives **logical** `width × height` and outputs
   `width*scale × height*scale` actual pixels. `encodeRGBA` must be called
   with the pixel dimensions or the output has the wrong extent.
+- **Viewport zoom convention differs from MapLibre.** Callers send zoom
+  in the 256-tile web-map convention (what poracle, Google, OSM, etc.
+  use). MapLibre Native interprets zoom in the style source's tileSize
+  convention — 512 for vector sources (the default). We subtract
+  `log2(tileSize/256)` from the user's zoom before dispatching, so a
+  512-tileSize style sees `zoom-1` internally. See `styleZoomOffset`.
+  The adjustment is only applied on the viewport path; `TileToViewport`
+  already produces a 512-pixel frame that matches MapLibre's native
+  units for the common 512-tileSize case, so tile rendering is already
+  correct.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.

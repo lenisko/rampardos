@@ -79,3 +79,56 @@ func TestPrepareStyleKeepsHTTPGlyphsUnchanged(t *testing.T) {
 		t.Errorf("http glyphs was rewritten: %q", got)
 	}
 }
+
+func TestStyleZoomOffset(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want float64
+	}{
+		{
+			name: "vector source with default tileSize",
+			body: `{"sources":{"omt":{"type":"vector","url":"mbtiles://x"}}}`,
+			want: 1.0,
+		},
+		{
+			name: "explicit tileSize=256",
+			body: `{"sources":{"s":{"type":"vector","url":"mbtiles://x","tileSize":256}}}`,
+			want: 0.0,
+		},
+		{
+			name: "explicit tileSize=512",
+			body: `{"sources":{"s":{"type":"vector","url":"mbtiles://x","tileSize":512}}}`,
+			want: 1.0,
+		},
+		{
+			name: "explicit tileSize=1024",
+			body: `{"sources":{"s":{"type":"vector","url":"mbtiles://x","tileSize":1024}}}`,
+			want: 2.0,
+		},
+		{
+			name: "raster source defaults to 256",
+			body: `{"sources":{"r":{"type":"raster","tiles":["http://x/{z}/{x}/{y}.png"]}}}`,
+			want: 0.0,
+		},
+		{
+			name: "unparseable style falls back to 512",
+			body: `not json`,
+			want: 1.0,
+		},
+		{
+			name: "no sources falls back to 512",
+			body: `{"version":8,"name":"empty"}`,
+			want: 1.0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := styleZoomOffset([]byte(tc.body))
+			if got != tc.want {
+				t.Errorf("styleZoomOffset(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}

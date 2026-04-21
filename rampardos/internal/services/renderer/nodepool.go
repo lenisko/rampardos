@@ -200,10 +200,12 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 	}
 
 	spawn := npr.spawnFactory(id, preparedPath, ratio)
+	zoomAdj := styleZoomOffset(raw)
 
 	return newStylePool(stylePoolConfig{
 		styleID:          id,
 		scaleLabel:       strconv.Itoa(ratio),
+		viewportZoomAdj:  zoomAdj,
 		poolSize:         npr.cfg.StylePoolSize,
 		workerLifetime:   npr.cfg.WorkerLifetime,
 		handshakeTimeout: npr.cfg.StartupTimeout,
@@ -246,7 +248,15 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 		return nil, err
 	}
 	defer npr.releaseGlobal()
-	frame := requestFrameForViewport(req)
+	// Rewrite the caller's (web-map convention) zoom into the style's
+	// native tileSize convention before handing it to MapLibre. See
+	// styleZoomOffset for the full derivation. Not applied on the
+	// tile-render path — TileToViewport already produces a frame whose
+	// 512-pixel viewport matches MapLibre's native zoom unit for the
+	// common 512-tileSize case.
+	adjusted := req
+	adjusted.Zoom = req.Zoom - pool.cfg.viewportZoomAdj
+	frame := requestFrameForViewport(adjusted)
 	rgba, err := pool.dispatch(ctx, frame)
 	if err != nil {
 		return nil, err

@@ -12,7 +12,8 @@ import (
 // stylePoolConfig configures a single per-style worker pool.
 type stylePoolConfig struct {
 	styleID          string
-	scaleLabel       string // ratio as string ("1", "2") for Prometheus labels
+	scaleLabel       string  // ratio as string ("1", "2") for Prometheus labels
+	viewportZoomAdj  float64 // subtracted from the user's zoom on viewport renders; see styleZoomOffset
 	poolSize         int
 	workerLifetime   int
 	handshakeTimeout time.Duration
