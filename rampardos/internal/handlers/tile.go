@@ -53,30 +53,35 @@ func (h *TileHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	z, err := strconv.Atoi(zStr)
 	if err != nil {
+		services.GlobalMetrics.RecordValidationError("tile", "z")
 		http.Error(w, "Invalid z parameter", http.StatusBadRequest)
 		return
 	}
 
 	x, err := strconv.Atoi(xStr)
 	if err != nil {
+		services.GlobalMetrics.RecordValidationError("tile", "x")
 		http.Error(w, "Invalid x parameter", http.StatusBadRequest)
 		return
 	}
 
 	y, err := strconv.Atoi(yStr)
 	if err != nil {
+		services.GlobalMetrics.RecordValidationError("tile", "y")
 		http.Error(w, "Invalid y parameter", http.StatusBadRequest)
 		return
 	}
 
 	scale, err := strconv.ParseUint(scaleStr, 10, 8)
 	if err != nil || scale < 1 {
+		services.GlobalMetrics.RecordValidationError("tile", "scale")
 		http.Error(w, "Invalid scale parameter", http.StatusBadRequest)
 		return
 	}
 
 	format := models.ImageFormat(formatStr)
 	if !format.IsValid() {
+		services.GlobalMetrics.RecordValidationError("tile", "format")
 		http.Error(w, "Invalid format parameter", http.StatusBadRequest)
 		return
 	}

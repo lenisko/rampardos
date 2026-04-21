@@ -214,17 +214,17 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
 	// Validate required fields
 	if staticMap.Zoom < 1 || staticMap.Zoom > 22 {
-		services.GlobalMetrics.RecordError("staticmap", "invalid_zoom")
+		services.GlobalMetrics.RecordValidationError("staticmap", "zoom")
 		http.Error(w, "Invalid zoom level (must be 1-22)", http.StatusBadRequest)
 		return
 	}
 	if staticMap.Width == 0 || staticMap.Height == 0 {
-		services.GlobalMetrics.RecordError("staticmap", "invalid_dimensions")
+		services.GlobalMetrics.RecordValidationError("staticmap", "dimensions")
 		http.Error(w, "Invalid dimensions", http.StatusBadRequest)
 		return
 	}
 	if staticMap.Style == "" {
-		services.GlobalMetrics.RecordError("staticmap", "missing_style")
+		services.GlobalMetrics.RecordValidationError("staticmap", "style")
 		http.Error(w, "Missing style", http.StatusBadRequest)
 		return
 	}

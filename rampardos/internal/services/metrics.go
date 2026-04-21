@@ -47,11 +47,6 @@ type MetricsManager struct {
 	fileToucherQueueSize prometheus.Gauge
 	fileRemoverQueueSize *prometheus.GaugeVec
 
-	// Task metrics
-	activeTasks    *prometheus.GaugeVec
-	tasksStarted   *prometheus.CounterVec
-	tasksCompleted *prometheus.CounterVec
-
 	// Template metrics
 	templateRendersTotal *prometheus.CounterVec
 
@@ -101,9 +96,6 @@ type MetricsManager struct {
 
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
-
-	// Tileserver metrics
-	tileserverRestarts prometheus.Counter
 }
 
 // Low-cardinality label values used across metric recordings.
@@ -220,21 +212,6 @@ func newMetricsManager() *MetricsManager {
 			Help: "Size of the file remover queue (files pending removal)",
 		}, []string{"folder"}),
 
-		activeTasks: promauto.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "rampardos_active_tasks",
-			Help: "Number of active tasks",
-		}, []string{"type"}),
-
-		tasksStarted: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "rampardos_tasks_started_total",
-			Help: "Total tasks started",
-		}, []string{"type"}),
-
-		tasksCompleted: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "rampardos_tasks_completed_total",
-			Help: "Total tasks completed",
-		}, []string{"type"}),
-
 		templateRendersTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_template_renders_total",
 			Help: "Total template renders",
@@ -309,11 +286,6 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_dataset_size_bytes",
 			Help: "Size of dataset files in bytes",
 		}, []string{"name"}),
-
-		tileserverRestarts: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "rampardos_tileserver_restarts_total",
-			Help: "Total number of tileserver restarts triggered by health check failures",
-		}),
 	}
 
 	// Start runtime metrics updater
@@ -763,22 +735,6 @@ func (m *MetricsManager) GetUptime() time.Duration {
 	return time.Since(m.startTime)
 }
 
-// IncTileserverRestarts increments the tileserver restart counter
-func (m *MetricsManager) IncTileserverRestarts() {
-	m.tileserverRestarts.Inc()
-}
-
-// GetTileserverRestarts returns the total number of tileserver restarts
-func (m *MetricsManager) GetTileserverRestarts() uint64 {
-	var dto prommodel.Metric
-	if err := m.tileserverRestarts.Write(&dto); err != nil {
-		return 0
-	}
-	if dto.GetCounter() != nil {
-		return uint64(dto.GetCounter().GetValue())
-	}
-	return 0
-}
 
 // TemplateRenderStat holds template render statistics
 type TemplateRenderStat struct {
