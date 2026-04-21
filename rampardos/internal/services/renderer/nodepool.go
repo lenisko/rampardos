@@ -256,6 +256,13 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 	// common 512-tileSize case.
 	adjusted := req
 	adjusted.Zoom = req.Zoom - pool.cfg.viewportZoomAdj
+	slog.Debug("renderer viewport dispatch",
+		"style", req.StyleID,
+		"scale", req.Scale,
+		"callerZoom", req.Zoom,
+		"maplibreZoom", adjusted.Zoom,
+		"zoomAdj", pool.cfg.viewportZoomAdj,
+	)
 	frame := requestFrameForViewport(adjusted)
 	rgba, err := pool.dispatch(ctx, frame)
 	if err != nil {
