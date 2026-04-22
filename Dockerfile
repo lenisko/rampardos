@@ -110,6 +110,7 @@ COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
 # Fontnik (build-glyphs for font processing)
 COPY --from=fontnik-build /fontnik /app/fontnik
+RUN ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs
 ENV PATH="/app/fontnik/node_modules/.bin:$PATH"
 
 # Go binary
@@ -137,7 +138,7 @@ COPY rampardos-render-worker/package.json /app/render-worker/package.json
 
 # Create directories
 RUN mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable \
-    TileServer/Fonts TileServer/Styles TileServer/Datasets Templates Markers Temp
+    TileServer/Fonts TileServer/Styles TileServer/Datasets Templates Markers
 
 # Force EGL backend for headless rendering (no X11 display in Docker).
 # Without this, maplibre-native tries GLX and loops on "Failed to open X display".

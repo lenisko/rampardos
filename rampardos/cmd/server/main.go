@@ -88,7 +88,7 @@ func main() {
 	fileToucher.Start()
 
 	statsController := services.NewStatsController(fileToucher)
-	fontsController := services.NewFontsController("TileServer/Fonts", "Temp")
+	fontsController := services.NewFontsController("TileServer/Fonts")
 	stylesController := services.NewStylesController(externalStyles, "TileServer/Styles", fontsController)
 
 	// Initialize the renderer (spawns Node worker pools).
