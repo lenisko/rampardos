@@ -1,6 +1,6 @@
 module github.com/lenisko/rampardos
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/CloudyKit/jet/v6 v6.3.1
@@ -11,6 +11,7 @@ require (
 	github.com/grafana/pyroscope-go v1.2.7
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/image v0.34.0
+	golang.org/x/sync v0.20.0
 )
 
 require (

@@ -1,32 +1,10 @@
 services:
-  tileserver:
-    image: maptiler/tileserver-gl:latest
-    command: -p 8080
-    container_name: tileserver
-    restart: unless-stopped
-    tty: true
-    user: "${PUID:-0}:${PGID:-0}"
-    volumes:
-      - ./TileServer:/data
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 3G
-        reservations:
-          memory: 1G
   rampardos:
-    image: rampardos
+    image: ghcr.io/lenisko/rampardos:latest
     container_name: rampardos
     restart: unless-stopped
     tty: true
     user: "${PUID:-0}:${PGID:-0}"
-    pid: "service:tileserver" # share PID namespace - required to get mbtiles reload working
     volumes:
       - ./Cache:/app/Cache
       - ./Templates:/app/Templates
@@ -35,7 +13,6 @@ services:
     environment:
       PORT: ${PORT:-9000}
       HOSTNAME: ${HOSTNAME:-0.0.0.0}
-      TILE_SERVER_URL: ${TILE_SERVER_URL:-http://tileserver:8080}
       TILE_CACHE_MAX_AGE_MINUTES: ${TILE_CACHE_MAX_AGE_MINUTES:-10080}
       TILE_CACHE_DELAY_SECONDS: ${TILE_CACHE_DELAY_SECONDS:-3600}
       STATIC_CACHE_MAX_AGE_MINUTES: ${STATIC_CACHE_MAX_AGE_MINUTES:-10080}
@@ -44,22 +21,27 @@ services:
       STATIC_MULTI_CACHE_DELAY_SECONDS: ${STATIC_MULTI_CACHE_DELAY_SECONDS:-900}
       MARKER_CACHE_MAX_AGE_MINUTES: ${MARKER_CACHE_MAX_AGE_MINUTES:-1440}
       MARKER_CACHE_DELAY_SECONDS: ${MARKER_CACHE_DELAY_SECONDS:-3600}
-      TEMPLATES_CACHE_DELAY_SECONDS: ${TEMPLATES_CACHE_DELAY_SECONDS:-60}
       PREVIEW_LATITUDE: ${PREVIEW_LATITUDE:-51.5165753}
       PREVIEW_LONGITUDE: ${PREVIEW_LONGITUDE:--0.1543177}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       PYROSCOPE_SERVER_ADDRESS: ${PYROSCOPE_SERVER_ADDRESS:-}
-      PYROSCOPE_APPLICATION_NAME: ${PYROSCOPE_APPLICATION_NAME:-tileserver-cache}
+      PYROSCOPE_APPLICATION_NAME: ${PYROSCOPE_APPLICATION_NAME:-rampardos}
       PYROSCOPE_API_KEY: ${PYROSCOPE_API_KEY:-}
       PYROSCOPE_BASIC_AUTH_USER: ${PYROSCOPE_BASIC_AUTH_USER:-}
       PYROSCOPE_BASIC_AUTH_PASSWORD: ${PYROSCOPE_BASIC_AUTH_PASSWORD:-}
       PYROSCOPE_MUTEX_PROFILE_FRACTION: ${PYROSCOPE_MUTEX_PROFILE_FRACTION:-5}
       PYROSCOPE_BLOCK_PROFILE_RATE: ${PYROSCOPE_BLOCK_PROFILE_RATE:-5}
       PYROSCOPE_LOGGER: ${PYROSCOPE_LOGGER:-false}
-      TILESERVER_MONITOR_ENABLED: ${TILESERVER_MONITOR_ENABLED:-true}
-      TILESERVER_MONITOR_INTERVAL_SECONDS: ${TILESERVER_MONITOR_INTERVAL_SECONDS:-15}
-      TILESERVER_MONITOR_TIMEOUT_SECONDS: ${TILESERVER_MONITOR_TIMEOUT_SECONDS:-10}
-      TILESERVER_MONITOR_THRESHOLD: ${TILESERVER_MONITOR_THRESHOLD:-3}
+      RENDERER_POOL_SIZE: ${RENDERER_POOL_SIZE:-4}
+      STYLE_POOL_SIZE: ${STYLE_POOL_SIZE:-}
+      RENDERER_TIMEOUT_SECONDS: ${RENDERER_TIMEOUT_SECONDS:-15}
+      RENDERER_WORKER_LIFETIME: ${RENDERER_WORKER_LIFETIME:-500}
     ports:
       - ${PORT:-9000}:9000
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          memory: 1G

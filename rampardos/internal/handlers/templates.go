@@ -55,7 +55,7 @@ type SaveTestDataRequest struct {
 func (h *TemplatesHandler) Preview(w http.ResponseWriter, r *http.Request) {
 	var req PreviewRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		services.GlobalMetrics.RecordError("template_preview", "invalid_json")
+		services.GlobalMetrics.RecordTemplateError("preview", "invalid_json")
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -64,7 +64,7 @@ func (h *TemplatesHandler) Preview(w http.ResponseWriter, r *http.Request) {
 	content, err := services.GlobalJetRenderer.RenderString(req.Template, req.Context)
 	if err != nil {
 		slog.Error("Failed to render template", "error", err)
-		services.GlobalMetrics.RecordError("template_preview", "render_failed")
+		services.GlobalMetrics.RecordTemplateError("preview", "render_failed")
 		http.Error(w, fmt.Sprintf("Template rendering error: %s", err.Error()), http.StatusBadRequest)
 		return
 	}
@@ -89,7 +89,7 @@ func (h *TemplatesHandler) Preview(w http.ResponseWriter, r *http.Request) {
 	case "StaticMap":
 		var staticMap models.StaticMap
 		if err := json.NewDecoder(bytes.NewReader([]byte(content))).Decode(&staticMap); err != nil {
-			services.GlobalMetrics.RecordError("template_preview", "decode_staticmap_failed")
+			services.GlobalMetrics.RecordTemplateError("preview", "decode_staticmap_failed")
 			http.Error(w, fmt.Sprintf("Invalid Template: %s", err.Error()), http.StatusBadRequest)
 			return
 		}
@@ -98,14 +98,14 @@ func (h *TemplatesHandler) Preview(w http.ResponseWriter, r *http.Request) {
 		var multiStaticMap models.MultiStaticMap
 		if err := json.NewDecoder(bytes.NewReader([]byte(content))).Decode(&multiStaticMap); err != nil {
 			slog.Error("Failed to decode MultiStaticMap", "error", err, "content_preview", content[:min(500, len(content))])
-			services.GlobalMetrics.RecordError("template_preview", "decode_multistaticmap_failed")
+			services.GlobalMetrics.RecordTemplateError("preview", "decode_multistaticmap_failed")
 			http.Error(w, fmt.Sprintf("Invalid Template: %s", err.Error()), http.StatusBadRequest)
 			return
 		}
 		slog.Debug("Decoded MultiStaticMap", "grid_count", len(multiStaticMap.Grid))
 		h.multiStaticMapHandler.HandleRequest(w, r, multiStaticMap)
 	default:
-		services.GlobalMetrics.RecordError("template_preview", "invalid_mode")
+		services.GlobalMetrics.RecordTemplateError("preview", "invalid_mode")
 		http.Error(w, "Invalid mode", http.StatusBadRequest)
 	}
 }

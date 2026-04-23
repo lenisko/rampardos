@@ -47,23 +47,81 @@ type MetricsManager struct {
 	fileToucherQueueSize prometheus.Gauge
 	fileRemoverQueueSize *prometheus.GaugeVec
 
-	// Task metrics
-	activeTasks    *prometheus.GaugeVec
-	tasksStarted   *prometheus.CounterVec
-	tasksCompleted *prometheus.CounterVec
-
 	// Template metrics
 	templateRendersTotal *prometheus.CounterVec
 
 	// Cache size metrics
 	cacheSizeBytes *prometheus.GaugeVec
 
+	// In-memory image cache metrics (marker LRU, tile LRU). Distinct
+	// from the on-disk {cache_hits,misses}_total{type=...} counters:
+	// these measure whether a decoded image was reused from memory.
+	imageCacheHits   *prometheus.CounterVec
+	imageCacheMisses *prometheus.CounterVec
+
+	// Tile generation time split by source: disk cache hit, local
+	// render via maplibre-native, or external download. Covers every
+	// GenerateTile call including internal ones from the static-map
+	// stitcher (which bypass the /tile HTTP handler and therefore
+	// don't land in rampardos_request_duration_seconds{type="tile"}).
+	tileGenerateDuration *prometheus.HistogramVec
+
+	// Tile decode time split by source: RAM LRU hit (memcpy + lock)
+	// vs disk read + image.Decode. Measures the step between
+	// "tile bytes are available" and "decoded *image.NRGBA in hand"
+	// so we can see whether further format work (alternate on-disk
+	// encoding) would meaningfully reduce per-stitch CPU.
+	tileDecodeDuration *prometheus.HistogramVec
+
+	// Viewport render time for the arbitrary-size maplibre-native
+	// path. Covers fractional-zoom staticmaps and the
+	// LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass; distinct from
+	// tile_generate_duration which only times per-tile work.
+	rendererViewportDuration *prometheus.HistogramVec
+
+	// Renderer pool saturation tripwires. With LOCAL_STYLES_USE_VIEWPORT
+	// every local staticmap base is a live renderer call — there is no
+	// disk-cache buffer — so visibility into whether the Node workers
+	// are the bottleneck matters.
+	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker in (style, scale) pool
+	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
+	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
+
+	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
+	// concurrent renders across all pools; complements the per-pool
+	// saturation metrics above.
+	rendererGlobalCapacity    prometheus.Gauge
+	rendererGlobalInFlight    prometheus.Gauge
+	rendererGlobalAcquireWait prometheus.Histogram
+
+	// Renderer child-process resource usage. Node workers are outside
+	// Go's heap, so rampardos_memory_rss_bytes alone can't reveal a
+	// Node-side leak. Sum and count are sampled from /proc on Linux.
+	nodeWorkersTotal    prometheus.Gauge
+	nodeWorkersRSSBytes prometheus.Gauge
+
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
-
-	// Tileserver metrics
-	tileserverRestarts prometheus.Counter
 }
+
+// Low-cardinality label values used across metric recordings.
+// Keeping them as constants prevents typos silently splitting a
+// counter into multiple dimensions.
+const (
+	TileSourceCache    = "cache"
+	TileSourceLocal    = "local"
+	TileSourceExternal = "external"
+
+	ImageCacheTile      = "tile"
+	ImageCacheMarker    = "marker"
+	ImageCacheComposite = "composite"
+
+	TileDecodeSourceRAMLRU = "ram_lru"
+	TileDecodeSourceDisk   = "disk"
+
+	WorkerReplacementError    = "error"
+	WorkerReplacementLifetime = "lifetime"
+)
 
 var (
 	GlobalMetrics *MetricsManager
@@ -107,7 +165,7 @@ func newMetricsManager() *MetricsManager {
 			Name:    "rampardos_request_duration_seconds",
 			Help:    "Request duration in seconds",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0},
-		}, []string{"type", "cached"}),
+		}, []string{"type", "style", "cached"}),
 
 		requestsInFlight: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_requests_in_flight",
@@ -160,21 +218,6 @@ func newMetricsManager() *MetricsManager {
 			Help: "Size of the file remover queue (files pending removal)",
 		}, []string{"folder"}),
 
-		activeTasks: promauto.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "rampardos_active_tasks",
-			Help: "Number of active tasks",
-		}, []string{"type"}),
-
-		tasksStarted: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "rampardos_tasks_started_total",
-			Help: "Total tasks started",
-		}, []string{"type"}),
-
-		tasksCompleted: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "rampardos_tasks_completed_total",
-			Help: "Total tasks completed",
-		}, []string{"type"}),
-
 		templateRendersTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_template_renders_total",
 			Help: "Total template renders",
@@ -185,15 +228,80 @@ func newMetricsManager() *MetricsManager {
 			Help: "Size of cache directories in bytes",
 		}, []string{"folder"}),
 
+		imageCacheHits: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_image_cache_hits_total",
+			Help: "Hits on the in-memory decoded-image LRUs. cache=tile covers the base-map stitch path; cache=marker covers resized marker overlays.",
+		}, []string{"cache"}),
+
+		imageCacheMisses: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_image_cache_misses_total",
+			Help: "Misses on the in-memory decoded-image LRUs. A miss forces a file read + image.Decode.",
+		}, []string{"cache"}),
+
+		tileGenerateDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_tile_generate_duration_seconds",
+			Help:    "Time spent producing a tile. source=cache is a disk hit; source=local is a maplibre-native render; source=external is an upstream download. Includes stitcher-initiated calls that skip the /tile HTTP handler.",
+			Buckets: []float64{0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+		}, []string{"style", "source"}),
+
+		tileDecodeDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_tile_decode_duration_seconds",
+			Help:    "Time to produce a decoded *image.NRGBA for a tile. source=ram_lru is a memory cache hit (lock + memcpy); source=disk is a file read + image.Decode on miss.",
+			Buckets: []float64{0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"source"}),
+
+		rendererViewportDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_viewport_duration_seconds",
+			Help:    "Time spent inside renderer.RenderViewport, covering fractional-zoom bases and the LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass. Includes maplibre-native render + encode + IPC; excludes the caller's disk write.",
+			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+		}, []string{"style", "scale"}),
+
+		rendererPoolAcquireWait: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pool_acquire_wait_seconds",
+			Help:    "Time a dispatch call spent waiting for an idle worker in its (style, scale) pool. Sustained high percentiles indicate the pool is saturated; under healthy load this should be dominated by the sub-ms bucket.",
+			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
+		}, []string{"style", "scale"}),
+
+		rendererPoolIdleWorkers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_pool_idle_workers",
+			Help: "Idle workers snapshotted at the moment a dispatch acquires one from the (style, scale) pool. 0 means the pool was fully busy when this dispatch entered.",
+		}, []string{"style", "scale"}),
+
+		rendererWorkerReplacements: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_worker_replacements_total",
+			Help: "Worker processes killed and respawned. reason=error counts abnormal dispatch failures; reason=lifetime counts routine recycling after workerLifetime renders.",
+		}, []string{"style", "scale", "reason"}),
+
+		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_global_capacity",
+			Help: "Maximum concurrent renders across all (style, scale) pools (RENDERER_POOL_SIZE). Static; set once at renderer init.",
+		}),
+
+		rendererGlobalInFlight: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_global_in_flight",
+			Help: "Active renders holding the global concurrency semaphore. Scrape together with rampardos_renderer_global_capacity for utilisation.",
+		}),
+
+		rendererGlobalAcquireWait: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_global_acquire_wait_seconds",
+			Help:    "Time a dispatch spent waiting for the global concurrency semaphore before even attempting the per-pool acquire. Non-zero percentiles indicate the global cap is the limiting factor, not a specific pool.",
+			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
+		}),
+
+		nodeWorkersTotal: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_node_workers_total",
+			Help: "Count of child Node render-worker processes (ppid == rampardos && comm == node). A climbing count with stable traffic means worker rotation is broken.",
+		}),
+
+		nodeWorkersRSSBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_node_workers_rss_bytes",
+			Help: "Summed Resident Set Size of child Node render-worker processes, in bytes. Outside Go's heap — complements rampardos_memory_rss_bytes. Sampled from /proc on Linux.",
+		}),
+
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
 			Help: "Size of dataset files in bytes",
 		}, []string{"name"}),
-
-		tileserverRestarts: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "rampardos_tileserver_restarts_total",
-			Help: "Total number of tileserver restarts triggered by health check failures",
-		}),
 	}
 
 	// Start runtime metrics updater
@@ -207,6 +315,7 @@ func newMetricsManager() *MetricsManager {
 
 func (m *MetricsManager) updateRuntimeMetrics() {
 	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
 	for range ticker.C {
 		m.uptimeSeconds.Set(time.Since(m.startTime).Seconds())
 
@@ -220,6 +329,11 @@ func (m *MetricsManager) updateRuntimeMetrics() {
 			runtime.ReadMemStats(&memStats)
 			m.memoryRSSBytes.Set(float64(memStats.Alloc))
 			m.memoryVSSBytes.Set(float64(memStats.Sys))
+		}
+
+		if sample, ok := sampleNodeWorkers(); ok {
+			m.nodeWorkersTotal.Set(float64(sample.count))
+			m.nodeWorkersRSSBytes.Set(float64(sample.rssBytes))
 		}
 	}
 }
@@ -293,6 +407,83 @@ func readVSSFromStatus() uint64 {
 	return 0
 }
 
+// nodeWorkerSample aggregates the render-worker subprocess footprint.
+type nodeWorkerSample struct {
+	count    int
+	rssBytes uint64
+}
+
+// sampleNodeWorkers walks /proc and sums RSS / counts child Node render
+// workers (ppid == our pid, comm == "node"). Linux-only; returns ok=false
+// when /proc isn't available. Sampling cost is proportional to the total
+// process count in the container — trivial for our single-service image.
+func sampleNodeWorkers() (nodeWorkerSample, bool) {
+	selfPID := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nodeWorkerSample{}, false
+	}
+	var out nodeWorkerSample
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		if addNodeWorkerIfMatch(&out, entry.Name(), selfPID) {
+			continue
+		}
+	}
+	return out, true
+}
+
+// addNodeWorkerIfMatch parses /proc/<pid>/status once; if the process is a
+// child node worker of ours, its RSS is added to out. Returns true when the
+// entry was our worker (caller uses this only as a "counted" hint).
+func addNodeWorkerIfMatch(out *nodeWorkerSample, pidDir string, selfPID int) bool {
+	f, err := os.Open("/proc/" + pidDir + "/status")
+	if err != nil {
+		// Process exited between ReadDir and Open — benign.
+		return false
+	}
+	defer f.Close()
+
+	var (
+		name    string
+		ppid    int
+		vmRSS   uint64
+		haveRSS bool
+	)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "Name:"):
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				name = fields[1]
+			}
+		case strings.HasPrefix(line, "PPid:"):
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				ppid, _ = strconv.Atoi(fields[1])
+			}
+		case strings.HasPrefix(line, "VmRSS:"):
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+					vmRSS = v * 1024
+					haveRSS = true
+				}
+			}
+		}
+	}
+	if name != "node" || ppid != selfPID || !haveRSS {
+		return false
+	}
+	out.count++
+	out.rssBytes += vmRSS
+	return true
+}
+
 // RecordRequest records a request with type, cache status, and duration
 func (m *MetricsManager) RecordRequest(reqType, style string, cached bool, duration float64) {
 	cachedStr := "false"
@@ -308,7 +499,7 @@ func (m *MetricsManager) RecordRequest(reqType, style string, cached bool, durat
 		m.cacheMissTotal.WithLabelValues(reqType).Inc()
 	}
 
-	m.requestDuration.WithLabelValues(reqType, cachedStr).Observe(duration)
+	m.requestDuration.WithLabelValues(reqType, style, cachedStr).Observe(duration)
 }
 
 // IncrementInFlight increments the in-flight counter for a request type
@@ -347,6 +538,53 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 	} else {
 		m.cacheMissTotal.WithLabelValues("staticmap").Inc()
 	}
+}
+
+func (m *MetricsManager) RecordTileGenerate(style, source string, duration float64) {
+	m.tileGenerateDuration.WithLabelValues(style, source).Observe(duration)
+}
+
+func (m *MetricsManager) RecordTileDecode(source string, duration float64) {
+	m.tileDecodeDuration.WithLabelValues(source).Observe(duration)
+}
+
+func (m *MetricsManager) RecordRendererViewport(style, scale string, duration float64) {
+	m.rendererViewportDuration.WithLabelValues(style, scale).Observe(duration)
+}
+
+func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeconds float64, idleAfter int) {
+	m.rendererPoolAcquireWait.WithLabelValues(style, scale).Observe(waitSeconds)
+	m.rendererPoolIdleWorkers.WithLabelValues(style, scale).Set(float64(idleAfter))
+}
+
+func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
+	m.rendererWorkerReplacements.WithLabelValues(style, scale, reason).Inc()
+}
+
+// SetRendererGlobalCapacity is called once at renderer init to expose
+// the global concurrency cap (RENDERER_POOL_SIZE).
+func (m *MetricsManager) SetRendererGlobalCapacity(capacity int) {
+	m.rendererGlobalCapacity.Set(float64(capacity))
+}
+
+// RecordRendererGlobalAcquire is called once per successful semaphore
+// acquire, passing how long the caller waited. Paired with
+// DecRendererGlobalInFlight on release.
+func (m *MetricsManager) RecordRendererGlobalAcquire(waitSeconds float64) {
+	m.rendererGlobalAcquireWait.Observe(waitSeconds)
+	m.rendererGlobalInFlight.Inc()
+}
+
+func (m *MetricsManager) DecRendererGlobalInFlight() {
+	m.rendererGlobalInFlight.Dec()
+}
+
+func (m *MetricsManager) RecordImageCacheHit(name string) {
+	m.imageCacheHits.WithLabelValues(name).Inc()
+}
+
+func (m *MetricsManager) RecordImageCacheMiss(name string) {
+	m.imageCacheMisses.WithLabelValues(name).Inc()
 }
 
 // RecordMarkerRequest records a marker request
@@ -425,6 +663,7 @@ func (m *MetricsManager) GetDailyErrorsByCategory() DailyErrorsByCategory {
 // cleanupOldDailyErrors removes daily error entries older than 14 days
 func (m *MetricsManager) cleanupOldDailyErrors() {
 	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
 	for range ticker.C {
 		cutoff := time.Now().AddDate(0, 0, -14).Format("2006-01-02")
 		m.dailyErrorsMu.Lock()
@@ -596,22 +835,6 @@ func (m *MetricsManager) GetUptime() time.Duration {
 	return time.Since(m.startTime)
 }
 
-// IncTileserverRestarts increments the tileserver restart counter
-func (m *MetricsManager) IncTileserverRestarts() {
-	m.tileserverRestarts.Inc()
-}
-
-// GetTileserverRestarts returns the total number of tileserver restarts
-func (m *MetricsManager) GetTileserverRestarts() uint64 {
-	var dto prommodel.Metric
-	if err := m.tileserverRestarts.Write(&dto); err != nil {
-		return 0
-	}
-	if dto.GetCounter() != nil {
-		return uint64(dto.GetCounter().GetValue())
-	}
-	return 0
-}
 
 // TemplateRenderStat holds template render statistics
 type TemplateRenderStat struct {

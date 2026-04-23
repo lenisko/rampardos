@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
-	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -21,6 +26,7 @@ import (
 	custommw "github.com/lenisko/rampardos/internal/middleware"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 	"github.com/lenisko/rampardos/internal/static"
 )
 
@@ -29,13 +35,10 @@ func main() {
 	cfg := config.Load()
 
 	// Initialize runtime settings (includes logging setup)
-	services.InitGlobalRuntimeSettings(false)
-	if cfg.TileServerURL == "" {
-		slog.Error("TILE_SERVER_URL environment not set. Exiting...")
-		os.Exit(1)
-	}
+	debugMode := os.Getenv("DEBUG") == "true"
+	services.InitGlobalRuntimeSettings(debugMode)
 
-	slog.Info("Configuration loaded", "timeout", cfg.RequestTimeout, "debug", false)
+	slog.Info("Configuration loaded", "timeout", cfg.RequestTimeout, "debug", debugMode)
 
 	// Initialize Pyroscope profiling if configured
 	services.InitPyroscope(cfg)
@@ -85,24 +88,62 @@ func main() {
 	fileToucher.Start()
 
 	statsController := services.NewStatsController(fileToucher)
-	fontsController := services.NewFontsController("TileServer/Fonts", "Temp")
-	stylesController := services.NewStylesController(cfg.TileServerURL, externalStyles, "TileServer/Styles", fontsController)
+	fontsController := services.NewFontsController("TileServer/Fonts")
+	stylesController := services.NewStylesController(externalStyles, "TileServer/Styles", fontsController)
 
-	// Create tileserver reload function (sends SIGHUP to docker container)
-	var reloadTileserver func() error
-	if cfg.TileServerContainer != "" {
-		containerName := cfg.TileServerContainer
-		reloadTileserver = func() error {
-			cmd := exec.Command("docker", "kill", "-s", "HUP", containerName)
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("docker kill failed: %s - %w", string(output), err)
-			}
-			return nil
+	// Initialize the renderer (spawns Node worker pools).
+	rendererCfg := renderer.Config{
+		Backend:        cfg.RendererBackend,
+		NodeBinary:     cfg.RendererNodeBinary,
+		WorkerScript:   cfg.RendererWorkerScript,
+		PoolSize:       cfg.RendererPoolSize,
+		StylePoolSize:  cfg.RendererStylePoolSize,
+		RenderTimeout:  cfg.RendererRenderTimeout,
+		WorkerLifetime: cfg.RendererWorkerLifetime,
+		StartupTimeout: cfg.RendererStartupTimeout,
+		StylesDir:      absPath("TileServer/Styles"),
+		FontsDir:       absPath("TileServer/Fonts"),
+		MbtilesFile:    absPath("TileServer/Datasets/Combined.mbtiles"),
+		// DiscoverStyles re-scans the disk each time it's called, so
+		// new style directories added after startup are picked up on
+		// ReloadStyles (admin "Reload Styles" button or dataset change).
+		DiscoverStyles: func() ([]string, error) {
+			return stylesController.GetLocalStyleIDs()
+		},
+	}
+	localStyleIDs, _ := rendererCfg.DiscoverStyles()
+	renderEngine, err := renderer.NewNodePoolRenderer(rendererCfg, renderer.DefaultSpawnFactory(rendererCfg))
+	if err != nil {
+		slog.Error("Failed to initialise renderer", "error", err)
+		os.Exit(1)
+	}
+	defer renderEngine.Close()
+
+	// Canary render: ensures the pool is live before we bind HTTP port.
+	if len(localStyleIDs) > 0 {
+		canaryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := renderEngine.Render(canaryCtx, renderer.Request{
+			StyleID: localStyleIDs[0],
+			Z: 0, X: 0, Y: 0,
+			Scale:  1,
+			Format: models.ImageFormatPNG,
+		}); err != nil {
+			slog.Error("Startup canary render failed", "error", err)
+			os.Exit(1)
 		}
-		slog.Info("Tileserver reload enabled", "container", cfg.TileServerContainer)
+		slog.Info("Renderer canary passed", "style", localStyleIDs[0])
 	}
 
+	// Dataset reload callback: rebuild pools and drop the tile cache.
+	reloadTileserver := func() error {
+		reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
+			return fmt.Errorf("renderer reload: %w", err)
+		}
+		return nil
+	}
 	datasetsController := services.NewDatasetsController("TileServer/Datasets", reloadTileserver)
 	templatesController := services.NewTemplatesController("Templates")
 
@@ -118,30 +159,31 @@ func main() {
 		services.GlobalCacheIndex.SetMarkerImageCacheSize(cfg.MarkerImageCacheSize)
 	}
 
+	// Skip the PNG decode on every base-map stitch — pprof showed
+	// image.Decode at 54% of CPU before this cache existed.
+	services.InitGlobalTileImageCache(cfg.TileImageCacheSize)
+
+	// Cross-request burst-sharing cache for base renders and final
+	// staticmap outputs. Replaces the short-TTL disk cache for the
+	// non-pregenerate hot path.
+	services.InitGlobalCompositeImageCache(cfg.CompositeImageCacheSize)
+
 	// Initialize image settings
 	services.InitImageSettings(cfg)
+
+	// Initialize expiry queue for TTL-based file cleanup
+	services.InitExpiryQueue(30 * time.Second)
 
 	// Initialize cache cleaners
 	initCacheCleaners(cfg)
 
-	// Initialize tileserver health monitor
-	if cfg.TileServerMonitorEnabled {
-		monitor := services.NewTileserverMonitor(
-			cfg.TileServerURL,
-			cfg.TileServerMonitorInterval,
-			cfg.TileServerMonitorTimeout,
-			cfg.TileServerMonitorThreshold,
-		)
-		monitor.Start()
-	}
-
 	// Initialize handlers
-	tileHandler := handlers.NewTileHandler(cfg.TileServerURL, statsController, stylesController)
-	staticMapHandler := handlers.NewStaticMapHandler(cfg.TileServerURL, tileHandler, statsController, stylesController)
+	tileHandler := handlers.NewTileHandler(renderEngine, statsController, stylesController)
+	staticMapHandler := handlers.NewStaticMapHandler(renderEngine, tileHandler, statsController, stylesController, cfg.LocalStylesUseViewport)
 	multiStaticMapHandler := handlers.NewMultiStaticMapHandler(staticMapHandler, statsController)
 	stylesHandler := handlers.NewStylesHandler(stylesController)
 	fontsHandler := handlers.NewFontsHandler(fontsController)
-	datasetsHandler := handlers.NewDatasetsHandler(datasetsController)
+	datasetsHandler := handlers.NewDatasetsHandler(datasetsController, renderEngine)
 	templatesHandler := handlers.NewTemplatesHandler(templatesController, staticMapHandler, multiStaticMapHandler)
 
 	// Initialize template renderer (uses embedded templates)
@@ -158,7 +200,7 @@ func main() {
 	statsView := views.NewStatsView(statsController, templateRenderer)
 	datasetsView := views.NewDatasetsView(datasetsController, openFreeMapService, datasetsHandler.GetDownloadManager(), templateRenderer)
 	fontsView := views.NewFontsView(fontsController, templateRenderer)
-	stylesView := views.NewStylesView(stylesController, templateRenderer)
+	stylesView := views.NewStylesView(stylesController, templateRenderer, cfg.PreviewLatitude, cfg.PreviewLongitude)
 	templatesView := views.NewTemplatesView(templatesController, templateRenderer)
 	convertView := views.NewConvertView(templateRenderer)
 
@@ -172,9 +214,9 @@ func main() {
 	r := chi.NewRouter()
 
 	// Middleware
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
+	r.Use(custommw.RequestLogger())
+	r.Use(middleware.Recoverer)
 	r.Use(custommw.Timeout(cfg.RequestTimeout))
 	r.Use(custommw.DebugRequestBody())
 
@@ -196,6 +238,30 @@ func main() {
 
 	// Metrics endpoint
 	r.Handle("/metrics", promhttp.Handler())
+
+	// pprof endpoints for live profiling, gated by PPROF_ENABLED because
+	// these expose internal state and pprof.Profile ties up a goroutine
+	// for 30s per call. Sub-profiles (heap, goroutine, allocs, block,
+	// mutex, threadcreate) are routed through pprof.Index.
+	//
+	// The pprof routes detach the caller's request deadline — pprof.Profile
+	// and pprof.Trace honour `?seconds=N` up to arbitrary durations, but
+	// the global custommw.Timeout(cfg.RequestTimeout) above cancels
+	// r.Context() at REQUEST_TIMEOUT (default 10s) and would cut a
+	// 60-second profile short without any error surfaced to the client.
+	if cfg.PprofEnabled {
+		slog.Warn("pprof endpoints enabled", "path", "/debug/pprof")
+		r.Route("/debug/pprof", func(r chi.Router) {
+			r.Use(detachRequestTimeout)
+			r.Get("/", pprof.Index)
+			r.Get("/cmdline", pprof.Cmdline)
+			r.Get("/profile", pprof.Profile)
+			r.Get("/symbol", pprof.Symbol)
+			r.Post("/symbol", pprof.Symbol)
+			r.Get("/trace", pprof.Trace)
+			r.Get("/{name}", pprof.Index)
+		})
+	}
 
 	// Admin routes (protected by Basic Auth)
 	r.Route("/admin", func(r chi.Router) {
@@ -286,6 +352,32 @@ func main() {
 		http.Redirect(w, req, "/admin/stats", http.StatusFound)
 	})
 
+	// Handle SIGHUP for graceful reload (templates, renderer pools, tile cache).
+	// Triggered via: docker kill -s HUP <container> or kill -HUP <pid>
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			slog.Info("SIGHUP received, reloading...")
+
+			// Reload templates from disk
+			if err := services.GlobalJetRenderer.LoadTemplatesFromDisk(); err != nil {
+				slog.Error("Failed to reload templates", "error", err)
+			} else {
+				slog.Info("Templates reloaded")
+			}
+
+			// Reload renderer pools (picks up new styles, refreshes mbtiles)
+			reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
+				slog.Error("Failed to reload renderer", "error", err)
+			} else {
+				slog.Info("Renderer pools reloaded")
+			}
+			cancel()
+		}
+	}()
+
 	// Start server
 	addr := cfg.Hostname + ":" + cfg.Port
 	slog.Info("Starting server", "address", addr)
@@ -325,4 +417,28 @@ func initCacheCleaners(cfg *config.Config) {
 		cleaner := services.NewCacheCleaner("Cache/Regeneratable", cfg.RegenCacheMaxAge, cfg.RegenCacheDelay, cfg.RegenCacheDropAfter)
 		cleaner.Start()
 	}
+}
+
+// absPath converts a relative path to absolute based on the process's
+// working directory. The renderer passes these paths to Node worker
+// subprocesses via CLI args and style.json rewriting, so they must be
+// absolute — relative paths would break if the worker's cwd differs.
+func absPath(rel string) string {
+	abs, err := filepath.Abs(rel)
+	if err != nil {
+		return rel // best-effort fallback
+	}
+	return abs
+}
+
+// detachRequestTimeout strips the upstream deadline and cancellation
+// set by custommw.Timeout so handlers that legitimately sample for
+// arbitrary durations (pprof.Profile, pprof.Trace) can honour their
+// own `?seconds=N` parameter instead of being cut short at
+// REQUEST_TIMEOUT. context.WithoutCancel preserves values (trace
+// IDs, auth), only detaching the cancel/deadline chain.
+func detachRequestTimeout(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithoutCancel(r.Context())))
+	})
 }

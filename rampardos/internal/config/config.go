@@ -8,16 +8,23 @@ import (
 
 // Config holds application configuration
 type Config struct {
-	TileServerURL  string
 	Port           string
 	Hostname       string
 	RequestTimeout time.Duration
 
+	// Renderer settings
+	RendererBackend        string        // "node-pool"
+	RendererNodeBinary     string        // path to node
+	RendererWorkerScript   string        // path to render-worker.js
+	RendererPoolSize       int           // global cap on concurrent renders (semaphore size)
+	RendererStylePoolSize  int           // workers per (style, scale) pool (default: RendererPoolSize)
+	RendererRenderTimeout  time.Duration // per-render deadline
+	RendererWorkerLifetime int           // renders per worker before recycle
+	RendererStartupTimeout time.Duration // max handshake wait
+
 	// HTTP client settings
-	HTTPMaxConns           int
-	HTTPTileserverMaxConns int
-	HTTPTimeout            time.Duration // General HTTP timeout (0 = unlimited)
-	HTTPTileserverTimeout  time.Duration // Tileserver-specific timeout
+	HTTPMaxConns  int
+	HTTPTimeout   time.Duration // General HTTP timeout (0 = unlimited)
 
 	// Cache settings
 	TileCacheMaxAge      *uint32
@@ -36,24 +43,35 @@ type Config struct {
 	RegenCacheDelay      *uint32
 	RegenCacheDropAfter  *uint32
 
-	// Tileserver reload settings
-	TileServerContainer string // Docker container name for SIGHUP reload (empty = disabled)
-
-	// Tileserver health monitor settings
-	TileServerMonitorEnabled   bool
-	TileServerMonitorInterval  time.Duration
-	TileServerMonitorTimeout   time.Duration
-	TileServerMonitorThreshold int
-
 	// Image processing settings
 	DefaultImageFormat   string // "png", "jpeg", or "webp" (default: png)
 	OverrideClientFormat bool   // If true, ignore client format and use DefaultImageFormat
-	PNGCompressionLevel  string // "fast" or "best" (default: best)
+	PNGCompressionLevel  string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
 	ImageQuality         int    // JPEG/WebP quality 1-100 (default: 90)
-	MarkerImageCacheSize int    // Max resized marker images to cache (default: 500)
+	MarkerImageCacheSize int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
+	TileImageCacheSize   int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
+	CompositeImageCacheSize int // Max base+staticmap images cached in memory (default: 200, 0 disables). Each entry ~640 KB for 400×400 NRGBA; 200 ≈ 128 MB.
 
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
+
+	// LocalStylesUseViewport bypasses tile stitching for local-style
+	// integer-zoom static maps, sending a single RenderViewport call
+	// to the Node renderer instead. Avoids the tile caching layer
+	// entirely for local styles — valuable when the tile working set
+	// exceeds the RAM LRU and most stitches decode-and-discard.
+	// External styles always tile-stitch (upstream providers can't
+	// render an arbitrary viewport).
+	LocalStylesUseViewport bool
+
+	// Admin styles preview tile centre. Drives the /admin/styles
+	// preview thumbnails; choose a latitude/longitude representative
+	// of the operator's deployment region.
+	PreviewLatitude  float64
+	PreviewLongitude float64
+
+	// Diagnostics
+	PprofEnabled bool // Mount net/http/pprof under /debug/pprof. Off by default — endpoints expose profiling data and pprof.Profile holds a goroutine for 30s per call.
 
 	// Pyroscope settings
 	PyroscopeServerAddress        string
@@ -69,15 +87,21 @@ type Config struct {
 // Load loads configuration from environment variables
 func Load() *Config {
 	cfg := &Config{
-		TileServerURL:  getEnv("TILE_SERVER_URL", ""),
 		Port:           getEnv("PORT", "9000"),
 		Hostname:       getEnv("HOSTNAME", "0.0.0.0"),
 		RequestTimeout: getEnvDuration("REQUEST_TIMEOUT", 10*time.Second),
 
-		HTTPMaxConns:           getEnvInt("HTTP_MAX_CONNS", 100),
-		HTTPTileserverMaxConns: getEnvInt("HTTP_TILESERVER_MAX_CONNS", 10),
-		HTTPTimeout:            getEnvSeconds("HTTP_TIMEOUT_SECONDS", 15), // 0 = unlimited
-		HTTPTileserverTimeout:  getEnvSeconds("HTTP_TILESERVER_TIMEOUT_SECONDS", 90),
+		RendererBackend:        getEnv("RENDERER_BACKEND", "node-pool"),
+		RendererNodeBinary:     getEnv("RENDERER_NODE_BINARY", "node"),
+		RendererWorkerScript:   getEnv("RENDERER_WORKER_SCRIPT", "/app/render-worker/render-worker.js"),
+		RendererPoolSize:       getEnvInt("RENDERER_POOL_SIZE", 0),
+		RendererStylePoolSize:  getEnvInt("STYLE_POOL_SIZE", 0),
+		RendererRenderTimeout:  getEnvSeconds("RENDERER_TIMEOUT_SECONDS", 15),
+		RendererWorkerLifetime: getEnvInt("RENDERER_WORKER_LIFETIME", 500),
+		RendererStartupTimeout: getEnvSeconds("RENDERER_STARTUP_TIMEOUT_SECONDS", 10),
+
+		HTTPMaxConns: getEnvInt("HTTP_MAX_CONNS", 100),
+		HTTPTimeout:  getEnvSeconds("HTTP_TIMEOUT_SECONDS", 15), // 0 = unlimited
 
 		TileCacheMaxAge:      getEnvUint32("TILE_CACHE_MAX_AGE_MINUTES", 10080),
 		TileCacheDelay:       getEnvUint32("TILE_CACHE_DELAY_SECONDS", 3600),
@@ -95,20 +119,22 @@ func Load() *Config {
 		RegenCacheDelay:      getEnvUint32("REGENERATABLE_CACHE_DELAY_SECONDS", 3600),
 		RegenCacheDropAfter:  getEnvUint32("REGENERATABLE_CACHE_DROP_AFTER_MINUTES", 129600),
 
-		TileServerContainer: getEnv("TILESERVER_CONTAINER", ""),
-
-		TileServerMonitorEnabled:   getEnvBool("TILESERVER_MONITOR_ENABLED", false),
-		TileServerMonitorInterval:  getEnvSeconds("TILESERVER_MONITOR_INTERVAL_SECONDS", 30),
-		TileServerMonitorTimeout:   getEnvSeconds("TILESERVER_MONITOR_TIMEOUT_SECONDS", 10),
-		TileServerMonitorThreshold: getEnvInt("TILESERVER_MONITOR_THRESHOLD", 3),
-
 		DefaultImageFormat:   getEnv("DEFAULT_IMAGE_FORMAT", "png"),
 		OverrideClientFormat: getEnvBool("OVERRIDE_CLIENT_FORMAT", false),
-		PNGCompressionLevel:  getEnv("PNG_COMPRESSION_LEVEL", "best"),
+		PNGCompressionLevel:  getEnv("PNG_COMPRESSION_LEVEL", "fast"),
 		ImageQuality:         getEnvInt("IMAGE_QUALITY", 90),
-		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 500),
+		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
+		TileImageCacheSize:   getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
+		CompositeImageCacheSize: getEnvInt("COMPOSITE_IMAGE_CACHE_SIZE", 200),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
+
+		LocalStylesUseViewport: getEnvBool("LOCAL_STYLES_USE_VIEWPORT", true),
+
+		PreviewLatitude:  getEnvFloat("PREVIEW_LATITUDE", 52.5200),
+		PreviewLongitude: getEnvFloat("PREVIEW_LONGITUDE", 13.4050),
+
+		PprofEnabled: getEnvBool("PPROF_ENABLED", false),
 
 		PyroscopeServerAddress:        getEnv("PYROSCOPE_SERVER_ADDRESS", ""),
 		PyroscopeApplicationName:      getEnv("PYROSCOPE_APPLICATION_NAME", "tileserver-cache"),
@@ -183,6 +209,18 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return i
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return f
 }
 
 func getEnvSeconds(key string, defaultValue int) time.Duration {

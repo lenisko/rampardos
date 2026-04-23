@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"log/slog"
 	"math"
 	"net/http"
@@ -17,27 +21,56 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 	"github.com/lenisko/rampardos/internal/utils"
+	"golang.org/x/sync/singleflight"
 )
+
+// stylesControllerGetExternal is the subset of StylesController used by
+// StaticMapHandler's dispatch logic. An interface keeps dispatch
+// unit-testable without spinning up a real StylesController.
+type stylesControllerGetExternal interface {
+	GetExternalStyle(name string) *models.Style
+}
 
 // StaticMapHandler handles static map requests
 type StaticMapHandler struct {
-	tileServerURL     string
+	renderer          renderer.Renderer
 	tileHandler       *TileHandler
 	statsController   *services.StatsController
-	stylesController  *services.StylesController
+	stylesController  stylesControllerGetExternal
 	sphericalMercator *utils.SphericalMercator
+	sfg               singleflight.Group // dedup concurrent generates for same final path
+	baseSfg           singleflight.Group // dedup concurrent base renders for same basePath
+
+	// localUseViewport routes local-style integer-zoom bases through
+	// RenderViewport instead of tile stitching when the tile working
+	// set is too large to benefit from the cache. Wired from
+	// config.LocalStylesUseViewport.
+	localUseViewport bool
+
+	// Function-valued hooks. Production wiring in NewStaticMapHandler
+	// sets these to the real methods below; tests override them to
+	// record dispatch without touching the renderer or disk.
+	generateBaseStaticMapFromAPIFn   func(ctx context.Context, sm models.StaticMap) (image.Image, error)
+	generateBaseStaticMapFromTilesFn func(ctx context.Context, sm models.StaticMap, extStyle *models.Style) (image.Image, error)
+	logExternalViewportApproxFn      func(sm models.StaticMap)
 }
 
 // NewStaticMapHandler creates a new static map handler
-func NewStaticMapHandler(tileServerURL string, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController) *StaticMapHandler {
-	return &StaticMapHandler{
-		tileServerURL:     tileServerURL,
+func NewStaticMapHandler(r renderer.Renderer, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController, localUseViewport bool) *StaticMapHandler {
+	h := &StaticMapHandler{
+		renderer:          r,
 		tileHandler:       tileHandler,
 		statsController:   statsController,
 		stylesController:  stylesController,
 		sphericalMercator: utils.NewSphericalMercator(),
+		localUseViewport:  localUseViewport,
 	}
+	h.generateBaseStaticMapFromAPIFn = h.generateBaseStaticMapFromAPI
+	h.generateBaseStaticMapFromTilesFn = h.generateBaseStaticMapFromTiles
+	h.logExternalViewportApproxFn = h.logExternalViewportApprox
+	return h
 }
 
 // Get handles GET /staticmap
@@ -115,39 +148,83 @@ func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Reques
 	h.handlePregeneratedRequest(w, r, id)
 }
 
-// GenerateStaticMap generates a static map (used by MultiStaticMapHandler)
-func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap) error {
+// GenerateStaticMap generates a static map and returns the decoded
+// image. Used by MultiStaticMapHandler to skip the PNG round-trip
+// that would otherwise happen between component generation and
+// grid composition. Concurrent requests for the same map are
+// deduplicated via singleflight; the sfg return value is the
+// image pointer so followers share the leader's result without
+// re-encoding.
+//
+// In the bytes-first pipeline nothing is written to disk on this
+// path — persistence and its matching expiry enqueue live
+// exclusively in handlePregenerateResponseBytes, the sole
+// disk-write site.
+//
+// nocache=true forces a fresh render by bypassing the composite LRU
+// read; the result is still written back (benefiting other callers)
+// and concurrent siblings still dedupe via singleflight.
+//
+// Returns the image, a cached flag indicating whether the result
+// came from the composite LRU without re-rendering, and any error.
+// The cached flag is what the handler feeds to RecordRequest and
+// StaticMapServed so dashboard panels that split by cached="true"
+// (cache-hit rate, hit-latency separation) stay populated.
+func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap models.StaticMap, nocache bool) (image.Image, bool, error) {
 	path := staticMap.Path()
 	basePath := staticMap.BasePath()
 
-	// Check if already exists
-	if _, err := os.Stat(path); err == nil {
-		return nil
+	if !nocache && services.GlobalCompositeImageCache != nil {
+		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+			return cached, true, nil
+		}
 	}
 
-	// Check if base exists
-	baseExists := false
-	if _, err := os.Stat(basePath); err == nil {
-		baseExists = true
+	// Detach the caller's cancellation from the shared render. singleflight
+	// runs the callback once for all joiners; if the leader disconnects,
+	// cancelling its ctx would abort generation for every follower that
+	// is still live. Values (deadlines, trace IDs) still flow through.
+	type sfgResult struct {
+		img    image.Image
+		cached bool
 	}
-
-	return h.generateStaticMap(ctx, path, basePath, baseExists, staticMap)
+	genCtx := context.WithoutCancel(ctx)
+	v, err, _ := h.sfg.Do(path, func() (any, error) {
+		if !nocache && services.GlobalCompositeImageCache != nil {
+			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+				return sfgResult{img: cached, cached: true}, nil
+			}
+		}
+		img, err := h.generateStaticMap(genCtx, path, basePath, staticMap, nocache)
+		if err != nil {
+			return nil, err
+		}
+		if services.GlobalCompositeImageCache != nil {
+			services.GlobalCompositeImageCache.Add(path, img)
+		}
+		return sfgResult{img: img, cached: false}, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	r := v.(sfgResult)
+	return r.img, r.cached, nil
 }
 
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
 	// Validate required fields
 	if staticMap.Zoom < 1 || staticMap.Zoom > 22 {
-		services.GlobalMetrics.RecordError("staticmap", "invalid_zoom")
+		services.GlobalMetrics.RecordValidationError("staticmap", "zoom")
 		http.Error(w, "Invalid zoom level (must be 1-22)", http.StatusBadRequest)
 		return
 	}
 	if staticMap.Width == 0 || staticMap.Height == 0 {
-		services.GlobalMetrics.RecordError("staticmap", "invalid_dimensions")
+		services.GlobalMetrics.RecordValidationError("staticmap", "dimensions")
 		http.Error(w, "Invalid dimensions", http.StatusBadRequest)
 		return
 	}
 	if staticMap.Style == "" {
-		services.GlobalMetrics.RecordError("staticmap", "missing_style")
+		services.GlobalMetrics.RecordValidationError("staticmap", "style")
 		http.Error(w, "Missing style", http.StatusBadRequest)
 		return
 	}
@@ -159,60 +236,52 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 	services.GlobalMetrics.IncrementInFlight("staticmap")
 	defer services.GlobalMetrics.DecrementInFlight("staticmap")
 
-	// Check if cache should be skipped (for preview)
-	skipCache := r.URL.Query().Get("nocache") == "true"
-
-	// Check if cached (use cache index first, then filesystem)
-	cached := false
-	if !skipCache {
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(path) {
-			cached = true
-		} else if _, err := os.Stat(path); err == nil {
-			cached = true
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddStaticMap(path)
-			}
-		}
+	// Cache control:
+	//   nocache=true — force a fresh render (bypass composite LRU read)
+	//   ttl=N        — keep the disk file for N seconds (pregenerate only)
+	//   pregenerate=true + nocache=true + no ttl — default ttl to 30s so
+	//     the returned URL lives long enough for the consumer to fetch it
+	nocache := r.URL.Query().Get("nocache") == "true"
+	pregenerate := r.URL.Query().Get("pregenerate") == "true"
+	ttlStr := r.URL.Query().Get("ttl")
+	var ttlSeconds int
+	if ttlStr != "" {
+		ttlSeconds, _ = strconv.Atoi(ttlStr)
+	}
+	if nocache && pregenerate && ttlSeconds == 0 {
+		ttlSeconds = 30
 	}
 
-	if cached {
-		duration := time.Since(startTime).Seconds()
-		slog.Debug("Served static map (cached)", "path", path)
-		h.statsController.StaticMapServed(false, path, staticMap.Style)
-		services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, true, duration)
-		h.generateResponse(w, r, staticMap, path)
+	img, cached, genErr := h.GenerateStaticMap(r.Context(), staticMap, nocache)
+	if genErr != nil {
+		slog.Error("Failed to generate static map", "error", genErr)
+		services.GlobalMetrics.RecordError("staticmap", "generation_failed")
+		http.Error(w, genErr.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	// Check if base exists (use cache index first)
-	baseExists := false
-	if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasStaticMap(basePath) {
-		baseExists = true
-	} else if _, err := os.Stat(basePath); err == nil {
-		baseExists = true
-		if services.GlobalCacheIndex != nil {
-			services.GlobalCacheIndex.AddStaticMap(basePath)
-		}
-	}
-
-	// Generate
-	if err := h.generateStaticMap(r.Context(), path, basePath, baseExists, staticMap); err != nil {
-		slog.Error("Failed to generate static map", "error", err)
-		services.GlobalMetrics.RecordError("staticmap", "generation_failed")
+	encoded, err := utils.EncodeImage(img, filepath.Ext(path))
+	if err != nil {
+		slog.Error("Failed to encode static map", "error", err)
+		services.GlobalMetrics.RecordError("staticmap", "encode_failed")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Add to cache index
-	if services.GlobalCacheIndex != nil {
-		services.GlobalCacheIndex.AddStaticMap(path)
-	}
-
 	duration := time.Since(startTime).Seconds()
-	slog.Debug("Served static map (generated)", "path", path, "duration", duration)
-	h.statsController.StaticMapServed(true, path, staticMap.Style)
-	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, false, duration)
-	h.generateResponse(w, r, staticMap, path)
+	// !cached feeds isNew to StatsController, which in turn drives the
+	// cached="true"/false dimension of rampardos_requests_total,
+	// rampardos_cache_hits_total{type="staticmap"}, and the cache-hit
+	// ratio surfaced in /admin/stats.
+	h.statsController.StaticMapServed(!cached, path, staticMap.Style)
+	services.GlobalMetrics.RecordRequest("staticmap", staticMap.Style, cached, duration)
+
+	// ttl only has effect if pregenerate=true (handlePregenerateResponseBytes
+	// writes the file + enqueues it); otherwise the response is served
+	// from in-memory bytes with no disk artefact to expire.
+	ttl := effectiveTTL(ttlSeconds)
+
+	slog.Debug("Served static map", "file", filepath.Base(path), "duration", duration, "ttl", ttlSeconds, "nocache", nocache)
+	h.generateResponse(w, r, staticMap, path, encoded, ttl, basePath)
 }
 
 func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *http.Request, id string) {
@@ -221,7 +290,7 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 
 	// Check if exists
 	if _, err := os.Stat(path); err == nil {
-		slog.Debug("Served static map (pregenerated)")
+		slog.Debug("Served static map (pregenerated)", "file", filepath.Base(path))
 		serveFile(w, r, path)
 		return
 	}
@@ -248,61 +317,100 @@ func (h *StaticMapHandler) handlePregeneratedRequest(w http.ResponseWriter, r *h
 	h.handleRequest(w, r, staticMap)
 }
 
-func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, baseExists bool, staticMap models.StaticMap) error {
-	// Ensure cache directory exists (cached check)
-	ensureDir(filepath.Dir(path))
+// ensureBase renders basePath if it's missing. Concurrent callers for
+// the same basePath are deduplicated via baseSfg, so sibling requests
+// (same viewport, different overlays) do not duplicate base rendering.
+//
+// LRU fast path: GlobalCompositeImageCache is checked before the
+// singleflight so burst-sharing across requests avoids the disk stat.
+//
+// Singleflight key correctness: basePath == BasePath() ==
+// hash(WithoutDrawables()), so two callers share a slot iff their
+// base-rendering inputs (style/lat/lon/zoom/w/h/scale/bearing/pitch/
+// format) are identical. Base generation reads none of Markers,
+// Polygons, or Circles, so merging the renders is safe.
+func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.StaticMap, basePath string, nocache bool) (image.Image, error) {
+	// LRU fast path — covers the cross-request burst-sharing case
+	// that the short-TTL disk cache used to handle. nocache skips
+	// the read to force a fresh render; sfg still dedupes concurrent
+	// siblings and the result is still written back.
+	if !nocache && services.GlobalCompositeImageCache != nil {
+		if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
+			return img, nil
+		}
+	}
+
+	v, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
+		if !nocache && services.GlobalCompositeImageCache != nil {
+			if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
+				return img, nil
+			}
+		}
+		img, err := h.generateBaseStaticMap(ctx, staticMap, basePath)
+		if err != nil {
+			return nil, err
+		}
+		if services.GlobalCompositeImageCache != nil {
+			services.GlobalCompositeImageCache.Add(basePath, img)
+		}
+		return img, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(image.Image), nil
+}
+
+func (h *StaticMapHandler) generateStaticMap(ctx context.Context, path, basePath string, staticMap models.StaticMap, nocache bool) (image.Image, error) {
+	baseImg, err := h.ensureBase(ctx, staticMap, basePath, nocache)
+	if err != nil {
+		return nil, err
+	}
 
 	hasDrawables := len(staticMap.Markers) > 0 || len(staticMap.Polygons) > 0 || len(staticMap.Circles) > 0
 
-	// Generate base if needed
-	if !baseExists {
-		if err := h.generateBaseStaticMap(ctx, staticMap, basePath); err != nil {
-			return err
-		}
-	}
-
-	// If no drawables, just use base
 	if !hasDrawables {
-		// Copy or link base to path
-		if path != basePath {
-			data, err := os.ReadFile(basePath)
-			if err != nil {
-				return err
-			}
-			return os.WriteFile(path, data, 0644)
-		}
-		return nil
+		return baseImg, nil
 	}
 
-	// Download markers if needed
 	if err := h.downloadMarkers(ctx, staticMap); err != nil {
-		return err
+		return nil, err
 	}
-
-	// Generate with drawables
-	return utils.GenerateStaticMap(staticMap, basePath, path, h.sphericalMercator)
+	return utils.GenerateStaticMapFromImage(staticMap, baseImg, h.sphericalMercator)
 }
 
-func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) error {
-	// Check if this is an external style (needs tile stitching)
-	if extStyle := h.stylesController.GetExternalStyle(staticMap.Style); extStyle != nil {
-		// External style - use tile stitching
-		return h.generateBaseStaticMapFromTiles(ctx, staticMap, basePath, extStyle)
+func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap models.StaticMap, basePath string) (image.Image, error) {
+	extStyle := h.stylesController.GetExternalStyle(staticMap.Style)
+
+	if extStyle == nil {
+		// Local style: fractional zoom → viewport render (native float zoom).
+		// Integer zoom → tile stitching (cacheable via Cache/Tile), unless
+		// localUseViewport is set to skip the tile pipeline entirely.
+		if isFractional(staticMap.Zoom) || h.localUseViewport {
+			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap)
+		}
+		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
 	}
 
-	// Local style - use tileserver-gl's static API directly
-	return h.generateBaseStaticMapFromAPI(ctx, staticMap, basePath)
+	if isFractional(staticMap.Zoom) {
+		h.logExternalViewportApproxFn(staticMap)
+	}
+	return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap, basePath string) error {
+func (h *StaticMapHandler) logExternalViewportApprox(sm models.StaticMap) {
+	slog.Warn("external style requested at fractional zoom; rendering at integer approximation",
+		"style", sm.Style,
+		"zoom", sm.Zoom,
+		"lat", sm.Latitude,
+		"lng", sm.Longitude,
+	)
+}
+
+func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, staticMap models.StaticMap) (image.Image, error) {
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
-	}
-
-	scaleString := ""
-	if scale > 1 {
-		scaleString = fmt.Sprintf("@%dx", scale)
 	}
 
 	bearing := 0.0
@@ -314,68 +422,109 @@ func (h *StaticMapHandler) generateBaseStaticMapFromAPI(ctx context.Context, sta
 		pitch = *staticMap.Pitch
 	}
 
-	// Use tileserver-gl's static API: /styles/{style}/static/{lon},{lat},{zoom}@{bearing},{pitch}/{width}x{height}{scale}.{format}
-	staticURL := fmt.Sprintf("%s/styles/%s/static/%f,%f,%f@%f,%f/%dx%d%s.%s",
-		h.tileServerURL,
-		staticMap.Style,
-		staticMap.Longitude,
-		staticMap.Latitude,
-		staticMap.Zoom,
-		bearing,
-		pitch,
-		staticMap.Width,
-		staticMap.Height,
-		scaleString,
-		staticMap.GetFormat(),
-	)
-
-	slog.Debug("Fetching static map from tileserver", "url", staticURL)
-
-	if err := services.DownloadFile(ctx, staticURL, basePath, "image", 0); err != nil {
-		return fmt.Errorf("failed to load base static map: %w", err)
+	start := time.Now()
+	img, err := h.renderer.RenderViewportImage(ctx, renderer.ViewportRequest{
+		StyleID:   staticMap.Style,
+		Longitude: staticMap.Longitude,
+		Latitude:  staticMap.Latitude,
+		Zoom:      staticMap.Zoom,
+		Width:     int(staticMap.Width),
+		Height:    int(staticMap.Height),
+		Bearing:   bearing,
+		Pitch:     pitch,
+		Scale:     scale,
+		Format:    staticMap.GetFormat(),
+	})
+	services.GlobalMetrics.RecordRendererViewport(staticMap.Style, strconv.Itoa(int(scale)), time.Since(start).Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("renderer viewport: %w", err)
 	}
-
-	return nil
+	return img, nil
 }
 
-func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, basePath string, extStyle *models.Style) error {
+func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, staticMap models.StaticMap, extStyle *models.Style) (image.Image, error) {
 	// Calculate tiles needed
 	center := models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude}
 	zoom := int(staticMap.Zoom)
 
-	// Get center tile
+	// Get center tile. xDelta/yDelta are pixel offsets within the tile
+	// in SphericalMercator's 256-based coordinate grid.
 	centerX, centerY, xDelta, yDelta := h.sphericalMercator.XY(center, zoom)
 
-	// Calculate how many tiles we need
 	scale := staticMap.Scale
 	if scale == 0 {
 		scale = 1
 	}
 
-	tilesX := int(math.Ceil(float64(staticMap.Width)/256/float64(scale))) + 1
-	tilesY := int(math.Ceil(float64(staticMap.Height)/256/float64(scale))) + 1
+	// Tile pixel size depends on the source:
+	// - Local styles rendered via maplibre-native: 512px (MapLibre's base tile size)
+	// - External raster tiles: 256px (standard web tile size)
+	tilePixels := 256
+	if extStyle == nil {
+		tilePixels = renderer.TileSizePx
+	}
 
-	// Check if external style supports scale
-	hasScale := strings.Contains(extStyle.URL, "{@scale}") || strings.Contains(extStyle.URL, "{scale}")
+	// How many tiles we need to cover the requested viewport.
+	tilesX := int(math.Ceil(float64(staticMap.Width)/float64(tilePixels)/float64(scale))) + 1
+	tilesY := int(math.Ceil(float64(staticMap.Height)/float64(tilePixels)/float64(scale))) + 1
 
-	// Generate tiles
-	var tilePaths []string
+	// External styles may use scale-aware URL templates; local styles
+	// have no URL template at all.
+	hasScale := false
+	if extStyle != nil {
+		hasScale = strings.Contains(extStyle.URL, "{@scale}") || strings.Contains(extStyle.URL, "{scale}")
+	}
+	// Local styles at scale>1 produce tiles at tilePixels*scale
+	// (e.g. 1024px for scale=2). The crop in GenerateBaseStaticMap
+	// must multiply offset and output dimensions by scale — the same
+	// path external scale-aware tiles use via hasScale.
+	if extStyle == nil && scale > 1 {
+		hasScale = true
+	}
+
+	// Generate tiles in parallel. Each tile is an independent download
+	// or render; parallelising cuts wall-clock time from N*latency to
+	// ~1*latency for external tile sources like Mapbox satellite.
+	type tileSlot struct {
+		index int
+		path  string
+		err   error
+	}
+	totalTiles := (2*(tilesX/2) + 1) * (2*(tilesY/2) + 1)
+	tilePaths := make([]string, totalTiles)
+	results := make(chan tileSlot, totalTiles)
+
+	i := 0
 	for dy := -tilesY / 2; dy <= tilesY/2; dy++ {
 		for dx := -tilesX / 2; dx <= tilesX/2; dx++ {
 			tileX := centerX + dx
 			tileY := centerY + dy
-
-			result, err := h.tileHandler.GenerateTile(ctx, staticMap.Style, zoom, tileX, tileY, scale, staticMap.GetFormat())
-			if err != nil {
-				return fmt.Errorf("failed to generate tile: %w", err)
-			}
-			tilePaths = append(tilePaths, result.Path)
+			idx := i
+			i++
+			go func() {
+				result, err := h.tileHandler.GenerateTile(ctx, staticMap.Style, zoom, tileX, tileY, scale, staticMap.GetFormat())
+				if err != nil {
+					results <- tileSlot{index: idx, err: err}
+					return
+				}
+				results <- tileSlot{index: idx, path: result.Path}
+			}()
 		}
 	}
+	for range totalTiles {
+		slot := <-results
+		if slot.err != nil {
+			return nil, fmt.Errorf("failed to generate tile: %w", slot.err)
+		}
+		tilePaths[slot.index] = slot.path
+	}
 
-	// Calculate offset
-	offsetX := int(xDelta) + (tilesX/2)*256
-	offsetY := int(yDelta) + (tilesY/2)*256
+	// Calculate offset: position of the map center in the combined tile grid.
+	// xDelta/yDelta are in SphericalMercator's 256-based pixel grid.
+	// Scale them to match the actual tile pixel size.
+	deltaScale := tilePixels / 256
+	offsetX := int(xDelta)*deltaScale + (tilesX/2)*tilePixels
+	offsetY := int(yDelta)*deltaScale + (tilesY/2)*tilePixels
 
 	// Create redownloader callback for corrupted tiles
 	redownload := func(tilePath string) error {
@@ -398,8 +547,10 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 		return err
 	}
 
-	// Combine tiles
-	return utils.GenerateBaseStaticMap(staticMap, tilePaths, basePath, offsetX, offsetY, hasScale, redownload)
+	// Stitch tiles into the base image. The LRU (populated by
+	// ensureBase up the stack) is now the sole cross-request cache
+	// for stitched bases; no disk persistence on this path.
+	return utils.GenerateBaseStaticMap(staticMap, tilePaths, offsetX, offsetY, hasScale, redownload)
 }
 
 func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models.StaticMap) error {
@@ -429,18 +580,8 @@ func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models
 		path := fmt.Sprintf("Cache/Marker/%s.%s", hash, format)
 		domain := extractDomain(marker.URL)
 
-		// Check cache index first (fast path)
-		if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(path) {
-			h.statsController.MarkerServed(false, path, domain)
-			continue
-		}
-
-		// Check filesystem
+		// Already cached on disk?
 		if _, err := os.Stat(path); err == nil {
-			// Add to cache index
-			if services.GlobalCacheIndex != nil {
-				services.GlobalCacheIndex.AddMarker(path)
-			}
 			h.statsController.MarkerServed(false, path, domain)
 			continue
 		}
@@ -464,36 +605,21 @@ func (h *StaticMapHandler) downloadMarkers(ctx context.Context, staticMap models
 			defer func() { <-sem }()
 
 			if err := services.DownloadFile(ctx, md.marker.URL, md.path, "", 0); err != nil {
-				// Try fallback
-				if md.marker.FallbackURL != "" {
-					fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
-					fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
-					fallbackDomain := extractDomain(md.marker.FallbackURL)
+				if md.marker.FallbackURL == "" {
+					return
+				}
+				fallbackHash := utils.PersistentHashString(md.marker.FallbackURL)
+				fallbackPath := fmt.Sprintf("Cache/Marker/%s.%s", fallbackHash, md.format)
+				fallbackDomain := extractDomain(md.marker.FallbackURL)
 
-					// Check if fallback exists
-					if services.GlobalCacheIndex != nil && services.GlobalCacheIndex.HasMarker(fallbackPath) {
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-					if _, err := os.Stat(fallbackPath); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
-						return
-					}
-
-					if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
-						if services.GlobalCacheIndex != nil {
-							services.GlobalCacheIndex.AddMarker(fallbackPath)
-						}
-						h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
-					}
+				if _, err := os.Stat(fallbackPath); err == nil {
+					h.statsController.MarkerServed(false, fallbackPath, fallbackDomain)
+					return
+				}
+				if err := services.DownloadFile(ctx, md.marker.FallbackURL, fallbackPath, "", 0); err == nil {
+					h.statsController.MarkerServed(true, fallbackPath, fallbackDomain)
 				}
 			} else {
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarker(md.path)
-				}
 				h.statsController.MarkerServed(true, md.path, md.domain)
 			}
 		}(md)
@@ -516,11 +642,31 @@ func extractDomain(url string) string {
 	return "?"
 }
 
-func (h *StaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap, path string) {
-	if handlePregenerateResponse(w, r, path, staticMap) {
+func (h *StaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap, path string, encoded []byte, ttl time.Duration, basePath string) {
+	if handlePregenerateResponseBytes(w, r, path, staticMap, encoded, ttl, basePath) {
 		return
 	}
-	serveFile(w, r, path)
+	serveStaticMapBytes(w, r, path, encoded)
+}
+
+// serveStaticMapBytes sets cache-control header and serves the encoded
+// image bytes via http.ServeContent, enabling range requests and
+// conditional GET (If-None-Match / If-Modified-Since).
+func serveStaticMapBytes(w http.ResponseWriter, r *http.Request, path string, encoded []byte) {
+	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
+	http.ServeContent(w, r, filepath.Base(path), time.Now(), bytes.NewReader(encoded))
+}
+
+// effectiveTTL resolves the ?ttl query-param into the duration that
+// governs disk-file lifetime for pregenerate requests. Zero falls
+// through to OwnedThreshold (CacheCleaner age-sweep). The nocache+
+// pregenerate combo is rewritten to ttlSeconds=30 at the handler
+// entry, so nocache-specific handling lives there, not here.
+func effectiveTTL(ttlSeconds int) time.Duration {
+	if ttlSeconds > 0 {
+		return time.Duration(ttlSeconds) * time.Second
+	}
+	return services.OwnedThreshold
 }
 
 func (h *StaticMapHandler) renderTemplate(ctx context.Context, template string, params map[string][]string) (*models.StaticMap, error) {
@@ -624,4 +770,21 @@ func parseQueryParams(r *http.Request, staticMap *models.StaticMap) error {
 	}
 
 	return nil
+}
+
+// isFractional reports whether the given zoom is non-integer, with
+// epsilon tolerance for floating-point noise. NaN and infinities are
+// treated as non-fractional (they fall through to whatever the
+// downstream code already handles — these should never occur in
+// validated input).
+func isFractional(zoom float64) bool {
+	if math.IsNaN(zoom) || math.IsInf(zoom, 0) {
+		return false
+	}
+	const epsilon = 1e-9
+	_, frac := math.Modf(zoom)
+	if frac < 0 {
+		frac = -frac
+	}
+	return frac > epsilon && frac < 1-epsilon
 }

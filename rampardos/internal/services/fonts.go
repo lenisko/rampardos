@@ -15,19 +15,15 @@ const (
 
 // FontsController manages fonts
 type FontsController struct {
-	folder     string
-	tempFolder string
+	folder string
 }
 
 // NewFontsController creates a new fonts controller
-func NewFontsController(folder, tempFolder string) *FontsController {
+func NewFontsController(folder string) *FontsController {
 	os.MkdirAll(folder, 0755)
-	os.RemoveAll(tempFolder)
-	os.MkdirAll(tempFolder, 0755)
 
 	return &FontsController{
-		folder:     folder,
-		tempFolder: tempFolder,
+		folder: folder,
 	}
 }
 
@@ -55,15 +51,26 @@ func (fc *FontsController) AddFont(data []byte, filename string) error {
 	baseName := strings.TrimSuffix(filename, ext)
 	name := toCamelCase(baseName)
 
-	// Write temp file
-	tempFile := filepath.Join(fc.tempFolder, fmt.Sprintf("%d%s", os.Getpid(), ext))
-	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+	// Write the uploaded bytes to a temp file inside the fonts folder so we
+	// can hand a path to build-glyphs. Using fc.folder (which is volume-mounted
+	// in docker-compose) avoids permission issues when the container runs as
+	// a non-root UID. Non-directory entries here are ignored by GetFonts.
+	tempFile, err := os.CreateTemp(fc.folder, "upload-*"+ext)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.Write(data); err != nil {
+		tempFile.Close()
 		return fmt.Errorf("failed to write temp file: %w", err)
 	}
-	defer os.Remove(tempFile)
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
 
 	// Build glyphs
-	if err := fc.buildGlyphs(tempFile, name); err != nil {
+	if err := fc.buildGlyphs(tempPath, name); err != nil {
 		return err
 	}
 

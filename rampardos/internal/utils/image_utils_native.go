@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
@@ -10,10 +11,11 @@ import (
 	"image/png"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/fogleman/gg"
 	"github.com/gen2brain/webp"
@@ -23,10 +25,34 @@ import (
 	_ "golang.org/x/image/webp"
 )
 
-// GenerateBaseStaticMapNative combines tiles into a base static map using native Go
-func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string, path string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) error {
+// pngBufferPool reuses png.EncoderBuffer across encodes so the
+// internal zlib writer and filter working buffers don't allocate
+// fresh per call. Encoder instances themselves are lightweight
+// (just CompressionLevel + a pointer); the pool is what matters.
+var pngBufferPool pngEncoderBufferPool
+
+type pngEncoderBufferPool struct {
+	pool sync.Pool
+}
+
+func (p *pngEncoderBufferPool) Get() *png.EncoderBuffer {
+	if b, ok := p.pool.Get().(*png.EncoderBuffer); ok {
+		return b
+	}
+	return nil
+}
+
+func (p *pngEncoderBufferPool) Put(buf *png.EncoderBuffer) {
+	p.pool.Put(buf)
+}
+
+// GenerateBaseStaticMapNative combines tiles into a base static map and
+// returns the cropped image. The caller owns persistence — in the
+// bytes-first pipeline the stitched base lives only in the composite
+// image LRU, not on disk.
+func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string, offsetX, offsetY int, hasScale bool, redownload TileRedownloader) (image.Image, error) {
 	if len(tilePaths) == 0 {
-		return fmt.Errorf("no tiles to combine")
+		return nil, fmt.Errorf("no tiles to combine")
 	}
 
 	// Sort tile paths for consistent ordering
@@ -41,7 +67,7 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	for _, tilePath := range sortedPaths {
 		img, err := loadImageWithRetry(tilePath, redownload)
 		if err != nil {
-			return fmt.Errorf("failed to load tile %s: %w", tilePath, err)
+			return nil, fmt.Errorf("failed to load tile %s: %w", tilePath, err)
 		}
 		tiles = append(tiles, img)
 		if tileWidth == 0 {
@@ -90,7 +116,7 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	// Create combined image
 	gridWidth := (maxX - minX + 1) * tileWidth
 	gridHeight := (maxY - minY + 1) * tileHeight
-	combined := image.NewRGBA(image.Rect(0, 0, gridWidth, gridHeight))
+	combined := image.NewNRGBA(image.Rect(0, 0, gridWidth, gridHeight))
 
 	// Draw tiles at their positions
 	for _, pos := range positions {
@@ -115,44 +141,48 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 	}
 
 	// Crop to final size
-	cropped := image.NewRGBA(image.Rect(0, 0, imgWidth, imgHeight))
+	cropped := image.NewNRGBA(image.Rect(0, 0, imgWidth, imgHeight))
 	draw.Draw(cropped, cropped.Bounds(), combined,
 		image.Point{X: imgWidthOffset, Y: imgHeightOffset}, draw.Src)
 
-	return saveImage(path, cropped)
+	return cropped, nil
 }
 
-// GenerateStaticMapNative adds markers, polygons, and circles to a base map using native Go
-func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, sm *SphericalMercator) error {
-	// Load base image
-	baseImg, err := loadImage(basePath)
-	if err != nil {
-		return fmt.Errorf("failed to load base image: %w", err)
-	}
+// drawPolygon draws a single polygon (fill + optional stroke) onto dc.
+func drawPolygon(dc *gg.Context, staticMap models.StaticMap, polygon models.Polygon, sm *SphericalMercator, scale uint8) error {
+	// Set fill color
+	fillColor := parseColor(polygon.FillColor)
+	dc.SetColor(fillColor)
 
-	// Create drawing context
-	dc := gg.NewContextForImage(baseImg)
-
-	scale := staticMap.Scale
-	if scale == 0 {
-		scale = 1
-	}
-
-	// Process polygons
-	for _, polygon := range staticMap.Polygons {
-		if len(polygon.Path) == 0 {
-			continue
+	// Draw polygon path
+	for i, coord := range polygon.Path {
+		if len(coord) != 2 {
+			return fmt.Errorf("expecting two values to form a coordinate but got %d", len(coord))
 		}
+		point := getRealOffset(
+			models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
+			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+			staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+		)
+		x := float64(point.x + int(staticMap.Width/2*uint16(scale)))
+		y := float64(point.y + int(staticMap.Height/2*uint16(scale)))
 
-		// Set fill color
-		fillColor := parseColor(polygon.FillColor)
-		dc.SetColor(fillColor)
+		if i == 0 {
+			dc.MoveTo(x, y)
+		} else {
+			dc.LineTo(x, y)
+		}
+	}
+	dc.ClosePath()
+	dc.Fill()
 
-		// Draw polygon path
+	// Draw stroke
+	if polygon.StrokeWidth > 0 {
+		strokeColor := parseColor(polygon.StrokeColor)
+		dc.SetColor(strokeColor)
+		dc.SetLineWidth(float64(polygon.StrokeWidth))
+
 		for i, coord := range polygon.Path {
-			if len(coord) != 2 {
-				return fmt.Errorf("expecting two values to form a coordinate but got %d", len(coord))
-			}
 			point := getRealOffset(
 				models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
 				models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
@@ -168,221 +198,248 @@ func GenerateStaticMapNative(staticMap models.StaticMap, basePath, path string, 
 			}
 		}
 		dc.ClosePath()
-		dc.Fill()
-
-		// Draw stroke
-		if polygon.StrokeWidth > 0 {
-			strokeColor := parseColor(polygon.StrokeColor)
-			dc.SetColor(strokeColor)
-			dc.SetLineWidth(float64(polygon.StrokeWidth))
-
-			for i, coord := range polygon.Path {
-				point := getRealOffset(
-					models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
-					models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-					staticMap.Zoom, staticMap.Scale, 0, 0, sm,
-				)
-				x := float64(point.x + int(staticMap.Width/2*uint16(scale)))
-				y := float64(point.y + int(staticMap.Height/2*uint16(scale)))
-
-				if i == 0 {
-					dc.MoveTo(x, y)
-				} else {
-					dc.LineTo(x, y)
-				}
-			}
-			dc.ClosePath()
-			dc.Stroke()
-		}
+		dc.Stroke()
 	}
-
-	// Process circles
-	for _, circle := range staticMap.Circles {
-		coord := models.Coordinate{Latitude: circle.Latitude, Longitude: circle.Longitude}
-		point := getRealOffset(
-			coord,
-			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-			staticMap.Zoom, staticMap.Scale, 0, 0, sm,
-		)
-		radiusCoord := coord.CoordinateAt(circle.Radius, 0)
-		radius := float64(getRealOffset(coord, radiusCoord, staticMap.Zoom, staticMap.Scale, 0, 0, sm).y)
-
-		x := float64(point.x + int(staticMap.Width)*int(scale)/2)
-		y := float64(point.y + int(staticMap.Height)*int(scale)/2)
-
-		// Fill circle
-		fillColor := parseColor(circle.FillColor)
-		dc.SetColor(fillColor)
-		dc.DrawCircle(x, y, radius)
-		dc.Fill()
-
-		// Stroke circle
-		if circle.StrokeWidth > 0 {
-			strokeColor := parseColor(circle.StrokeColor)
-			dc.SetColor(strokeColor)
-			dc.SetLineWidth(float64(circle.StrokeWidth))
-			dc.DrawCircle(x, y, radius)
-			dc.Stroke()
-		}
-	}
-
-	// Process markers
-	for _, marker := range staticMap.Markers {
-		realOffset := getRealOffset(
-			models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
-			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-			staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
-		)
-
-		// Skip markers outside the visible area
-		if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
-			abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
-			continue
-		}
-
-		markerPath := getMarkerPath(marker)
-		if marker.FallbackURL != "" {
-			if _, err := os.Stat(markerPath); os.IsNotExist(err) {
-				markerPath = getFallbackMarkerPath(marker)
-			}
-		}
-
-		// Always resize marker to target dimensions (matching ImageMagick behavior)
-		targetWidth := int(marker.Width) * int(scale)
-		targetHeight := int(marker.Height) * int(scale)
-
-		// Try to get from in-memory cache first
-		var markerImg image.Image
-		if services.GlobalCacheIndex != nil && targetWidth > 0 && targetHeight > 0 {
-			if cached, ok := services.GlobalCacheIndex.GetMarkerImage(markerPath, targetWidth, targetHeight); ok {
-				markerImg = cached
-			}
-		}
-
-		// Load and resize if not cached
-		if markerImg == nil {
-			var err error
-			markerImg, err = loadImage(markerPath)
-			if err != nil {
-				continue // Skip markers that can't be loaded
-			}
-
-			if targetWidth > 0 && targetHeight > 0 {
-				markerImg = resizeImage(markerImg, targetWidth, targetHeight)
-				// Cache the resized image
-				if services.GlobalCacheIndex != nil {
-					services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
-				}
-			}
-		}
-
-		// Calculate position (ImageMagick uses -gravity Center, so offset is from center)
-		// The marker should be centered at (centerX + offsetX, centerY + offsetY)
-		centerX := dc.Width() / 2
-		centerY := dc.Height() / 2
-
-		// Draw marker at position (top-left corner calculation)
-		drawX := centerX + realOffset.x - markerImg.Bounds().Dx()/2
-		drawY := centerY + realOffset.y - markerImg.Bounds().Dy()/2
-		dc.DrawImage(markerImg, drawX, drawY)
-	}
-
-	return saveImage(path, dc.Image())
+	return nil
 }
 
-// GenerateMultiStaticMapNative combines multiple static maps into a grid using native Go
-func GenerateMultiStaticMapNative(multiStaticMap models.MultiStaticMap, path string) error {
-	// First pass: load all images and calculate total dimensions
-	type gridImage struct {
-		img       image.Image
-		direction models.CombineDirection
+// drawCircle draws a single circle (fill + optional stroke) onto dc.
+func drawCircle(dc *gg.Context, staticMap models.StaticMap, circle models.Circle, sm *SphericalMercator, scale uint8) {
+	coord := models.Coordinate{Latitude: circle.Latitude, Longitude: circle.Longitude}
+	point := getRealOffset(
+		coord,
+		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+		staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+	)
+	radiusCoord := coord.CoordinateAt(circle.Radius, 0)
+	radius := float64(getRealOffset(coord, radiusCoord, staticMap.Zoom, staticMap.Scale, 0, 0, sm).y)
+
+	x := float64(point.x + int(staticMap.Width)*int(scale)/2)
+	y := float64(point.y + int(staticMap.Height)*int(scale)/2)
+
+	// Fill circle
+	fillColor := parseColor(circle.FillColor)
+	dc.SetColor(fillColor)
+	dc.DrawCircle(x, y, radius)
+	dc.Fill()
+
+	// Stroke circle
+	if circle.StrokeWidth > 0 {
+		strokeColor := parseColor(circle.StrokeColor)
+		dc.SetColor(strokeColor)
+		dc.SetLineWidth(float64(circle.StrokeWidth))
+		dc.DrawCircle(x, y, radius)
+		dc.Stroke()
+	}
+}
+
+// GenerateStaticMapFromImage renders overlays on top of baseImg and
+// returns the resulting image.Image. Unlike GenerateStaticMapNative
+// it neither reads from nor writes to disk — the caller owns
+// persistence.
+//
+// Marker-only requests skip gg entirely and stay NRGBA end-to-end.
+// When polygons or circles are present we use gg for its anti-aliased
+// rasterisers, convert its RGBA canvas to NRGBA, then stamp markers
+// on the NRGBA canvas so marker draws hit draw.Draw's same-type path
+// instead of xdraw's RGBA→NRGBA transform.
+func GenerateStaticMapFromImage(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator) (image.Image, error) {
+	scale := staticMap.Scale
+	if scale == 0 {
+		scale = 1
 	}
 
-	var rows [][]gridImage
-	totalHeight := 0
-	maxRowWidth := 0
+	if len(staticMap.Polygons) == 0 && len(staticMap.Circles) == 0 {
+		return drawMarkersNative(staticMap, baseImg, sm, scale), nil
+	}
 
+	dc := gg.NewContextForImage(baseImg)
+
+	for _, polygon := range staticMap.Polygons {
+		if len(polygon.Path) == 0 {
+			continue
+		}
+		if err := drawPolygon(dc, staticMap, polygon, sm, scale); err != nil {
+			return nil, err
+		}
+	}
+	for _, circle := range staticMap.Circles {
+		drawCircle(dc, staticMap, circle, sm, scale)
+	}
+
+	canvas := toNRGBA(dc.Image())
+	for _, marker := range staticMap.Markers {
+		drawMarkerNRGBA(canvas, staticMap, marker, sm, scale)
+	}
+	return canvas, nil
+}
+
+// drawMarkersNative renders markers onto a fresh NRGBA copy of
+// baseImg. Skips gg's RGBA round-trip.
+func drawMarkersNative(staticMap models.StaticMap, baseImg image.Image, sm *SphericalMercator, scale uint8) image.Image {
+	b := baseImg.Bounds()
+	canvas := image.NewNRGBA(b)
+	draw.Draw(canvas, b, baseImg, b.Min, draw.Src)
+
+	for _, marker := range staticMap.Markers {
+		drawMarkerNRGBA(canvas, staticMap, marker, sm, scale)
+	}
+	return canvas
+}
+
+// drawMarkerNRGBA stamps a single marker onto an NRGBA canvas via
+// draw.Draw (NRGBA→NRGBA Over fast path). Skips the marker when
+// outside the visible area or when loading fails.
+func drawMarkerNRGBA(canvas *image.NRGBA, staticMap models.StaticMap, marker models.Marker, sm *SphericalMercator, scale uint8) {
+	realOffset := getRealOffset(
+		models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
+		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
+		staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
+	)
+
+	if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
+		abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
+		return
+	}
+
+	markerPath := getMarkerPath(marker)
+	if marker.FallbackURL != "" {
+		if _, err := os.Stat(markerPath); os.IsNotExist(err) {
+			markerPath = getFallbackMarkerPath(marker)
+		}
+	}
+
+	targetWidth := int(marker.Width) * int(scale)
+	targetHeight := int(marker.Height) * int(scale)
+
+	var markerImg image.Image
+	if services.GlobalCacheIndex != nil && targetWidth > 0 && targetHeight > 0 {
+		if cached, ok := services.GlobalCacheIndex.GetMarkerImage(markerPath, targetWidth, targetHeight); ok {
+			markerImg = cached
+		}
+	}
+	if markerImg == nil {
+		var err error
+		markerImg, err = loadImage(markerPath)
+		if err != nil {
+			return
+		}
+		if targetWidth > 0 && targetHeight > 0 {
+			markerImg = resizeImage(markerImg, targetWidth, targetHeight)
+			if services.GlobalCacheIndex != nil {
+				services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
+			}
+		}
+	}
+
+	centerX := canvas.Bounds().Dx() / 2
+	centerY := canvas.Bounds().Dy() / 2
+	drawX := centerX + realOffset.x - markerImg.Bounds().Dx()/2
+	drawY := centerY + realOffset.y - markerImg.Bounds().Dy()/2
+
+	mb := markerImg.Bounds()
+	dstRect := image.Rect(drawX, drawY, drawX+mb.Dx(), drawY+mb.Dy())
+	draw.Draw(canvas, dstRect, markerImg, mb.Min, draw.Over)
+}
+
+// GenerateMultiStaticMapFromImages composes a grid from already-
+// decoded component images. Caller is responsible for the []Image
+// ordering matching multiStaticMap.Grid[…].Maps[…] iteration order.
+// Returns the composed image; caller owns encoding + persistence.
+//
+// Matches ImageMagick's -append/+append behaviour used by the
+// original Swift implementation: each image in a grid group is
+// sequentially appended to the cumulative result, and images are
+// scaled to match the append dimension (height for +append/right,
+// width for -append/bottom) so the seams align cleanly.
+func GenerateMultiStaticMapFromImages(multiStaticMap models.MultiStaticMap, componentImages []image.Image) (image.Image, error) {
+	var groupImages []image.Image
+	var groupDirections []models.CombineDirection
+
+	idx := 0
 	for _, grid := range multiStaticMap.Grid {
-		var rowImages []gridImage
-		rowWidth := 0
-		rowHeight := 0
-
+		var composite image.Image
 		for _, m := range grid.Maps {
-			mapPath := m.Map.Path()
-			img, err := loadImage(mapPath)
-			if err != nil {
-				return fmt.Errorf("failed to load map %s: %w", mapPath, err)
+			if idx >= len(componentImages) {
+				return nil, fmt.Errorf("component image %d missing (have %d)", idx, len(componentImages))
 			}
-
-			rowImages = append(rowImages, gridImage{img, m.Direction})
-
-			if m.Direction == models.CombineDirectionBottom {
-				if img.Bounds().Dx() > rowWidth {
-					rowWidth = img.Bounds().Dx()
-				}
-				rowHeight += img.Bounds().Dy()
-			} else {
-				rowWidth += img.Bounds().Dx()
-				if img.Bounds().Dy() > rowHeight {
-					rowHeight = img.Bounds().Dy()
-				}
+			img := componentImages[idx]
+			idx++
+			if m.Direction == models.CombineDirectionFirst || composite == nil {
+				composite = img
+				continue
 			}
+			composite = appendImages(composite, img, m.Direction)
 		}
-
-		rows = append(rows, rowImages)
-		if grid.Direction == models.CombineDirectionBottom {
-			totalHeight += rowHeight
-			if rowWidth > maxRowWidth {
-				maxRowWidth = rowWidth
-			}
-		} else {
-			if rowHeight > totalHeight {
-				totalHeight = rowHeight
-			}
-			maxRowWidth += rowWidth
+		if composite != nil {
+			groupImages = append(groupImages, composite)
+			groupDirections = append(groupDirections, grid.Direction)
 		}
 	}
-
-	// Create final image
-	result := image.NewRGBA(image.Rect(0, 0, maxRowWidth, totalHeight))
-
-	// Second pass: draw images
-	currentY := 0
-	currentX := 0
-
-	for gridIdx, grid := range multiStaticMap.Grid {
-		rowImages := rows[gridIdx]
-		rowX := currentX
-		rowY := currentY
-		rowHeight := 0
-
-		for _, gi := range rowImages {
-			bounds := gi.img.Bounds()
-
-			draw.Draw(result, image.Rect(rowX, rowY, rowX+bounds.Dx(), rowY+bounds.Dy()),
-				gi.img, image.Point{}, draw.Src)
-
-			if gi.direction == models.CombineDirectionBottom {
-				rowY += bounds.Dy()
-				if bounds.Dy() > rowHeight {
-					rowHeight = bounds.Dy()
-				}
-			} else {
-				rowX += bounds.Dx()
-				if bounds.Dy() > rowHeight {
-					rowHeight = bounds.Dy()
-				}
-			}
-		}
-
-		if grid.Direction == models.CombineDirectionBottom {
-			currentY += rowHeight
-		} else {
-			currentX = rowX
-		}
+	if len(groupImages) == 0 {
+		return nil, fmt.Errorf("no images to combine")
 	}
+	result := groupImages[0]
+	for i := 1; i < len(groupImages); i++ {
+		dir := groupDirections[i]
+		if dir == models.CombineDirectionFirst {
+			dir = models.CombineDirectionRight
+		}
+		result = appendImages(result, groupImages[i], dir)
+	}
+	return result, nil
+}
 
-	return saveImage(path, result)
+// appendImages combines two images in the given direction, scaling the
+// smaller image to match the larger's dimension along the append axis.
+// This matches ImageMagick's +append (right) and -append (bottom).
+func appendImages(base, addition image.Image, direction models.CombineDirection) image.Image {
+	baseW := base.Bounds().Dx()
+	baseH := base.Bounds().Dy()
+	addW := addition.Bounds().Dx()
+	addH := addition.Bounds().Dy()
+
+	switch direction {
+	case models.CombineDirectionRight:
+		// Horizontal append: scale addition to match base's height.
+		targetH := baseH
+		if addH != targetH && addH > 0 {
+			scaledW := addW * targetH / addH
+			addition = scaleImage(addition, scaledW, targetH)
+			addW = scaledW
+			addH = targetH
+		}
+		combined := image.NewNRGBA(image.Rect(0, 0, baseW+addW, targetH))
+		draw.Draw(combined, image.Rect(0, 0, baseW, baseH), base, image.Point{}, draw.Src)
+		draw.Draw(combined, image.Rect(baseW, 0, baseW+addW, addH), addition, image.Point{}, draw.Src)
+		return combined
+
+	case models.CombineDirectionBottom:
+		// Vertical append: scale addition to match base's width.
+		targetW := baseW
+		if addW != targetW && addW > 0 {
+			scaledH := addH * targetW / addW
+			addition = scaleImage(addition, targetW, scaledH)
+			addW = targetW
+			addH = scaledH
+		}
+		combined := image.NewNRGBA(image.Rect(0, 0, targetW, baseH+addH))
+		draw.Draw(combined, image.Rect(0, 0, baseW, baseH), base, image.Point{}, draw.Src)
+		draw.Draw(combined, image.Rect(0, baseH, addW, baseH+addH), addition, image.Point{}, draw.Src)
+		return combined
+
+	default:
+		// CombineDirectionFirst or unknown — treat as right.
+		return appendImages(base, addition, models.CombineDirectionRight)
+	}
+}
+
+// scaleImage resizes an image to the target dimensions using high-quality
+// CatmullRom interpolation.
+func scaleImage(src image.Image, width, height int) image.Image {
+	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+	return dst
 }
 
 // loadImage loads an image from a file
@@ -397,8 +454,102 @@ func loadImage(path string) (image.Image, error) {
 	return img, err
 }
 
-// loadImageWithRetry loads an image, retrying once via redownload if corrupted
+// toNRGBA normalises a decoded image to *image.NRGBA so later
+// draw.Draw calls into an NRGBA canvas hit the fast same-type copy
+// instead of the generic drawMask path. Identity return for images
+// already NRGBA (vector-tile PNGs decode to NRGBA natively). Pays
+// one draw.Draw on first decode for YCbCr (JPEG, e.g. mapbox
+// satellite tiles) and RGBA (no-alpha PNG) sources; the converted
+// NRGBA is what the caller caches, so the conversion is amortised
+// across every subsequent stitch that hits the LRU.
+func toNRGBA(img image.Image) *image.NRGBA {
+	switch s := img.(type) {
+	case *image.NRGBA:
+		return s
+	case *image.RGBA:
+		return rgbaToNRGBA(s)
+	case *image.YCbCr:
+		return ycbcrToNRGBA(s)
+	}
+	b := img.Bounds()
+	dst := image.NewNRGBA(b)
+	draw.Draw(dst, b, img, b.Min, draw.Src)
+	return dst
+}
+
+// rgbaToNRGBA unpremultiplies a *image.RGBA into *image.NRGBA by
+// direct byte access. Hot path for the fogleman/gg output (gg's
+// canvas is *image.RGBA); the fully-opaque case short-circuits to
+// a memcpy since div-by-255 is identity when alpha is 255.
+func rgbaToNRGBA(src *image.RGBA) *image.NRGBA {
+	b := src.Bounds()
+	dst := image.NewNRGBA(b)
+	w, h := b.Dx(), b.Dy()
+	for y := 0; y < h; y++ {
+		sRow := src.Pix[y*src.Stride : y*src.Stride+w*4]
+		dRow := dst.Pix[y*dst.Stride : y*dst.Stride+w*4]
+		for x := 0; x < w*4; x += 4 {
+			r, g, bl, a := sRow[x+0], sRow[x+1], sRow[x+2], sRow[x+3]
+			switch a {
+			case 0:
+				// dst already zeroed by NewNRGBA
+			case 0xFF:
+				dRow[x+0], dRow[x+1], dRow[x+2], dRow[x+3] = r, g, bl, 0xFF
+			default:
+				// Unpremultiply. uint32 math with 0xFFFF multiplier
+				// mirrors color.NRGBAModel's rounding — draw.Draw's
+				// generic path uses the same formula via .RGBA().
+				aa := uint32(a)
+				dRow[x+0] = uint8((uint32(r) * 0xFFFF / aa) >> 8)
+				dRow[x+1] = uint8((uint32(g) * 0xFFFF / aa) >> 8)
+				dRow[x+2] = uint8((uint32(bl) * 0xFFFF / aa) >> 8)
+				dRow[x+3] = a
+			}
+		}
+	}
+	return dst
+}
+
+// ycbcrToNRGBA converts a YCbCr image to NRGBA by direct pixel
+// access. Faster than draw.Draw because it bypasses the generic
+// RGBA64At/SetRGBA64 dispatch. Hot path for mapbox satellite tiles,
+// which decode as *image.YCbCr.
+func ycbcrToNRGBA(src *image.YCbCr) *image.NRGBA {
+	b := src.Bounds()
+	dst := image.NewNRGBA(b)
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			yi := src.YOffset(x, y)
+			ci := src.COffset(x, y)
+			r, g, bl := color.YCbCrToRGB(src.Y[yi], src.Cb[ci], src.Cr[ci])
+			di := dst.PixOffset(x, y)
+			dst.Pix[di+0] = r
+			dst.Pix[di+1] = g
+			dst.Pix[di+2] = bl
+			dst.Pix[di+3] = 0xFF
+		}
+	}
+	return dst
+}
+
+// loadImageWithRetry loads an image, retrying once via redownload if
+// corrupted. Consults GlobalTileImageCache first — pprof showed PNG
+// decode of already-disk-cached tiles dominating base-map stitching
+// at 54% of CPU, and an in-memory LRU eliminates the repeat decode
+// since the same tiles are requested heavily across adjacent
+// staticmaps. A corrupted-file retry invalidates the cached entry.
 func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, error) {
+	if services.GlobalTileImageCache != nil {
+		start := time.Now()
+		if img, ok := services.GlobalTileImageCache.Get(path); ok {
+			if services.GlobalMetrics != nil {
+				services.GlobalMetrics.RecordTileDecode(services.TileDecodeSourceRAMLRU, time.Since(start).Seconds())
+			}
+			return img, nil
+		}
+	}
+
+	start := time.Now()
 	img, err := loadImage(path)
 	if err != nil && redownload != nil {
 		slog.Warn("Corrupted tile detected, attempting redownload", "path", path, "error", err)
@@ -412,44 +563,26 @@ func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, 
 		}
 		slog.Info("Tile redownload successful", "path", path)
 	}
+
+	if err == nil && img != nil {
+		// Normalise once to NRGBA. Stitch canvases are NRGBA, so
+		// caching non-NRGBA (YCbCr from JPEG, RGBA from opaque PNG)
+		// would force draw.Draw into the generic drawMask path on
+		// every hit. Do the conversion at the LRU boundary instead.
+		img = toNRGBA(img)
+		if services.GlobalMetrics != nil {
+			services.GlobalMetrics.RecordTileDecode(services.TileDecodeSourceDisk, time.Since(start).Seconds())
+		}
+		if services.GlobalTileImageCache != nil {
+			services.GlobalTileImageCache.Add(path, img)
+		}
+	}
 	return img, err
-}
-
-// saveImage saves an image to a file
-func saveImage(path string, img image.Image) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".jpg", ".jpeg":
-		quality := 90
-		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
-			quality = services.GlobalImageSettings.ImageQuality
-		}
-		return jpeg.Encode(f, img, &jpeg.Options{Quality: quality})
-	case ".webp":
-		quality := 90
-		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
-			quality = services.GlobalImageSettings.ImageQuality
-		}
-		return webp.Encode(f, img, webp.Options{Quality: quality})
-	default:
-		// Use configurable PNG compression level
-		encoder := &png.Encoder{CompressionLevel: png.BestCompression}
-		if services.GlobalImageSettings != nil {
-			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
-		}
-		return encoder.Encode(f, img)
-	}
 }
 
 // resizeImage resizes an image to the target dimensions
 func resizeImage(img image.Image, width, height int) image.Image {
-	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
 	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Over, nil)
 	return dst
 }
@@ -531,4 +664,40 @@ func parseColor(s string) color.Color {
 
 	// Use NRGBA for correct alpha handling
 	return color.NRGBA{r, g, b, a}
+}
+
+// EncodeImage serializes img to the appropriate byte representation
+// inferred from pathExt (".png", ".jpg"/".jpeg", ".webp"). Used when
+// the pipeline has an image in hand and needs bytes for an HTTP
+// response or a disk write.
+func EncodeImage(img image.Image, pathExt string) ([]byte, error) {
+	var buf bytes.Buffer
+	ext := strings.ToLower(pathExt)
+	switch ext {
+	case ".jpg", ".jpeg":
+		quality := 90
+		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
+			quality = services.GlobalImageSettings.ImageQuality
+		}
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+			return nil, err
+		}
+	case ".webp":
+		quality := 90
+		if services.GlobalImageSettings != nil && services.GlobalImageSettings.ImageQuality > 0 {
+			quality = services.GlobalImageSettings.ImageQuality
+		}
+		if err := webp.Encode(&buf, img, webp.Options{Quality: quality}); err != nil {
+			return nil, err
+		}
+	default:
+		encoder := &png.Encoder{CompressionLevel: png.BestSpeed, BufferPool: &pngBufferPool}
+		if services.GlobalImageSettings != nil {
+			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
+		}
+		if err := encoder.Encode(&buf, img); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
 }
