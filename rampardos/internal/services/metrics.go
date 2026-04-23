@@ -94,6 +94,12 @@ type MetricsManager struct {
 	rendererGlobalInFlight    prometheus.Gauge
 	rendererGlobalAcquireWait prometheus.Histogram
 
+	// Renderer child-process resource usage. Node workers are outside
+	// Go's heap, so rampardos_memory_rss_bytes alone can't reveal a
+	// Node-side leak. Sum and count are sampled from /proc on Linux.
+	nodeWorkersTotal    prometheus.Gauge
+	nodeWorkersRSSBytes prometheus.Gauge
+
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
 }
@@ -282,6 +288,16 @@ func newMetricsManager() *MetricsManager {
 			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
 		}),
 
+		nodeWorkersTotal: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_node_workers_total",
+			Help: "Count of child Node render-worker processes (ppid == rampardos && comm == node). A climbing count with stable traffic means worker rotation is broken.",
+		}),
+
+		nodeWorkersRSSBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_node_workers_rss_bytes",
+			Help: "Summed Resident Set Size of child Node render-worker processes, in bytes. Outside Go's heap — complements rampardos_memory_rss_bytes. Sampled from /proc on Linux.",
+		}),
+
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
 			Help: "Size of dataset files in bytes",
@@ -299,6 +315,7 @@ func newMetricsManager() *MetricsManager {
 
 func (m *MetricsManager) updateRuntimeMetrics() {
 	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
 	for range ticker.C {
 		m.uptimeSeconds.Set(time.Since(m.startTime).Seconds())
 
@@ -312,6 +329,11 @@ func (m *MetricsManager) updateRuntimeMetrics() {
 			runtime.ReadMemStats(&memStats)
 			m.memoryRSSBytes.Set(float64(memStats.Alloc))
 			m.memoryVSSBytes.Set(float64(memStats.Sys))
+		}
+
+		if sample, ok := sampleNodeWorkers(); ok {
+			m.nodeWorkersTotal.Set(float64(sample.count))
+			m.nodeWorkersRSSBytes.Set(float64(sample.rssBytes))
 		}
 	}
 }
@@ -383,6 +405,83 @@ func readVSSFromStatus() uint64 {
 		}
 	}
 	return 0
+}
+
+// nodeWorkerSample aggregates the render-worker subprocess footprint.
+type nodeWorkerSample struct {
+	count    int
+	rssBytes uint64
+}
+
+// sampleNodeWorkers walks /proc and sums RSS / counts child Node render
+// workers (ppid == our pid, comm == "node"). Linux-only; returns ok=false
+// when /proc isn't available. Sampling cost is proportional to the total
+// process count in the container — trivial for our single-service image.
+func sampleNodeWorkers() (nodeWorkerSample, bool) {
+	selfPID := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nodeWorkerSample{}, false
+	}
+	var out nodeWorkerSample
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		if addNodeWorkerIfMatch(&out, entry.Name(), selfPID) {
+			continue
+		}
+	}
+	return out, true
+}
+
+// addNodeWorkerIfMatch parses /proc/<pid>/status once; if the process is a
+// child node worker of ours, its RSS is added to out. Returns true when the
+// entry was our worker (caller uses this only as a "counted" hint).
+func addNodeWorkerIfMatch(out *nodeWorkerSample, pidDir string, selfPID int) bool {
+	f, err := os.Open("/proc/" + pidDir + "/status")
+	if err != nil {
+		// Process exited between ReadDir and Open — benign.
+		return false
+	}
+	defer f.Close()
+
+	var (
+		name    string
+		ppid    int
+		vmRSS   uint64
+		haveRSS bool
+	)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "Name:"):
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				name = fields[1]
+			}
+		case strings.HasPrefix(line, "PPid:"):
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				ppid, _ = strconv.Atoi(fields[1])
+			}
+		case strings.HasPrefix(line, "VmRSS:"):
+			if fields := strings.Fields(line); len(fields) >= 2 {
+				if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+					vmRSS = v * 1024
+					haveRSS = true
+				}
+			}
+		}
+	}
+	if name != "node" || ppid != selfPID || !haveRSS {
+		return false
+	}
+	out.count++
+	out.rssBytes += vmRSS
+	return true
 }
 
 // RecordRequest records a request with type, cache status, and duration
@@ -564,6 +663,7 @@ func (m *MetricsManager) GetDailyErrorsByCategory() DailyErrorsByCategory {
 // cleanupOldDailyErrors removes daily error entries older than 14 days
 func (m *MetricsManager) cleanupOldDailyErrors() {
 	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
 	for range ticker.C {
 		cutoff := time.Now().AddDate(0, 0, -14).Format("2006-01-02")
 		m.dailyErrorsMu.Lock()
