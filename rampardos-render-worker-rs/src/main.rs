@@ -123,14 +123,20 @@ fn run() -> Result<()> {
         write_frame(&mut stdout, FRAME_HANDSHAKE, &hs_json)?;
     }
 
-    // In maplibre-native-rs v0.4.5, `set_map_size` does not reliably
-    // resize the framebuffer between renders in Static mode: the first
-    // render after a size change still uses the builder-time size. We
-    // work around it by caching one renderer per (width, height) tuple.
-    // Each distinct size pays one ~500 ms build-and-style-load cost on
-    // its first request; subsequent requests at that size reuse the
-    // cached renderer. Production workloads with a handful of template
-    // sizes per style settle quickly and then pay zero overhead.
+    // Work around upstream maplibre-native Vulkan bug: the Vulkan
+    // HeadlessBackend lazy-inits a staging Texture2D on the first
+    // readStillImage at whatever size the backend has at that moment,
+    // and never resizes it. Once a renderer has rendered once, any
+    // subsequent set_map_size is silently ignored on reads — the output
+    // stays pinned at the first-render size. See
+    //   platform/default/src/mbgl/vulkan/headless_backend.cpp:77
+    // in maplibre/maplibre-native (pinned commit
+    // 9b6325a14e2cf1cc29ab28c1855ad376f1ba4903). OpenGL/Metal backends
+    // are not affected. Until the fix lands upstream + an amalgam with
+    // it is released, cache one renderer per (width, height) so each
+    // distinct size renders on a pristine, correctly-sized instance.
+    // Production workloads with a handful of template sizes per style
+    // settle quickly and pay zero steady-state overhead.
     let mut cache = RendererCache::new(args, Arc::clone(&fs_state));
 
     let stdin = io::stdin();
