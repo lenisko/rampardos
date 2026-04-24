@@ -1,0 +1,66 @@
+# Dev/test environment for the Rust render-worker POC.
+#
+# Provides the build deps for maplibre_native (either via prebuilt Linux amalgam
+# or source build), Mesa's Vulkan software ICD (lavapipe) for headless CPU
+# rendering, Node.js 24 for running the baseline Node worker in the bench
+# harness, and Rust via rustup.
+#
+# Intended usage:
+#   docker build -f rampardos-render-worker-rs/docker/Dockerfile.dev \
+#     -t rampardos-rust-poc-dev \
+#     rampardos-render-worker-rs/
+#   docker run --rm -it \
+#     -v $PWD:/work \
+#     -v $PWD/../maplibre-native-rs-fork:/work/maplibre-native-rs-fork \
+#     -v /Users/james/GolandProjects/rampardos-tileserver-replacement:/fixtures:ro \
+#     -e CARGO_TARGET_DIR=/target-linux \
+#     rampardos-rust-poc-dev bash
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git \
+      build-essential cmake pkg-config \
+      # Runtime libs the amalgam unconditionally links against at the final
+      # link step (see build.rs: curl + zlib on every backend). libssl-dev
+      # is needed because the build-time `downloader` crate pulls openssl-sys.
+      libcurl4-openssl-dev libssl-dev zlib1g-dev \
+      # rusqlite uses the bundled sqlite3 source, so libsqlite3-dev is NOT
+      # needed. Uncomment if switching to the system-sqlite feature.
+      # libsqlite3-dev \
+      # Mesa Vulkan software ICD (lavapipe) + loader — enables headless CPU
+      # rendering with no GPU or display server. EGL_PLATFORM=surfaceless
+      # keeps X11 out of the runtime dependency set.
+      mesa-vulkan-drivers libvulkan1 vulkan-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 24 + GL/EGL runtime for the baseline Node render-worker. The Node
+# binding uses maplibre-native's OpenGL backend (not Vulkan), so we need
+# Mesa GL/EGL/GBM. Xvfb is kept as a fallback if the EGL surfaceless path
+# doesn't work for the Node binding.
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+    libgl1 libegl1 libgbm1 libopengl0 libglx-mesa0 libglx0 \
+    libjpeg8 libwebp7 libpng16-16t64 libicu74 libuv1 \
+    xvfb \
+ && rm -rf /var/lib/apt/lists/*
+# The Node worker's node_modules are installed at bench-run time via the
+# helper script (scripts/bench-in-docker.sh) — done outside the image so
+# iterating on render-worker/package.json doesn't rebuild the base image.
+
+# Install Rust via rustup so we match the host toolchain version.
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 --profile minimal \
+ && /root/.cargo/bin/rustup component add rustfmt clippy
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Rendering env: surfaceless EGL so no display server is needed. The Vulkan
+# loader auto-discovers the lavapipe ICD from /usr/share/vulkan/icd.d/ without
+# hard-coding an arch-specific filename (x86_64 vs aarch64 vs *_icd.json
+# multi-arch wrapper).
+ENV EGL_PLATFORM=surfaceless \
+    MLN_PRECOMPILE=1
+
+WORKDIR /work
+CMD ["bash"]

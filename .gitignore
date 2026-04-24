@@ -7,5 +7,9 @@
 /Temp
 docker-compose.*.yml
 bin/
+# Un-ignore our Cargo bin-target directory — the pattern above was
+# intended for Go-style output binaries, but matches too broadly.
+!rampardos-render-worker-rs/src/bin/
 .env
 rampardos/rampardos.exe
+.claude/

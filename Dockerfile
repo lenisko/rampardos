@@ -60,6 +60,33 @@ RUN npm install --omit=optional \
  && rm -f /build/package-lock.json
 
 # ================================
+# Build the Rust render worker (alternative to the Node one)
+# ================================
+# Ubuntu 24.04 matches the runtime base, so the release binary links
+# against the same glibc/libcurl/libz/libvulkan the runtime ships.
+# maplibre_native is a git dep on the FileSource-callback fork; the
+# build downloads the prebuilt linux-$arch amalgam via MLN_PRECOMPILE=1
+# (no local clone / source build required).
+FROM --platform=$TARGETPLATFORM ubuntu:24.04 AS rust-render-deps
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    ca-certificates curl git \
+    build-essential cmake pkg-config \
+    # Link-time libs: the maplibre-native amalgam unconditionally links
+    # curl + zlib. libssl-dev is pulled by the build-time `downloader`
+    # crate.
+    libcurl4-openssl-dev libssl-dev zlib1g-dev \
+ && curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.0 --profile minimal \
+ && rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    MLN_PRECOMPILE=1
+WORKDIR /build
+COPY rampardos-render-worker-rs/Cargo.toml rampardos-render-worker-rs/Cargo.lock ./
+COPY rampardos-render-worker-rs/src ./src
+RUN cargo build --release --bin rampardos-render-worker-rs
+
+# ================================
 # Build Go binary
 # ================================
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS rampardos-build
@@ -91,16 +118,17 @@ RUN apt-get update \
     # Node.js via NodeSource
  && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
-    # maplibre-native runtime deps (Mesa/OpenGL headless rendering)
+    # maplibre-native runtime deps for the NODE worker (Mesa/OpenGL
+    # headless rendering via Xvfb).
     libglx0 libgl1 libegl1 libgbm1 libopengl0 \
-    # maplibre-native additional deps
     libcurl4 libjpeg8 libwebp7 libpng16-16 libicu74 \
-    # libuv (maplibre-native links against it directly)
     libuv1 \
-    # Xvfb for headless GL rendering (maplibre-native needs an X display)
     xvfb \
-    # SQLite for better-sqlite3
     libsqlite3-0 \
+    # Runtime deps for the RUST worker: Mesa Vulkan software ICD
+    # (lavapipe). Adds ~30 MB; lets the Rust worker run fully
+    # headless without Xvfb. The Node worker continues to use GL + Xvfb.
+    mesa-vulkan-drivers libvulkan1 \
  && apt-get purge -y curl \
  && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
@@ -136,20 +164,37 @@ COPY --from=render-deps \
 COPY rampardos-render-worker/render-worker.js /app/render-worker/render-worker.js
 COPY rampardos-render-worker/package.json /app/render-worker/package.json
 
+# Rust render worker (alternative to the Node one). The Go orchestrator
+# picks the binary via RENDERER_NODE_BINARY + RENDERER_WORKER_SCRIPT; both
+# workers ship in the image so operators can flip between them without a
+# rebuild. See entrypoint.sh / docs below.
+COPY --from=rust-render-deps \
+     /build/target/release/rampardos-render-worker-rs \
+     /app/render-worker-rs/rampardos-render-worker-rs
+
 # Create directories
 RUN mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable \
     TileServer/Fonts TileServer/Styles TileServer/Datasets Templates Markers
 
-# Force EGL backend for headless rendering (no X11 display in Docker).
-# Without this, maplibre-native tries GLX and loops on "Failed to open X display".
+# Defaults: NODE worker. To flip to the Rust worker at runtime, set:
+#   RENDERER_NODE_BINARY=/app/render-worker-rs/rampardos-render-worker-rs
+#   RENDERER_WORKER_SCRIPT=-   (any non-empty string; the Rust binary
+#                               accepts and ignores this positional)
+#
+# The Node worker path (below) stays the default so existing deployments
+# are unaffected. The Rust worker is headless via Mesa Vulkan (lavapipe) —
+# it does not use Xvfb/DISPLAY, so flipping workers costs nothing.
 ENV DISPLAY=:0
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV MESA_GL_VERSION_OVERRIDE=3.3
 ENV RENDERER_WORKER_SCRIPT=/app/render-worker/render-worker.js
+# EGL surfaceless for the Rust worker — harmless to the Node worker,
+# which ignores it.
+ENV EGL_PLATFORM=surfaceless
 EXPOSE 9000
 
-# Start Xvfb (virtual framebuffer) then rampardos. maplibre-native
-# requires a GL context; Xvfb provides one without a physical display.
+# Start Xvfb (virtual framebuffer) then rampardos. The Node worker needs
+# it; the Rust worker ignores it (Mesa Vulkan is surfaceless).
 COPY <<'EOF' /app/entrypoint.sh
 #!/bin/sh
 rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
