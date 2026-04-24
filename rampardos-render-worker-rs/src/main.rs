@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use maplibre_native::{Height, ImageRendererBuilder, Size, Width};
+use maplibre_native::{ImageRenderer, ImageRendererBuilder, Static};
 use serde::{Deserialize, Serialize};
 
 use crate::fs_handler::FsState;
@@ -104,9 +104,6 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    // Args are ignored aside from what the Rust worker actually needs.
-    // styles_dir / fonts_dir are kept in the CLI for protocol-compatibility
-    // with render-worker.js; file:// URL resolution happens in fs_handler.
     let args = Args::parse();
     let _ = (&args.styles_dir, &args.fonts_dir);
 
@@ -114,29 +111,9 @@ fn run() -> Result<()> {
         FsState::new(&args.mbtiles).context("initializing mbtiles FileSource state")?,
     );
 
-    // Clone for the callback closure. FsState::handle takes &self and is
-    // Send + Sync (backed by Mutex<Connection>).
-    let fs_state_cb = Arc::clone(&fs_state);
-    let callback = move |url: &str, kind| fs_state_cb.handle(url, kind);
-
-    // Build the renderer. Size is a placeholder — every R frame re-sizes.
-    let width = NonZeroU32::new(512).unwrap();
-    let height = NonZeroU32::new(512).unwrap();
-    let pixel_ratio: f32 = args.ratio as f32;
-
-    let mut renderer = ImageRendererBuilder::new()
-        .with_size(width, height)
-        .with_pixel_ratio(pixel_ratio)
-        .with_file_source_callback(callback)
-        .build_static_renderer();
-
-    // Load the style. The baked URL scheme inside style.prepared.json
-    // (mbtiles://..., file://...) routes through our FileSource callback.
-    renderer
-        .load_style_from_path(&args.style_path)
-        .with_context(|| format!("loading style from {}", args.style_path))?;
-
-    // Handshake — Go orchestrator waits for this before sending any R frames.
+    // Handshake is emitted BEFORE the first renderer build — the Go
+    // orchestrator waits for it and we want to fail fast on mbtiles-open
+    // errors before that point, not after.
     {
         let hs = Handshake { pid: std::process::id(), style: args.style_id.clone() };
         let hs_json = serde_json::to_vec(&hs)?;
@@ -144,7 +121,15 @@ fn run() -> Result<()> {
         write_frame(&mut stdout, FRAME_HANDSHAKE, &hs_json)?;
     }
 
-    // Main loop: read frames, dispatch, respond.
+    // The renderer is lazy — built on the first R frame at that request's
+    // exact size. In maplibre-native-rs v0.4.5, `set_map_size` does not
+    // reliably resize the framebuffer between renders in Static mode (the
+    // first render after a size change still uses the builder-time size),
+    // so we rebuild the renderer whenever the requested (width, height)
+    // changes. Same-size streams pay no extra cost; transitions eat one
+    // style reload (~100-200 ms) per change.
+    let mut cache = RendererCache::new(args, Arc::clone(&fs_state));
+
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = io::stdout();
@@ -152,18 +137,14 @@ fn run() -> Result<()> {
 
     loop {
         match read_frame(&mut reader)? {
-            ReadFrameResult::Eof => {
-                // Clean shutdown path. mbgl will tear down via Drop when
-                // renderer goes out of scope.
-                break;
-            }
+            ReadFrameResult::Eof => break,
             ReadFrameResult::Frame { typ, payload } => {
                 if typ != FRAME_REQUEST {
                     let msg = format!("unexpected frame type: {}", typ as char);
                     write_frame(&mut writer, FRAME_ERROR, msg.as_bytes())?;
                     continue;
                 }
-                match handle_request(&mut renderer, &payload) {
+                match handle_request(&mut cache, &payload) {
                     Ok(rgba) => write_frame(&mut writer, FRAME_OK, &rgba)?,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -177,10 +158,52 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn handle_request(
-    renderer: &mut maplibre_native::ImageRenderer<maplibre_native::Static>,
-    payload: &[u8],
-) -> Result<Vec<u8>> {
+/// Per-(width, height) renderer cache. Rebuilds on size change; reuses
+/// otherwise.
+struct RendererCache {
+    args: Args,
+    fs_state: Arc<FsState>,
+    current: Option<(u32, u32, ImageRenderer<Static>)>,
+}
+
+impl RendererCache {
+    fn new(args: Args, fs_state: Arc<FsState>) -> Self {
+        Self { args, fs_state, current: None }
+    }
+
+    fn for_size(&mut self, w: u32, h: u32) -> Result<&mut ImageRenderer<Static>> {
+        if let Some((cur_w, cur_h, _)) = self.current.as_ref() {
+            if *cur_w == w && *cur_h == h {
+                return Ok(&mut self.current.as_mut().unwrap().2);
+            }
+        }
+
+        // Drop the old renderer first so its ~200 MB footprint is freed
+        // before we allocate a new one.
+        self.current = None;
+
+        let fs_cb_state = Arc::clone(&self.fs_state);
+        let callback = move |url: &str, kind| fs_cb_state.handle(url, kind);
+
+        let nw = NonZeroU32::new(w).context("width must be > 0")?;
+        let nh = NonZeroU32::new(h).context("height must be > 0")?;
+
+        let mut renderer = ImageRendererBuilder::new()
+            .with_size(nw, nh)
+            .with_pixel_ratio(self.args.ratio as f32)
+            .with_file_source_callback(callback)
+            .build_static_renderer();
+
+        renderer
+            .load_style_from_path(&self.args.style_path)
+            .with_context(|| format!("loading style from {}", self.args.style_path))?;
+
+        self.current = Some((w, h, renderer));
+        Ok(&mut self.current.as_mut().unwrap().2)
+    }
+}
+
+fn handle_request(cache: &mut RendererCache, payload: &[u8]) -> Result<Vec<u8>> {
     let req: RenderRequest =
         serde_json::from_slice(payload).context("parsing request JSON")?;
 
@@ -189,15 +212,23 @@ fn handle_request(
     let lng = req.center[0];
     let lat = req.center[1];
 
-    let w = NonZeroU32::new(req.width.max(1)).unwrap();
-    let h = NonZeroU32::new(req.height.max(1)).unwrap();
-    renderer.set_map_size(Size::new(Width(w.get()), Height(h.get())));
-
+    let renderer = cache.for_size(req.width.max(1), req.height.max(1))?;
     let image = renderer
         .render_static(lat, lng, req.zoom, req.bearing, req.pitch)
         .context("render_static")?;
 
-    // Return raw RGBA bytes (buffer.as_raw() gives the flat Vec<u8>).
+    // Defence-in-depth: if mbgl ever returns an unexpected size, fail the
+    // request with a specific error rather than silently shipping bad bytes.
+    // The Go orchestrator also checks this (`renderer: worker returned N
+    // bytes, expected M`), so catching it here produces a clearer message.
     let buf = image.as_image();
+    let got = buf.as_raw().len() as u32;
+    let want = req.width * req.height * 4 * cache.args.ratio * cache.args.ratio;
+    if got != want {
+        anyhow::bail!(
+            "rendered size mismatch: got {got} bytes, expected {want} for {}x{} @ ratio {}",
+            req.width, req.height, cache.args.ratio
+        );
+    }
     Ok(buf.as_raw().clone())
 }
