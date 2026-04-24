@@ -9,9 +9,11 @@
 mod fs_handler;
 mod protocol;
 
+use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -121,13 +123,14 @@ fn run() -> Result<()> {
         write_frame(&mut stdout, FRAME_HANDSHAKE, &hs_json)?;
     }
 
-    // The renderer is lazy — built on the first R frame at that request's
-    // exact size. In maplibre-native-rs v0.4.5, `set_map_size` does not
-    // reliably resize the framebuffer between renders in Static mode (the
-    // first render after a size change still uses the builder-time size),
-    // so we rebuild the renderer whenever the requested (width, height)
-    // changes. Same-size streams pay no extra cost; transitions eat one
-    // style reload (~100-200 ms) per change.
+    // In maplibre-native-rs v0.4.5, `set_map_size` does not reliably
+    // resize the framebuffer between renders in Static mode: the first
+    // render after a size change still uses the builder-time size. We
+    // work around it by caching one renderer per (width, height) tuple.
+    // Each distinct size pays one ~500 ms build-and-style-load cost on
+    // its first request; subsequent requests at that size reuse the
+    // cached renderer. Production workloads with a handful of template
+    // sizes per style settle quickly and then pay zero overhead.
     let mut cache = RendererCache::new(args, Arc::clone(&fs_state));
 
     let stdin = io::stdin();
@@ -158,30 +161,41 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Per-(width, height) renderer cache. Rebuilds on size change; reuses
-/// otherwise.
+/// Cache of renderers keyed by (width, height). Each distinct size that
+/// the worker sees gets its own renderer, built on first request. The
+/// cache grows unbounded — production workloads have a handful of
+/// template sizes per style, so the cache saturates quickly and stays
+/// that way. Each cached renderer holds ~200 MB (style + tile cache +
+/// the usual mbgl state), so the caller is trusted not to feed pathological
+/// size streams.
 struct RendererCache {
     args: Args,
     fs_state: Arc<FsState>,
-    current: Option<(u32, u32, ImageRenderer<Static>)>,
+    renderers: HashMap<(u32, u32), ImageRenderer<Static>>,
 }
 
 impl RendererCache {
     fn new(args: Args, fs_state: Arc<FsState>) -> Self {
-        Self { args, fs_state, current: None }
+        Self { args, fs_state, renderers: HashMap::new() }
     }
 
     fn for_size(&mut self, w: u32, h: u32) -> Result<&mut ImageRenderer<Static>> {
-        if let Some((cur_w, cur_h, _)) = self.current.as_ref() {
-            if *cur_w == w && *cur_h == h {
-                return Ok(&mut self.current.as_mut().unwrap().2);
-            }
+        if !self.renderers.contains_key(&(w, h)) {
+            let started = Instant::now();
+            let renderer = self.build(w, h)?;
+            self.renderers.insert((w, h), renderer);
+            eprintln!(
+                "render-worker-rs: built new renderer for {}x{} ({} ms; cache size now {})",
+                w,
+                h,
+                started.elapsed().as_millis(),
+                self.renderers.len(),
+            );
         }
+        Ok(self.renderers.get_mut(&(w, h)).unwrap())
+    }
 
-        // Drop the old renderer first so its ~200 MB footprint is freed
-        // before we allocate a new one.
-        self.current = None;
-
+    fn build(&self, w: u32, h: u32) -> Result<ImageRenderer<Static>> {
         let fs_cb_state = Arc::clone(&self.fs_state);
         let callback = move |url: &str, kind| fs_cb_state.handle(url, kind);
 
@@ -198,8 +212,7 @@ impl RendererCache {
             .load_style_from_path(&self.args.style_path)
             .with_context(|| format!("loading style from {}", self.args.style_path))?;
 
-        self.current = Some((w, h, renderer));
-        Ok(&mut self.current.as_mut().unwrap().2)
+        Ok(renderer)
     }
 }
 
@@ -212,6 +225,7 @@ fn handle_request(cache: &mut RendererCache, payload: &[u8]) -> Result<Vec<u8>> 
     let lng = req.center[0];
     let lat = req.center[1];
 
+    let ratio = cache.args.ratio;
     let renderer = cache.for_size(req.width.max(1), req.height.max(1))?;
     let image = renderer
         .render_static(lat, lng, req.zoom, req.bearing, req.pitch)
@@ -223,11 +237,11 @@ fn handle_request(cache: &mut RendererCache, payload: &[u8]) -> Result<Vec<u8>> 
     // bytes, expected M`), so catching it here produces a clearer message.
     let buf = image.as_image();
     let got = buf.as_raw().len() as u32;
-    let want = req.width * req.height * 4 * cache.args.ratio * cache.args.ratio;
+    let want = req.width * req.height * 4 * ratio * ratio;
     if got != want {
         anyhow::bail!(
             "rendered size mismatch: got {got} bytes, expected {want} for {}x{} @ ratio {}",
-            req.width, req.height, cache.args.ratio
+            req.width, req.height, ratio
         );
     }
     Ok(buf.as_raw().clone())
