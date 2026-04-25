@@ -32,7 +32,7 @@ RUN git clone --depth 1 -b 1.36.0 https://github.com/mapbox/tippecanoe.git \
     && make -j$(nproc) \
     && make install \
     && mkdir -p /tippecanoe-out \
-    && cp /usr/local/bin/tippecanoe* /tippecanoe-out/
+    && cp /usr/local/bin/tippecanoe* /usr/local/bin/tile-join /tippecanoe-out/
 
 # ================================
 # Build fontnik (needs Debian for bash scripts)
@@ -80,7 +80,7 @@ COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
 # Copy fontnik
 COPY --from=fontnik-build /fontnik /app/fontnik
-ENV PATH="/app/fontnik/node_modules/.bin:$PATH"
+RUN ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs
 
 # Copy Go binary
 COPY --from=go-build /build/rampardos /app/rampardos
