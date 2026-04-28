@@ -25,14 +25,14 @@ RUN GIT_COMMIT=$(cat /git-commit.txt) && \
 # ================================
 FROM alpine:3.20 AS tippecanoe-build
 
-RUN apk add --no-cache build-base sqlite-dev zlib-dev git bash
+RUN apk add --no-cache build-base sqlite-dev sqlite-static zlib-dev zlib-static git bash
 
 RUN git clone --depth 1 -b 1.36.0 https://github.com/mapbox/tippecanoe.git \
     && cd tippecanoe \
-    && make -j$(nproc) \
+    && make -j$(nproc) LDFLAGS="-static -static-libgcc -static-libstdc++" \
     && make install \
     && mkdir -p /tippecanoe-out \
-    && cp /usr/local/bin/tippecanoe* /tippecanoe-out/
+    && cp /usr/local/bin/tippecanoe* /usr/local/bin/tile-join /tippecanoe-out/
 
 # ================================
 # Build fontnik (needs Debian for bash scripts)
@@ -80,7 +80,7 @@ COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
 # Copy fontnik
 COPY --from=fontnik-build /fontnik /app/fontnik
-ENV PATH="/app/fontnik/node_modules/.bin:$PATH"
+RUN ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs
 
 # Copy Go binary
 COPY --from=go-build /build/rampardos /app/rampardos
