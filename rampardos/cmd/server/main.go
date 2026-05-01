@@ -113,9 +113,29 @@ func main() {
 		},
 	}
 	localStyleIDs, _ := rendererCfg.DiscoverStyles()
-	renderEngine, err := renderer.NewNodePoolRenderer(rendererCfg, renderer.DefaultSpawnFactory(rendererCfg))
+
+	// Backend selection. "node-pool" is the production default and runs
+	// the existing Node subprocess workers. "go-pool" is the in-process
+	// path on top of maplibre-native-go (see
+	// docs/superpowers/plans/2026-05-01-in-process-go-renderer.md);
+	// requires building with -tags mln_ffi and the libmln_ffi.so present
+	// at runtime. Without the tag, NewGoPoolRenderer returns a clear
+	// error from the stub and we exit rather than silently falling back.
+	var (
+		renderEngine renderer.Renderer
+		err          error
+	)
+	switch cfg.RendererBackend {
+	case "go-pool":
+		renderEngine, err = renderer.NewGoPoolRenderer(rendererCfg)
+	case "node-pool", "":
+		renderEngine, err = renderer.NewNodePoolRenderer(rendererCfg, renderer.DefaultSpawnFactory(rendererCfg))
+	default:
+		slog.Error("Unknown RENDERER_BACKEND; expected 'node-pool' or 'go-pool'", "backend", cfg.RendererBackend)
+		os.Exit(1)
+	}
 	if err != nil {
-		slog.Error("Failed to initialise renderer", "error", err)
+		slog.Error("Failed to initialise renderer", "backend", cfg.RendererBackend, "error", err)
 		os.Exit(1)
 	}
 	// renderEngine.Close() is called explicitly during shutdown (after the
