@@ -75,6 +75,24 @@ RUN eval "$(mise activate bash)" && mise run build
 RUN test -f build/libmaplibre-native-c.so \
  && test -f build/pkgconfig/maplibre-native-c.pc
 
+# The FFI's CMake links the .so against the pixi conda env's libs
+# (libicu 78, libuv 1, libjpeg 8, libwebp 7, libpng16) — versions that
+# don't match Debian Trixie / Ubuntu 24.04 system packages. Without
+# this bundling step, a downstream `ld` against libmaplibre-native-c.so
+# fails to resolve DT_NEEDED entries (libicuuc.so.78, etc.) and the
+# Go build errors out with "undefined reference" linker errors.
+#
+# Strategy: ldd recursively expands the dependency closure, awk filters
+# to entries living under /ffi/.pixi/, cp -L dereferences any symlinks
+# so the destination filename matches the DT_NEEDED soname directly.
+# Bundled libs land alongside libmaplibre-native-c.so in /ffi/build,
+# so both -L${libdir} from pkg-config and the dynamic linker's view of
+# the .so's transitive deps resolve in one place.
+RUN for lib in $(LD_LIBRARY_PATH=/ffi/.pixi/envs/default/lib ldd build/libmaplibre-native-c.so | awk '/=> .*pixi/ {print $3}'); do \
+        cp -L "$lib" build/; \
+    done \
+ && ls -la build/*.so*
+
 # ================================
 # Render worker deps (maplibre-gl-native + better-sqlite3)
 # ================================
@@ -128,6 +146,7 @@ RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
     PKG_CONFIG_PATH=/ffi/build/pkgconfig \
+    CGO_LDFLAGS="-Wl,-rpath-link=/ffi/build" \
     CGO_ENABLED=1 \
     go build -trimpath -tags 'nodynamic mln_ffi' \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
@@ -171,12 +190,21 @@ COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 COPY --from=fontnik-build /fontnik /app/fontnik
 RUN ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs
 
-# maplibre-native-ffi shared library — only loaded at process start when
-# RENDERER_BACKEND=go-pool is set. ldconfig adds /usr/local/lib to the
-# dynamic linker's search path so rampardos resolves it without an
-# explicit RPATH or LD_LIBRARY_PATH.
-COPY --from=mln-ffi-build /ffi/build/libmaplibre-native-c.so /usr/local/lib/
-RUN ldconfig
+# maplibre-native-ffi shared library + its pixi-conda-env transitive deps
+# (libicuuc.so.78, libuv.so.1, libjpeg.so.8, libpng16.so.16, libwebp.so.7,
+# libicui18n.so.78, libicudata.so.78). Bundled together in a dedicated
+# directory rather than dumped into /usr/local/lib so they don't shadow
+# matching-soname Ubuntu system libraries used by other parts of the
+# image (the Node binding's GL stack also pulls in libuv1/libpng/libjpeg).
+# A dedicated ld.so.conf.d entry registers the directory with the
+# dynamic linker; only consumers that resolve via the cache pick these
+# up — the existing /usr/lib search path is unchanged.
+COPY --from=mln-ffi-build /ffi/build /tmp/ffi-build
+RUN mkdir -p /opt/rampardos/lib \
+ && cp -L /tmp/ffi-build/*.so* /opt/rampardos/lib/ \
+ && rm -rf /tmp/ffi-build \
+ && echo /opt/rampardos/lib > /etc/ld.so.conf.d/rampardos.conf \
+ && ldconfig
 
 # Go binary
 COPY --from=rampardos-build /out/rampardos /app/rampardos
