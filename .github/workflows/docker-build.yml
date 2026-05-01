@@ -61,7 +61,15 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # linux/arm64 disabled while the maplibre-native-ffi build
+          # stage runs under QEMU emulation. The FFI build itself is
+          # ~10-20 min cold on amd64 native; under arm64 emulation it
+          # would push past sensible CI budgets. Restore via either
+          # a native ubuntu-24.04-arm runner matrix (the FFI repo's
+          # own CI does this) or a cross-compile path. Captured as a
+          # follow-up once the Go renderer has been validated on
+          # amd64. See scripts/build-mln-ffi.sh for the host equivalent.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,6 +1,6 @@
 .PHONY: build run test test-integration test-coverage clean tidy fmt lint \
        npm-install docker-build docker-push docker-compose-up docker-compose-down \
-       docker-compose-logs setup-dirs help
+       docker-compose-logs setup-dirs help build-ffi build-go-renderer clean-ffi
 
 # Binary name
 BINARY_NAME=rampardos
@@ -23,7 +23,16 @@ LDFLAGS=-ldflags="-w -s -X github.com/lenisko/rampardos/internal/version.gitComm
 # Docker
 DOCKER_IMAGE=ghcr.io/lenisko/rampardos
 DOCKER_TAG=latest
-DOCKER_PLATFORMS=linux/amd64,linux/arm64
+# linux/arm64 disabled while the FFI build runs under QEMU emulation —
+# see comment in .github/workflows/docker-build.yml.
+DOCKER_PLATFORMS=linux/amd64
+
+# In-process Go renderer (RENDERER_BACKEND=go-pool) — see plan in
+# docs/superpowers/plans/2026-05-01-in-process-go-renderer.md.
+# MLN_FFI_REV MUST stay in sync with the ARG in the Dockerfile's
+# mln-ffi-build stage; bump both together when the Go binding changes.
+MLN_FFI_REV ?= f1d00086e0da85617edc1ce5281b4c5f4e5938e1
+MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi-linux
 
 # Default target
 all: build
@@ -83,6 +92,25 @@ clean:
 	$(GOCLEAN)
 	rm -rf $(BUILD_DIR)
 	rm -f $(GO_DIR)/coverage.out $(GO_DIR)/coverage.html
+
+## build-ffi: Build libmaplibre-native-c.so for the Go renderer (~10-20 min cold)
+build-ffi:
+	MLN_FFI_REV=$(MLN_FFI_REV) MLN_FFI_DIR_HOST=$(MLN_FFI_DIR_HOST) ./scripts/build-mln-ffi.sh
+
+## build-go-renderer: Build rampardos with the Go renderer compiled in (-tags mln_ffi). Run build-ffi first.
+build-go-renderer:
+	@test -f $(MLN_FFI_DIR_HOST)/build/libmaplibre-native-c.so || \
+	  (echo "FFI not built. Run 'make build-ffi' first." >&2 && exit 1)
+	@mkdir -p $(BUILD_DIR)
+	cd $(GO_DIR) && \
+	  PKG_CONFIG_PATH=$(MLN_FFI_DIR_HOST)/build/pkgconfig \
+	  CGO_LDFLAGS="-Wl,-rpath,$(MLN_FFI_DIR_HOST)/build" \
+	  CGO_ENABLED=1 \
+	  $(GOBUILD) -trimpath $(LDFLAGS) -tags 'nodynamic mln_ffi' -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
+
+## clean-ffi: Remove the host FFI build directory ($MLN_FFI_DIR_HOST)
+clean-ffi:
+	rm -rf $(MLN_FFI_DIR_HOST)
 
 ## tidy: Tidy and verify Go dependencies
 tidy:
