@@ -9,6 +9,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/grafana/pyroscope-go v1.2.7
+	github.com/jfberry/maplibre-native-go v0.0.0-20260501094219-4f1c8f391cdc
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/image v0.34.0
 	golang.org/x/sync v0.20.0
