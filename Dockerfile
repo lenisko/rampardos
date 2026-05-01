@@ -103,12 +103,16 @@ RUN for lib in $(LD_LIBRARY_PATH=/ffi/.pixi/envs/default/lib ldd build/libmaplib
 # RENDERER_BACKEND=node-pool was selected. RPATH-on-the-.so keeps the
 # bundle invisible to anything that doesn't load libmaplibre-native-c.so.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends patchelf \
+ && apt-get install -y --no-install-recommends patchelf binutils \
  && rm -rf /var/lib/apt/lists/* \
+ && set -x \
  && for lib in build/*.so*; do \
-        patchelf --set-rpath '$ORIGIN' "$lib" || true; \
+        patchelf --set-rpath '$ORIGIN' "$lib" \
+          || echo "WARN: patchelf failed on $lib"; \
     done \
- && readelf -d build/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH'
+ && set +x \
+ && echo "--- libmaplibre-native-c.so DT_RUNPATH/DT_RPATH ---" \
+ && readelf -d build/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
 # ================================
 # Render worker deps (maplibre-gl-native + better-sqlite3)
