@@ -113,8 +113,12 @@ RUN npm install --omit=optional \
 # ================================
 FROM golang:1.26 AS rampardos-build
 ENV DEBIAN_FRONTEND=noninteractive
+# libvulkan-dev provides vulkan.pc — required because the binding's
+# texture_vulkan_linux.go declares `#cgo linux pkg-config: vulkan`.
+# Compile-time dep only; the runtime libvulkan1 / mesa-vulkan-drivers
+# are installed on the runtime image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config \
+ && apt-get install -y --no-install-recommends pkg-config libvulkan-dev \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=mln-ffi-build /ffi/build /ffi/build
 COPY --from=mln-ffi-build /ffi/include /ffi/include
