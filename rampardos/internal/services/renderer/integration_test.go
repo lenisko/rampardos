@@ -8,27 +8,60 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/lenisko/rampardos/internal/models"
 )
 
-// TestIntegrationRealWorker exercises the full NodePoolRenderer against
-// a real Node worker spawned with `@maplibre/maplibre-gl-native`. It
-// uses a minimal background-only style so the test does not need real
-// tile data inside the mbtiles file.
+// Integration tests for the renderer, parameterised over the backend.
 //
-// Run with: go test -tags renderer_integration ./internal/services/renderer/ -v
+// TestIntegrationNode exercises NodePoolRenderer against a real Node
+// worker spawned with @maplibre/maplibre-gl-native. TestIntegrationGo
+// (in integration_mln_ffi_test.go, gated by the mln_ffi build tag)
+// exercises GoPoolRenderer against the maplibre-native-go binding.
+// Both share the fixtures and assertions defined here so the two paths
+// stay observably equivalent at the Renderer interface boundary.
+//
+// Run Node only:
+//   go test -tags renderer_integration ./internal/services/renderer/ -v
+//
+// Run both Node and Go (requires libmaplibre-native-c.so available
+// via pkg-config; see scripts/build-mln-ffi.sh):
+//   go test -tags 'renderer_integration mln_ffi' ./internal/services/renderer/ -v
+
+// TestIntegrationNode exercises NodePoolRenderer against a real
+// `node render-worker.js` spawned with @maplibre/maplibre-gl-native.
 //
 // Prerequisites:
 //   - rampardos-render-worker/node_modules populated via `npm install`
 //   - Node on PATH
-func TestIntegrationRealWorker(t *testing.T) {
+func TestIntegrationNode(t *testing.T) {
 	workerDir := findWorkerDir(t)
 
-	// Write a minimal style that requires no sources, sprites, or glyphs.
+	cfg := setupIntegrationFixtures(t)
+	cfg.Backend = "node-pool"
+	cfg.NodeBinary = "node"
+	cfg.WorkerScript = filepath.Join(workerDir, "render-worker.js")
+	cfg.WorkerLifetime = 100
+
+	r, err := NewNodePoolRenderer(cfg, DefaultSpawnFactory(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	runRenderAssertions(t, r)
+}
+
+// setupIntegrationFixtures creates a temp dir with a minimal background-
+// only style and an empty-but-valid mbtiles file, returning a Config
+// that points at them. The caller adds backend-specific fields
+// (NodeBinary/WorkerScript for Node, none for Go) and constructs the
+// renderer.
+func setupIntegrationFixtures(t *testing.T) Config {
+	t.Helper()
+
 	tmp := t.TempDir()
 	styleDir := filepath.Join(tmp, "bg")
 	if err := os.MkdirAll(styleDir, 0o755); err != nil {
@@ -40,54 +73,33 @@ func TestIntegrationRealWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a minimal valid mbtiles file so better-sqlite3 can open it.
-	// better-sqlite3 with fileMustExist requires a real SQLite DB with
-	// the `tiles` table the worker queries at startup.
+	// Minimal valid mbtiles. Both backends open the file at startup;
+	// the background-only style never reads tiles, so the table can be
+	// empty as long as the schema exists.
 	mbtilesPath := filepath.Join(tmp, "empty.mbtiles")
 	if err := createMinimalMbtiles(t, mbtilesPath); err != nil {
 		t.Fatal(err)
 	}
 
-	cfg := Config{
-		Backend:        "node-pool",
-		NodeBinary:     "node",
-		WorkerScript:   filepath.Join(workerDir, "render-worker.js"),
+	return Config{
 		PoolSize:       1,
+		StylePoolSize:  1,
 		RenderTimeout:  15 * time.Second,
-		WorkerLifetime: 100,
-		StartupTimeout: 15 * time.Second,
+		StartupTimeout: 30 * time.Second,
 		StylesDir:      tmp,
 		FontsDir:       tmp,
 		MbtilesFile:    mbtilesPath,
 		DiscoverStyles: func() ([]string, error) { return []string{"bg"}, nil },
 	}
+}
 
-	// Build a SpawnFactory that launches the real Node worker with the
-	// CLI args render-worker.js expects.
-	sf := func(styleID, preparedStylePath string, ratio int) func() (*worker, error) {
-		return func() (*worker, error) {
-			return spawnWorker(workerArgs{
-				binary:  cfg.NodeBinary,
-				script:  cfg.WorkerScript,
-				styleID: styleID,
-				scriptArgs: []string{
-					"--style-id", styleID,
-					"--style-path", preparedStylePath,
-					"--mbtiles", cfg.MbtilesFile,
-					"--styles-dir", cfg.StylesDir,
-					"--fonts-dir", cfg.FontsDir,
-					"--ratio", strconv.Itoa(ratio),
-				},
-				handshakeTimeout: cfg.StartupTimeout,
-			})
-		}
-	}
-
-	r, err := NewNodePoolRenderer(cfg, sf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
+// runRenderAssertions exercises r.Render against the "bg" style fixture
+// at z=0 x=0 y=0 and verifies the output is a non-trivial PNG. Shared
+// across backends so a regression visible at the interface (wrong format,
+// empty buffer, encoder failure) trips the same assertion regardless of
+// which renderer produced it.
+func runRenderAssertions(t *testing.T, r Renderer) {
+	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -102,11 +114,16 @@ func TestIntegrationRealWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify it's a valid PNG.
+	// PNG signature: 89 50 4E 47 0D 0A 1A 0A. Bytes 1-3 are "PNG".
 	if len(out) < 8 || string(out[1:4]) != "PNG" {
-		t.Errorf("not a PNG: %x", out[:min(16, len(out))])
+		head := out
+		if len(head) > 16 {
+			head = head[:16]
+		}
+		t.Errorf("not a PNG: %x", head)
 	}
-	// Spot-check size.
+	// Spot-check size: a real render of a single-color tile is ~hundreds
+	// of bytes; anything sub-100 is a missing-payload smell.
 	if len(out) < 100 {
 		t.Errorf("PNG suspiciously small: %d bytes", len(out))
 	}
@@ -142,8 +159,8 @@ func findRepoRoot(t *testing.T) string {
 }
 
 // createMinimalMbtiles uses the sqlite3 CLI to create a valid mbtiles
-// file with the `tiles` table the render worker expects. The table is
-// empty — the background-only style never queries tiles.
+// file with the `tiles` table both backends expect. The table is empty
+// — the background-only style never queries tiles.
 func createMinimalMbtiles(t *testing.T, path string) error {
 	t.Helper()
 	sql := `CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);
