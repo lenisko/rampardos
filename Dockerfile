@@ -94,6 +94,22 @@ RUN for lib in $(LD_LIBRARY_PATH=/ffi/.pixi/envs/default/lib ldd build/libmaplib
     done \
  && ls -la build/*.so*
 
+# RPATH the bundled .so to find its transitive deps via $ORIGIN (its
+# own directory) at load time, regardless of where the runtime image
+# places the bundle. Without this, the runtime image had to register
+# /opt/rampardos/lib with ldconfig, which shadowed Ubuntu's system
+# libraries (libpng/libjpeg/libuv/libicu) for ALL processes — so the
+# Node binding's mbgl.node crashed on libpng version mismatch when
+# RENDERER_BACKEND=node-pool was selected. RPATH-on-the-.so keeps the
+# bundle invisible to anything that doesn't load libmaplibre-native-c.so.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends patchelf \
+ && rm -rf /var/lib/apt/lists/* \
+ && for lib in build/*.so*; do \
+        patchelf --set-rpath '$ORIGIN' "$lib" || true; \
+    done \
+ && readelf -d build/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH'
+
 # ================================
 # Render worker deps (maplibre-gl-native + better-sqlite3)
 # ================================
@@ -147,7 +163,7 @@ RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
     PKG_CONFIG_PATH=/ffi/build/pkgconfig \
-    CGO_LDFLAGS="-Wl,-rpath-link=/ffi/build" \
+    CGO_LDFLAGS="-Wl,-rpath-link=/ffi/build -Wl,-rpath,/opt/rampardos/lib" \
     CGO_ENABLED=1 \
     go build -trimpath -tags 'nodynamic mln_ffi' \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
@@ -195,21 +211,21 @@ RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
       ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs; \
     fi
 
-# maplibre-native-ffi shared library + its pixi-conda-env transitive deps
-# (libicuuc.so.78, libuv.so.1, libjpeg.so.8, libpng16.so.16, libwebp.so.7,
-# libicui18n.so.78, libicudata.so.78). Bundled together in a dedicated
-# directory rather than dumped into /usr/local/lib so they don't shadow
-# matching-soname Ubuntu system libraries used by other parts of the
-# image (the Node binding's GL stack also pulls in libuv1/libpng/libjpeg).
-# A dedicated ld.so.conf.d entry registers the directory with the
-# dynamic linker; only consumers that resolve via the cache pick these
-# up — the existing /usr/lib search path is unchanged.
+# maplibre-native-ffi shared library + its pixi-conda-env transitive deps.
+# Bundle is reached only via the chain
+#     rampardos (DT_RPATH=/opt/rampardos/lib)
+#       → libmaplibre-native-c.so (DT_RPATH=$ORIGIN, set in mln-ffi-build)
+#         → its bundled deps (also DT_RPATH=$ORIGIN)
+# so the Node binding's mbgl.node and any other process that doesn't
+# load libmaplibre-native-c.so resolves libpng / libjpeg / libuv / libicu
+# from /usr/lib/x86_64-linux-gnu/ as Ubuntu intended. Earlier revisions
+# of this Dockerfile registered /opt/rampardos/lib with ldconfig globally,
+# which shadowed Ubuntu's libpng for the Node renderer and caused a
+# version-mismatch abort on RENDERER_BACKEND=node-pool selection.
 COPY --from=mln-ffi-build /ffi/build /tmp/ffi-build
 RUN mkdir -p /opt/rampardos/lib \
  && cp -L /tmp/ffi-build/*.so* /opt/rampardos/lib/ \
- && rm -rf /tmp/ffi-build \
- && echo /opt/rampardos/lib > /etc/ld.so.conf.d/rampardos.conf \
- && ldconfig
+ && rm -rf /tmp/ffi-build
 
 # Go binary
 COPY --from=rampardos-build /out/rampardos /app/rampardos
