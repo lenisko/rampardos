@@ -59,7 +59,7 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # See scripts/build-mln-ffi.sh for the host-side equivalent.
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
-ARG MLN_FFI_REV=f1d00086e0da85617edc1ce5281b4c5f4e5938e1
+ARG MLN_FFI_REV=b43836502281b9d091d7d78b7ad3219a9c805c7e
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
