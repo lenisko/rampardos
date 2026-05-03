@@ -136,12 +136,16 @@ func main() {
 	}
 
 	// Dataset reload callback: rebuild pools and drop the tile cache.
+	// Bumping the content-version epoch invalidates every cached
+	// client response — same URL may produce different bytes against
+	// the new dataset.
 	reloadTileserver := func() error {
 		reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
 			return fmt.Errorf("renderer reload: %w", err)
 		}
+		handlers.BumpContentVersion()
 		return nil
 	}
 	datasetsController := services.NewDatasetsController("TileServer/Datasets", reloadTileserver)
@@ -375,6 +379,12 @@ func main() {
 				slog.Info("Renderer pools reloaded")
 			}
 			cancel()
+
+			// Invalidate every cached client response — same URL may
+			// produce different bytes after a style/dataset reload.
+			// Clients holding a previous ETag get a fresh download on
+			// their next request.
+			handlers.BumpContentVersion()
 		}
 	}()
 

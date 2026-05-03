@@ -252,6 +252,20 @@ func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request,
 		ttlSeconds = 30
 	}
 
+	// Conditional GET short-circuit. URL → bytes is deterministic per
+	// CLAUDE.md (Path() is content-addressable), so a matching
+	// If-None-Match means the client holds the bytes we would render.
+	// Skip rendering, encoding, and disk-cache lookup entirely — return
+	// 304 with no body. Pregenerate path is excluded because its 200
+	// response is a JSON URL/path, not the image bytes the ETag
+	// describes.
+	if !pregenerate {
+		setStaticMapCacheHeaders(w, path)
+		if servedNotModified(w, r) {
+			return
+		}
+	}
+
 	img, cached, genErr := h.GenerateStaticMap(r.Context(), staticMap, nocache)
 	if genErr != nil {
 		slog.Error("Failed to generate static map", "error", genErr)
@@ -649,12 +663,14 @@ func (h *StaticMapHandler) generateResponse(w http.ResponseWriter, r *http.Reque
 	serveStaticMapBytes(w, r, path, encoded)
 }
 
-// serveStaticMapBytes sets cache-control header and serves the encoded
-// image bytes via http.ServeContent, enabling range requests and
-// conditional GET (If-None-Match / If-Modified-Since).
+// serveStaticMapBytes serves the encoded image bytes via
+// http.ServeContent, which honours range requests and the conditional
+// GET headers (If-None-Match / If-Modified-Since) we already set in
+// setStaticMapCacheHeaders at the top of the handler. Last-Modified
+// is serverStartTime — stable across the process lifetime so revalidation
+// for clients that omit If-None-Match still short-circuits to 304.
 func serveStaticMapBytes(w http.ResponseWriter, r *http.Request, path string, encoded []byte) {
-	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
-	http.ServeContent(w, r, filepath.Base(path), time.Now(), bytes.NewReader(encoded))
+	http.ServeContent(w, r, filepath.Base(path), serverStartTime, bytes.NewReader(encoded))
 }
 
 // effectiveTTL resolves the ?ttl query-param into the duration that

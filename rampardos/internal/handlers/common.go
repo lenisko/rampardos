@@ -40,9 +40,12 @@ func ensureDir(dir string) {
 	knownDirs.Store(dir, struct{}{})
 }
 
-// serveFile serves a file with cache headers
+// serveFile serves an on-disk file with the same content-addressable
+// ETag + Cache-Control as the bytes-first response path.
+// http.ServeFile dispatches to http.ServeContent internally, which
+// honours the ETag we set here for conditional-GET 304 responses.
 func serveFile(w http.ResponseWriter, r *http.Request, path string) {
-	w.Header().Set("Cache-Control", "max-age=604800, must-revalidate")
+	setStaticMapCacheHeaders(w, path)
 	http.ServeFile(w, r, path)
 }
 

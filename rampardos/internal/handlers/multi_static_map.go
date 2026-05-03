@@ -136,6 +136,20 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 		ttlSeconds = 30
 	}
 
+	// Conditional GET short-circuit. Same contract as the staticmap
+	// path: URL → bytes is deterministic, so a matching If-None-Match
+	// means the client already holds the bytes we would render. Skip
+	// the entire generate+combine pipeline (more expensive than the
+	// single-staticmap path because it composes N components) and
+	// return 304. Pregenerate excluded — its 200 response is JSON,
+	// not the image.
+	if !pregenerate {
+		setStaticMapCacheHeaders(w, path)
+		if servedNotModified(w, r) {
+			return
+		}
+	}
+
 	// Collect all maps to generate
 	var mapsToGenerate []models.StaticMap
 	for _, grid := range multiStaticMap.Grid {
