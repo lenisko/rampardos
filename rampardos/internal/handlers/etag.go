@@ -75,13 +75,23 @@ func setStaticMapCacheHeaders(w http.ResponseWriter, path string) {
 	w.Header().Set("ETag", contentETag(path))
 	w.Header().Set("Last-Modified", serverStartTime.Format(http.TimeFormat))
 	// public — explicit so shared caches don't fall back to "private" defaults.
-	// max-age=604800 (7 days) — bytes are content-addressed; long is fine.
+	// max-age=31536000 (1 year) — bytes are content-addressed (URL → bytes
+	//   is stable until BumpContentVersion rotates the epoch on a style/
+	//   dataset reload). 1y is the conventional "forever" value for
+	//   content-addressable URLs; CDNs won't ask us for a year, then
+	//   revalidate to a 304 and reset the window. The previous 7-day
+	//   value had CDNs revalidating 52× as often for no semantic reason.
 	// stale-while-revalidate=86400 — proxies serve a stale image while
 	//   refreshing in background. Reduces tail latency under cache-miss
 	//   stampedes.
 	// stale-if-error=604800 — keep serving stale for a week if origin
 	//   errors. Bot-friendly resilience.
-	w.Header().Set("Cache-Control", "public, max-age=604800, stale-while-revalidate=86400, stale-if-error=604800")
+	// Note: deliberately not using `immutable` even though it would let
+	//   CDNs skip revalidation entirely — `immutable` would lie when
+	//   BumpContentVersion rotates the epoch (clients keep serving old
+	//   bytes forever without ever asking us). Long max-age + ETag
+	//   revalidation gives us "ask once a year, get 304, extend" instead.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, stale-while-revalidate=86400, stale-if-error=604800")
 }
 
 // servedNotModified short-circuits to 304 Not Modified when the
