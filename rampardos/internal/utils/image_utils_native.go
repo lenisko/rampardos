@@ -434,11 +434,21 @@ func appendImages(base, addition image.Image, direction models.CombineDirection)
 	}
 }
 
-// scaleImage resizes an image to the target dimensions using high-quality
-// CatmullRom interpolation.
+// scaleImage resizes an image to the target dimensions using BiLinear
+// interpolation. Used by appendImages when stitching multistaticmap
+// panels of mismatched dimensions.
+//
+// Previously CatmullRom (4×4 bicubic). pprof showed scaleImage at
+// ~14.7% cum / ~10% absolute CPU under production load, with the
+// bicubic kernel work (kernelScaler.scaleX_NRGBA +
+// scaleY_RGBA64Image_Src) the dominant contributor. BiLinear is a 2×2
+// kernel — roughly 1/4 the convolution work — and is visually
+// indistinguishable from CatmullRom on map content (smooth colour
+// regions, no fine high-frequency detail). resizeImage in the same
+// file already uses BiLinear, so this is also a consistency fix.
 func scaleImage(src image.Image, width, height int) image.Image {
 	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
 	return dst
 }
 
