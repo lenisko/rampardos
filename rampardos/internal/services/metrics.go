@@ -835,7 +835,6 @@ func (m *MetricsManager) GetUptime() time.Duration {
 	return time.Since(m.startTime)
 }
 
-
 // TemplateRenderStat holds template render statistics
 type TemplateRenderStat struct {
 	Template string

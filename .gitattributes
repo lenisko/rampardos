@@ -1,0 +1,9 @@
+# Force LF line endings for all text files. The Go tooling (gofmt,
+# language servers, vet output) expects LF; CRLF in committed source
+# produced spurious whole-file gofmt -d diffs and editor-sensitive
+# noise on unrelated commits. Existing CRLF files were normalised in
+# a single commit; see .git-blame-ignore-revs so `git blame` skips it.
+#
+# `text=auto` lets git autodetect text vs binary, so PNG/mbtiles/etc
+# remain untouched. `eol=lf` enforces LF on anything classified as text.
+* text=auto eol=lf

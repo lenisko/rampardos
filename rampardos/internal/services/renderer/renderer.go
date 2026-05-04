@@ -68,7 +68,7 @@ type ViewportRequest struct {
 	Height    int
 	Bearing   float64 // degrees counter-clockwise from north; 0 for no rotation
 	Pitch     float64 // degrees; 0 for flat
-	Scale     uint8 // DPR / pixel ratio; typically 1 or 2. Implementations may reject larger values.
+	Scale     uint8   // DPR / pixel ratio; typically 1 or 2. Implementations may reject larger values.
 	Format    models.ImageFormat
 }
 
