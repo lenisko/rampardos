@@ -1,7 +1,7 @@
 package services
 
 import (
-	png "github.com/gameparrot/fastpng"
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 
 	"github.com/lenisko/rampardos/internal/config"
 	"github.com/lenisko/rampardos/internal/models"

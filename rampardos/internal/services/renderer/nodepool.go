@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	png "github.com/gameparrot/fastpng"
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"

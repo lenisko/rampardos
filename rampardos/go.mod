@@ -9,6 +9,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/grafana/pyroscope-go v1.2.7
+	github.com/klauspost/compress v1.18.2
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/image v0.34.0
 	golang.org/x/sync v0.20.0
@@ -17,10 +18,8 @@ require (
 require (
 	github.com/CloudyKit/fastprinter v0.0.0-20251202014920-1725d2651bd4 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
-	github.com/gameparrot/fastpng v0.0.0-20250305185850-d72e123a2123 // indirect
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.9 // indirect
-	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/tetratelabs/wazero v1.10.1 // indirect
 )
 

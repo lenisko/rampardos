@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/fogleman/gg"
-	png "github.com/gameparrot/fastpng"
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
@@ -30,11 +30,12 @@ import (
 // fresh per call. Encoder instances themselves are lightweight
 // (just CompressionLevel + a pointer); the pool is what matters.
 //
-// `png` here aliases github.com/gameparrot/fastpng — a fork of
-// image/png that swaps stdlib compress/flate for klauspost/compress.
-// Drop-in API; ~10-15% faster encode at the same nominal compression
-// level for our content shape per local bench. See
-// github.com/gameparrot/fastpng for upstream.
+// `png` here aliases the in-house pngfast package — Go's stdlib
+// image/png writer with stdlib compress/zlib swapped for
+// klauspost/compress/zlib. Drop-in API. ~14% faster encode and
+// ~2.5% smaller output at the same nominal compression level on
+// our production content shape (per real multistaticmap bench).
+// See internal/utils/pngfast/doc.go for provenance.
 var pngBufferPool pngEncoderBufferPool
 
 type pngEncoderBufferPool struct {
