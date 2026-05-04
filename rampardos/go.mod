@@ -17,6 +17,7 @@ require (
 require (
 	github.com/CloudyKit/fastprinter v0.0.0-20251202014920-1725d2651bd4 // indirect
 	github.com/ebitengine/purego v0.9.1 // indirect
+	github.com/gameparrot/fastpng v0.0.0-20250305185850-d72e123a2123 // indirect
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.9 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect

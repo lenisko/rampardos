@@ -8,7 +8,6 @@ import (
 	"image/draw"
 	_ "image/gif"
 	"image/jpeg"
-	"image/png"
 	"log/slog"
 	"os"
 	"sort"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/fogleman/gg"
+	png "github.com/gameparrot/fastpng"
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
@@ -29,6 +29,12 @@ import (
 // internal zlib writer and filter working buffers don't allocate
 // fresh per call. Encoder instances themselves are lightweight
 // (just CompressionLevel + a pointer); the pool is what matters.
+//
+// `png` here aliases github.com/gameparrot/fastpng — a fork of
+// image/png that swaps stdlib compress/flate for klauspost/compress.
+// Drop-in API; ~10-15% faster encode at the same nominal compression
+// level for our content shape per local bench. See
+// github.com/gameparrot/fastpng for upstream.
 var pngBufferPool pngEncoderBufferPool
 
 type pngEncoderBufferPool struct {
