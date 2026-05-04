@@ -139,8 +139,8 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 		encoded, err := h.renderer.Render(ctx, renderer.Request{
 			StyleID: style,
 			Z:       z, X: x, Y: y,
-			Scale:   scale,
-			Format:  format,
+			Scale:  scale,
+			Format: format,
 		})
 		if err != nil {
 			return nil, err

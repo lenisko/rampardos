@@ -53,9 +53,9 @@ var GlobalExpiryQueue *ExpiryQueue
 func InitExpiryQueue(sweepInterval time.Duration) {
 	ctx, cancel := context.WithCancel(context.Background())
 	q := &ExpiryQueue{
-		byKey: make(map[string]*expiryItem),
-		owned: make(map[string]struct{}),
-		ctx:   ctx,
+		byKey:  make(map[string]*expiryItem),
+		owned:  make(map[string]struct{}),
+		ctx:    ctx,
 		cancel: cancel,
 	}
 	heap.Init(&q.h)

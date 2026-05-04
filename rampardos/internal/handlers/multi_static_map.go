@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"golang.org/x/sync/singleflight"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
 	"github.com/lenisko/rampardos/internal/utils"
+	"golang.org/x/sync/singleflight"
 )
 
 // MultiStaticMapHandler handles multi static map requests

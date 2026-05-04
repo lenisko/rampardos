@@ -273,4 +273,3 @@ func (cc *CacheCleaner) shouldRemove(info os.FileInfo, cutoff, dropCutoff time.T
 	}
 	return false
 }
-

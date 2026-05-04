@@ -125,7 +125,7 @@ func main() {
 		defer cancel()
 		if _, err := renderEngine.Render(canaryCtx, renderer.Request{
 			StyleID: localStyleIDs[0],
-			Z: 0, X: 0, Y: 0,
+			Z:       0, X: 0, Y: 0,
 			Scale:  1,
 			Format: models.ImageFormatPNG,
 		}); err != nil {

@@ -1,0 +1,8 @@
+# Commits listed here are skipped by `git blame --ignore-revs-file`
+# and (importantly) by GitHub's blame view, which auto-detects this
+# file. Use for tree-wide cosmetic changes (line ending normalisation,
+# gofmt sweeps) so the line-by-line history isn't pointed at the
+# mechanical commit instead of the author who last edited the line.
+
+# chore: gofmt -s + LF line endings + .gitattributes
+7750ea5ebff7f7220ffe52e2be62bbc3011b7f40

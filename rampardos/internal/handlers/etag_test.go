@@ -85,7 +85,7 @@ func TestServedNotModified_Miss(t *testing.T) {
 	}{
 		{"empty header", ""},
 		{"different etag", `"deadbeefcafef00d"`},
-		{"unquoted match", "abcd"},     // ETag without quotes never matches
+		{"unquoted match", "abcd"},      // ETag without quotes never matches
 		{"weak comparison", `W/"abcd"`}, // We use strong comparison; weak doesn't match
 	}
 	for _, tc := range cases {

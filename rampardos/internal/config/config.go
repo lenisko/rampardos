@@ -23,8 +23,8 @@ type Config struct {
 	RendererStartupTimeout time.Duration // max handshake wait
 
 	// HTTP client settings
-	HTTPMaxConns  int
-	HTTPTimeout   time.Duration // General HTTP timeout (0 = unlimited)
+	HTTPMaxConns int
+	HTTPTimeout  time.Duration // General HTTP timeout (0 = unlimited)
 
 	// Cache settings
 	TileCacheMaxAge      *uint32
@@ -44,13 +44,13 @@ type Config struct {
 	RegenCacheDropAfter  *uint32
 
 	// Image processing settings
-	DefaultImageFormat   string // "png", "jpeg", or "webp" (default: png)
-	OverrideClientFormat bool   // If true, ignore client format and use DefaultImageFormat
-	PNGCompressionLevel  string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
-	ImageQuality         int    // JPEG/WebP quality 1-100 (default: 90)
-	MarkerImageCacheSize int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
-	TileImageCacheSize   int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
-	CompositeImageCacheSize int // Max base+staticmap images cached in memory (default: 200, 0 disables). Each entry ~640 KB for 400×400 NRGBA; 200 ≈ 128 MB.
+	DefaultImageFormat      string // "png", "jpeg", or "webp" (default: png)
+	OverrideClientFormat    bool   // If true, ignore client format and use DefaultImageFormat
+	PNGCompressionLevel     string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
+	ImageQuality            int    // JPEG/WebP quality 1-100 (default: 90)
+	MarkerImageCacheSize    int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
+	TileImageCacheSize      int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
+	CompositeImageCacheSize int    // Max base+staticmap images cached in memory (default: 200, 0 disables). Each entry ~640 KB for 400×400 NRGBA; 200 ≈ 128 MB.
 
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
@@ -119,12 +119,12 @@ func Load() *Config {
 		RegenCacheDelay:      getEnvUint32("REGENERATABLE_CACHE_DELAY_SECONDS", 3600),
 		RegenCacheDropAfter:  getEnvUint32("REGENERATABLE_CACHE_DROP_AFTER_MINUTES", 129600),
 
-		DefaultImageFormat:   getEnv("DEFAULT_IMAGE_FORMAT", "png"),
-		OverrideClientFormat: getEnvBool("OVERRIDE_CLIENT_FORMAT", false),
-		PNGCompressionLevel:  getEnv("PNG_COMPRESSION_LEVEL", "fast"),
-		ImageQuality:         getEnvInt("IMAGE_QUALITY", 90),
-		MarkerImageCacheSize: getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
-		TileImageCacheSize:   getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
+		DefaultImageFormat:      getEnv("DEFAULT_IMAGE_FORMAT", "png"),
+		OverrideClientFormat:    getEnvBool("OVERRIDE_CLIENT_FORMAT", false),
+		PNGCompressionLevel:     getEnv("PNG_COMPRESSION_LEVEL", "fast"),
+		ImageQuality:            getEnvInt("IMAGE_QUALITY", 90),
+		MarkerImageCacheSize:    getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
+		TileImageCacheSize:      getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
 		CompositeImageCacheSize: getEnvInt("COMPOSITE_IMAGE_CACHE_SIZE", 200),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),

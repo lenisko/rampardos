@@ -17,10 +17,10 @@ import (
 	"time"
 
 	"github.com/fogleman/gg"
-	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
