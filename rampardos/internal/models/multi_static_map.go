@@ -31,12 +31,31 @@ type DirectionedMultiStaticMap struct {
 
 // MultiStaticMap represents a grid of static maps
 type MultiStaticMap struct {
-	Grid []DirectionedMultiStaticMap `json:"grid"`
+	Grid   []DirectionedMultiStaticMap `json:"grid"`
+	Format *ImageFormat                `json:"format,omitempty"`
 }
 
-// Path returns the cache path for this multi static map
+// GetFormat returns the format the response should be encoded in.
+// Mirrors StaticMap.GetFormat: client value if set, else server default;
+// OverrideClientFormat trumps the client. Without this, MultiStaticMap
+// previously hardcoded ".png" in Path() and bypassed the format-
+// selection mechanism entirely — DEFAULT_IMAGE_FORMAT and
+// OVERRIDE_CLIENT_FORMAT had no effect on the multistaticmap path,
+// which is the dominant CPU consumer in Poracle workloads.
+func (m *MultiStaticMap) GetFormat() ImageFormat {
+	if m.Format != nil && !OverrideClientFormat {
+		return *m.Format
+	}
+	return DefaultImageFormat
+}
+
+// Path returns the cache path for this multi static map. The extension
+// derives from GetFormat(), so changing DEFAULT_IMAGE_FORMAT or
+// OVERRIDE_CLIENT_FORMAT propagates to the cache key — different
+// formats produce different bytes and therefore different cache
+// entries.
 func (m *MultiStaticMap) Path() string {
-	return fmt.Sprintf("Cache/StaticMulti/%s.png", m.PersistentHash())
+	return fmt.Sprintf("Cache/StaticMulti/%s.%s", m.PersistentHash(), m.GetFormat())
 }
 
 // PersistentHash generates a stable hash for cache key

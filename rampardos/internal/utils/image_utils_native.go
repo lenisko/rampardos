@@ -8,7 +8,6 @@ import (
 	"image/draw"
 	_ "image/gif"
 	"image/jpeg"
-	"image/png"
 	"log/slog"
 	"os"
 	"sort"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/fogleman/gg"
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
@@ -29,6 +29,13 @@ import (
 // internal zlib writer and filter working buffers don't allocate
 // fresh per call. Encoder instances themselves are lightweight
 // (just CompressionLevel + a pointer); the pool is what matters.
+//
+// `png` here aliases the in-house pngfast package — Go's stdlib
+// image/png writer with stdlib compress/zlib swapped for
+// klauspost/compress/zlib. Drop-in API. ~14% faster encode and
+// ~2.5% smaller output at the same nominal compression level on
+// our production content shape (per real multistaticmap bench).
+// See internal/utils/pngfast/doc.go for provenance.
 var pngBufferPool pngEncoderBufferPool
 
 type pngEncoderBufferPool struct {
@@ -434,11 +441,21 @@ func appendImages(base, addition image.Image, direction models.CombineDirection)
 	}
 }
 
-// scaleImage resizes an image to the target dimensions using high-quality
-// CatmullRom interpolation.
+// scaleImage resizes an image to the target dimensions using BiLinear
+// interpolation. Used by appendImages when stitching multistaticmap
+// panels of mismatched dimensions.
+//
+// Previously CatmullRom (4×4 bicubic). pprof showed scaleImage at
+// ~14.7% cum / ~10% absolute CPU under production load, with the
+// bicubic kernel work (kernelScaler.scaleX_NRGBA +
+// scaleY_RGBA64Image_Src) the dominant contributor. BiLinear is a 2×2
+// kernel — roughly 1/4 the convolution work — and is visually
+// indistinguishable from CatmullRom on map content (smooth colour
+// regions, no fine high-frequency detail). resizeImage in the same
+// file already uses BiLinear, so this is also a consistency fix.
 func scaleImage(src image.Image, width, height int) image.Image {
 	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
 	return dst
 }
 

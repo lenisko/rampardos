@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
-	"image/png"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	"github.com/gen2brain/webp"
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/models"
