@@ -154,8 +154,7 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	defer cancelLeader()
-	followerCtx, cancelFollower := context.WithCancel(context.Background())
-	defer cancelFollower()
+	followerCtx := t.Context()
 
 	leaderErr := make(chan error, 1)
 	followerErr := make(chan error, 1)
@@ -305,18 +304,16 @@ func TestEnsureBaseSingleflightDedupesSiblings(t *testing.T) {
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range N {
+		wg.Go(func() {
 			started <- struct{}{}
 			if _, err := h.ensureBase(ctx, sm, basePath, false); err != nil {
 				t.Errorf("ensureBase: %v", err)
 			}
-		}()
+		})
 	}
 
-	for i := 0; i < N; i++ {
+	for range N {
 		<-started
 	}
 	<-reached

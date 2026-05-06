@@ -236,10 +236,7 @@ func (npr *NodePoolRenderer) RenderViewport(ctx context.Context, req ViewportReq
 // raw decoded *image.NRGBA. Lets callers skip the PNG encode when
 // their next step is a draw operation rather than a disk write.
 func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req ViewportRequest) (*image.NRGBA, error) {
-	scale := int(req.Scale)
-	if scale < 1 {
-		scale = 1
-	}
+	scale := max(int(req.Scale), 1)
 	pool, err := npr.getOrCreatePool(req.StyleID, req.Scale)
 	if err != nil {
 		return nil, err
@@ -289,10 +286,7 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 // or RenderViewportImage, both of which go through encodeRGBAImage
 // directly.
 func (npr *NodePoolRenderer) renderViewportInternal(ctx context.Context, req ViewportRequest) ([]byte, error) {
-	scale := int(req.Scale)
-	if scale < 1 {
-		scale = 1
-	}
+	scale := max(int(req.Scale), 1)
 
 	pool, err := npr.getOrCreatePool(req.StyleID, req.Scale)
 	if err != nil {

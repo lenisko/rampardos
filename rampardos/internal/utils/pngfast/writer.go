@@ -220,7 +220,7 @@ func filter(cr *[nFilter][]byte, pr []byte, bpp int) int {
 
 	// The up filter.
 	sum := 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		cdat2[i] = cdat0[i] - pdat[i]
 		sum += abs8(cdat2[i])
 	}
@@ -229,7 +229,7 @@ func filter(cr *[nFilter][]byte, pr []byte, bpp int) int {
 
 	// The Paeth filter.
 	sum = 0
-	for i := 0; i < bpp; i++ {
+	for i := range bpp {
 		cdat4[i] = cdat0[i] - pdat[i]
 		sum += abs8(cdat4[i])
 	}
@@ -247,7 +247,7 @@ func filter(cr *[nFilter][]byte, pr []byte, bpp int) int {
 
 	// The none filter.
 	sum = 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		sum += abs8(cdat0[i])
 		if sum >= best {
 			break
@@ -260,7 +260,7 @@ func filter(cr *[nFilter][]byte, pr []byte, bpp int) int {
 
 	// The sub filter.
 	sum = 0
-	for i := 0; i < bpp; i++ {
+	for i := range bpp {
 		cdat1[i] = cdat0[i]
 		sum += abs8(cdat1[i])
 	}
@@ -278,7 +278,7 @@ func filter(cr *[nFilter][]byte, pr []byte, bpp int) int {
 
 	// The average filter.
 	sum = 0
-	for i := 0; i < bpp; i++ {
+	for i := range bpp {
 		cdat3[i] = cdat0[i] - pdat[i]/2
 		sum += abs8(cdat3[i])
 	}

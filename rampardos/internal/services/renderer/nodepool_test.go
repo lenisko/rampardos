@@ -229,7 +229,7 @@ func TestLoadPoolWritesPreparedStyleAtomically(t *testing.T) {
 	// non-atomic write has a meaningful window for a reader to land
 	// in the middle of it.
 	layers := make([]any, 0, 400)
-	for i := 0; i < 400; i++ {
+	for i := range 400 {
 		layers = append(layers, map[string]any{
 			"id":   fmt.Sprintf("layer-%d", i),
 			"type": "background",
@@ -279,9 +279,7 @@ func TestLoadPoolWritesPreparedStyleAtomically(t *testing.T) {
 	stop := make(chan struct{})
 	var partial atomic.Bool
 	var readerDone sync.WaitGroup
-	readerDone.Add(1)
-	go func() {
-		defer readerDone.Done()
+	readerDone.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -306,15 +304,13 @@ func TestLoadPoolWritesPreparedStyleAtomically(t *testing.T) {
 				return
 			}
 		}
-	}()
+	})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 40; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 40 {
+		wg.Go(func() {
 			_, _ = npr.loadPool("atomic", 1)
-		}()
+		})
 	}
 	wg.Wait()
 	close(stop)

@@ -240,7 +240,7 @@ func (d *decoder) parsePLTE(length uint32) error {
 	switch d.cb {
 	case cbP1, cbP2, cbP4, cbP8:
 		d.palette = make(color.Palette, 256)
-		for i := 0; i < np; i++ {
+		for i := range np {
 			d.palette[i] = color.RGBA{d.tmp[3*i+0], d.tmp[3*i+1], d.tmp[3*i+2], 0xff}
 		}
 		for i := np; i < 256; i++ {
@@ -310,7 +310,7 @@ func (d *decoder) parsetRNS(length uint32) error {
 		if len(d.palette) < n {
 			d.palette = d.palette[:n]
 		}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			rgba := d.palette[i].(color.RGBA)
 			d.palette[i] = color.NRGBA{rgba.R, rgba.G, rgba.B, d.tmp[i]}
 		}
@@ -379,7 +379,7 @@ func (d *decoder) decode() (image.Image, error) {
 		if err != nil {
 			return nil, err
 		}
-		for pass := 0; pass < 7; pass++ {
+		for pass := range 7 {
 			imagePass, err := d.readImagePass(r, pass, false)
 			if err != nil {
 				return nil, err
@@ -535,7 +535,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			// The first column has no column to the left of it, so it is a
 			// special case. We know that the first column exists because we
 			// check above that width != 0, and so len(cdat) != 0.
-			for i := 0; i < bytesPerPixel; i++ {
+			for i := range bytesPerPixel {
 				cdat[i] += pdat[i] / 2
 			}
 			for i := bytesPerPixel; i < len(cdat); i++ {

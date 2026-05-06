@@ -502,7 +502,7 @@ func rgbaToNRGBA(src *image.RGBA) *image.NRGBA {
 	b := src.Bounds()
 	dst := image.NewNRGBA(b)
 	w, h := b.Dx(), b.Dy()
-	for y := 0; y < h; y++ {
+	for y := range h {
 		sRow := src.Pix[y*src.Stride : y*src.Stride+w*4]
 		dRow := dst.Pix[y*dst.Stride : y*dst.Stride+w*4]
 		for x := 0; x < w*4; x += 4 {

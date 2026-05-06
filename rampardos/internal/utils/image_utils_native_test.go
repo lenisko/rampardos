@@ -171,8 +171,8 @@ func TestRGBAToNRGBAMatchesDrawDraw(t *testing.T) {
 // through rgbaToNRGBA and not the generic draw.Draw fallback.
 func TestToNRGBADispatchesRGBAFastPath(t *testing.T) {
 	src := image.NewRGBA(image.Rect(0, 0, 32, 32))
-	for y := 0; y < 32; y++ {
-		for x := 0; x < 32; x++ {
+	for y := range 32 {
+		for x := range 32 {
 			src.SetRGBA(x, y, color.RGBA{R: byte(x * 4), G: byte(y * 4), B: 0x80, A: 0xFF})
 		}
 	}
@@ -194,8 +194,8 @@ func TestToNRGBADispatchesRGBAFastPath(t *testing.T) {
 // the typical staticmap output before NRGBA normalisation.
 func BenchmarkRGBAToNRGBA(b *testing.B) {
 	src := image.NewRGBA(image.Rect(0, 0, 400, 400))
-	for y := 0; y < 400; y++ {
-		for x := 0; x < 400; x++ {
+	for y := range 400 {
+		for x := range 400 {
 			src.SetRGBA(x, y, color.RGBA{R: byte(x), G: byte(y), B: byte(x ^ y), A: 0xFF})
 		}
 	}
