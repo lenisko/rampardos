@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -233,13 +232,17 @@ func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 }
 
-const maxDatasetUploadBytes = 2 << 30 // 2GB
-
-// Add handles POST /admin/api/datasets/add (file upload)
+// Add handles POST /admin/api/datasets/add (file upload).
+//
+// mbtiles can be tens-to-hundreds of gigabytes (planet extracts), so
+// no MaxBytesReader cap is applied — admin endpoint, intentional
+// upload. ParseMultipartForm's 32MB in-memory cap means anything
+// larger spills to a temp file on disk, and AddDataset then streams
+// the multipart.File directly into the final path without buffering
+// the whole payload in RAM.
 func (h *DatasetsHandler) Add(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxDatasetUploadBytes)
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB in memory, rest to temp file
-		http.Error(w, "Failed to parse form (file too large?)", http.StatusBadRequest)
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB in memory, rest spools to /tmp
+		http.Error(w, "Failed to parse form", http.StatusBadRequest)
 		return
 	}
 
@@ -256,13 +259,7 @@ func (h *DatasetsHandler) Add(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "Failed to read file", http.StatusInternalServerError)
-		return
-	}
-
-	if err := h.datasetsController.AddDataset(name, data); err != nil {
+	if err := h.datasetsController.AddDataset(name, file); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

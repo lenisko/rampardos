@@ -4,6 +4,7 @@
 package fileutil
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -27,6 +28,45 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	tmp := f.Name()
 	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// AtomicWriteReader streams r into a sibling tempfile then renames it
+// over path. The streaming form avoids buffering arbitrarily-large
+// payloads (e.g. multi-gigabyte mbtiles uploads) in RAM. Same atomic
+// guarantees as AtomicWriteFile.
+func AtomicWriteReader(path string, r io.Reader, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := io.Copy(f, r); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err

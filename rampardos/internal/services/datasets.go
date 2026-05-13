@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -188,14 +189,16 @@ func (dc *DatasetsController) GetDatasets() ([]string, error) {
 	return datasets, nil
 }
 
-// AddDataset adds a new dataset from file data
-func (dc *DatasetsController) AddDataset(name string, data []byte) error {
+// AddDataset adds a new dataset by streaming src to disk. The
+// streaming form lets callers hand off a multipart.File or similar
+// without buffering the (potentially multi-gigabyte) payload in RAM.
+func (dc *DatasetsController) AddDataset(name string, src io.Reader) error {
 	sanitized, err := SanitizeName(name)
 	if err != nil {
 		return fmt.Errorf("invalid dataset name: %w", err)
 	}
 	path := filepath.Join(dc.listFolder, sanitized+".mbtiles")
-	if err := fileutil.AtomicWriteFile(path, data, 0644); err != nil {
+	if err := fileutil.AtomicWriteReader(path, src, 0644); err != nil {
 		return fmt.Errorf("failed to write dataset: %w", err)
 	}
 
