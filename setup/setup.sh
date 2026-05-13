@@ -4,8 +4,10 @@
 #
 # Intended for users running rampardos under Docker but who need to
 # populate the volume-mounted TileServer/ tree on the host before the
-# first start. Idempotent — re-running is safe; existing styles, fonts,
-# and datasets are left in place.
+# first start. Installs the klokantech-basic style and the openmaptiles
+# v2.0 fonts; creates an empty Datasets/List/ for the admin UI to fill.
+# Idempotent — re-running is safe; existing styles and fonts are left
+# in place.
 #
 # Usage (recommended):
 #   curl -fsSL https://raw.githubusercontent.com/lenisko/rampardos/master/setup/setup.sh | bash
@@ -44,20 +46,6 @@ require_tool() {
 	command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1 (please install and re-run)"
 }
 
-# read_prompt PROMPT DEFAULT — reads a line from /dev/tty so it works
-# even when the script itself is being piped from curl. Falls back to
-# DEFAULT if no TTY is attached (e.g. inside a non-interactive CI job).
-read_prompt() {
-	local prompt="$1" default="$2" answer
-	if [ ! -e /dev/tty ]; then
-		printf '%s\n' "$default"
-		return
-	fi
-	printf '%s ' "$prompt" >/dev/tty
-	IFS= read -r answer </dev/tty || answer=""
-	printf '%s\n' "${answer:-$default}"
-}
-
 # --- preflight --------------------------------------------------------------
 
 require_tool curl
@@ -94,65 +82,6 @@ else
 	trap - EXIT
 fi
 
-# --- mbtiles (interactive) --------------------------------------------------
-
-printf '\n'
-log "Initial dataset"
-cat <<'EOF'
-You can install an mbtiles file now, or skip and add one later via the
-admin UI (http://<host>:9000/admin/datasets — supports both URL paste
-and direct file upload).
-
-A common source is https://www.maptiler.com/ — log in there, generate a
-download link, and paste it below. The link is single-use and signed.
-EOF
-
-choice=$(read_prompt "How would you like to provide the mbtiles? [url/file/skip] (default: skip):" "skip")
-
-case "$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')" in
-	url|u)
-		url=$(read_prompt "Paste the mbtiles URL:" "")
-		if [ -z "$url" ]; then
-			warn "no URL provided, skipping mbtiles install"
-		else
-			name=$(read_prompt "Name for this dataset (default: planet):" "planet")
-			dest="$DATASETS_LIST_DIR/$name.mbtiles"
-			if [ -e "$dest" ]; then
-				warn "$dest already exists, leaving untouched"
-			else
-				log "Downloading $url"
-				# Stream to a .tmp first so an interrupted download
-				# doesn't leave a half-written .mbtiles that the
-				# server might try to combine.
-				curl -fL --progress-bar "$url" -o "$dest.tmp"
-				mv "$dest.tmp" "$dest"
-				log "Saved $dest"
-				log "Activate it via the admin UI after starting the server."
-			fi
-		fi
-		;;
-	file|f)
-		path=$(read_prompt "Path to local mbtiles file:" "")
-		if [ -z "$path" ] || [ ! -f "$path" ]; then
-			warn "file not found, skipping mbtiles install"
-		else
-			name=$(read_prompt "Name for this dataset (default: planet):" "planet")
-			dest="$DATASETS_LIST_DIR/$name.mbtiles"
-			if [ -e "$dest" ]; then
-				warn "$dest already exists, leaving untouched"
-			else
-				log "Copying $path"
-				cp "$path" "$dest"
-				log "Saved $dest"
-				log "Activate it via the admin UI after starting the server."
-			fi
-		fi
-		;;
-	*)
-		log "Skipping mbtiles; upload via the admin UI when ready"
-		;;
-esac
-
 # --- next steps -------------------------------------------------------------
 
 cat <<EOF
@@ -160,10 +89,11 @@ cat <<EOF
 Done. Layout under $TARGET_DIR/TileServer:
   Styles/$STYLE_NAME/
   Fonts/...
-  Datasets/List/
+  Datasets/List/    (empty — add an mbtiles via the admin UI)
 
 Next:
   1. Set ADMIN_USERNAME / ADMIN_PASSWORD in your .env
   2. Start the container (docker compose up -d, or your preferred runner)
-  3. Open http://<host>:9000/admin/datasets to activate a dataset
+  3. Open http://<host>:9000/admin/datasets to upload or paste an
+     mbtiles URL, then activate it
 EOF
