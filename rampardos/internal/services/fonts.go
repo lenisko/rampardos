@@ -48,8 +48,24 @@ func (fc *FontsController) GetFonts() ([]string, error) {
 func (fc *FontsController) AddFont(data []byte, filename string) error {
 	// Extract name from filename
 	ext := filepath.Ext(filename)
-	baseName := strings.TrimSuffix(filename, ext)
-	name := toCamelCase(baseName)
+	baseName := strings.TrimSuffix(filepath.Base(filename), ext)
+	name, err := SanitizeName(toCamelCase(baseName))
+	if err != nil {
+		return fmt.Errorf("invalid font name: %w", err)
+	}
+
+	// Sanitize extension: allow only alphanumeric characters
+	extClean := strings.Map(func(r rune) rune {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return -1
+	}, strings.TrimPrefix(ext, "."))
+	if extClean != "" {
+		ext = "." + extClean
+	} else {
+		ext = ""
+	}
 
 	// Write the uploaded bytes to a temp file inside the fonts folder so we
 	// can hand a path to build-glyphs. Using fc.folder (which is volume-mounted

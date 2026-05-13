@@ -133,6 +133,20 @@ func DownloadFile(ctx context.Context, fromURL, toPath, expectedType string, tim
 	return nil
 }
 
+// cancelOnClose wraps a ReadCloser to call cancel() when Close() is invoked.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return err
+}
+
 // HTTPGet performs a GET request and returns the response.
 // Caller is responsible for closing the response body.
 func HTTPGet(ctx context.Context, fromURL string, timeout time.Duration) (*http.Response, error) {
@@ -150,7 +164,20 @@ func HTTPGet(ctx context.Context, fromURL string, timeout time.Duration) (*http.
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		_ = cancel // caller handles context
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fromURL, nil)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "TileserverCache")
+		client := globalHTTPService.getClient(host)
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+		return resp, nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fromURL, nil)

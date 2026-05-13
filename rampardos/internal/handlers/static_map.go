@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,10 @@ import (
 	"github.com/lenisko/rampardos/internal/utils"
 	"golang.org/x/sync/singleflight"
 )
+
+// validStyleRe constrains the style identifier to a safe character set,
+// applied as defense-in-depth before the style reaches the renderer.
+var validStyleRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // stylesControllerGetExternal is the subset of StylesController used by
 // StaticMapHandler's dispatch logic. An interface keeps dispatch
@@ -43,12 +48,6 @@ type StaticMapHandler struct {
 	sfg               singleflight.Group // dedup concurrent generates for same final path
 	baseSfg           singleflight.Group // dedup concurrent base renders for same basePath
 
-	// localUseViewport routes local-style integer-zoom bases through
-	// RenderViewport instead of tile stitching when the tile working
-	// set is too large to benefit from the cache. Wired from
-	// config.LocalStylesUseViewport.
-	localUseViewport bool
-
 	// Function-valued hooks. Production wiring in NewStaticMapHandler
 	// sets these to the real methods below; tests override them to
 	// record dispatch without touching the renderer or disk.
@@ -58,14 +57,13 @@ type StaticMapHandler struct {
 }
 
 // NewStaticMapHandler creates a new static map handler
-func NewStaticMapHandler(r renderer.Renderer, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController, localUseViewport bool) *StaticMapHandler {
+func NewStaticMapHandler(r renderer.Renderer, tileHandler *TileHandler, statsController *services.StatsController, stylesController *services.StylesController) *StaticMapHandler {
 	h := &StaticMapHandler{
 		renderer:          r,
 		tileHandler:       tileHandler,
 		statsController:   statsController,
 		stylesController:  stylesController,
 		sphericalMercator: utils.NewSphericalMercator(),
-		localUseViewport:  localUseViewport,
 	}
 	h.generateBaseStaticMapFromAPIFn = h.generateBaseStaticMapFromAPI
 	h.generateBaseStaticMapFromTilesFn = h.generateBaseStaticMapFromTiles
@@ -140,8 +138,8 @@ func (h *StaticMapHandler) PostTemplate(w http.ResponseWriter, r *http.Request) 
 // GetPregenerated handles GET /staticmap/pregenerated/:id
 func (h *StaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if id == "" || strings.Contains(id, "..") {
-		http.Error(w, "Missing id", http.StatusBadRequest)
+	if _, err := services.SanitizeName(id); err != nil {
+		http.Error(w, "Invalid id", http.StatusBadRequest)
 		return
 	}
 
@@ -213,14 +211,29 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 
 func (h *StaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Request, staticMap models.StaticMap) {
 	// Validate required fields
-	if staticMap.Zoom < 1 || staticMap.Zoom > 22 {
+	if math.IsNaN(staticMap.Zoom) || math.IsInf(staticMap.Zoom, 0) || staticMap.Zoom < 1 || staticMap.Zoom > 22 {
 		services.GlobalMetrics.RecordValidationError("staticmap", "zoom")
 		http.Error(w, "Invalid zoom level (must be 1-22)", http.StatusBadRequest)
+		return
+	}
+	if staticMap.Style != "" && !validStyleRe.MatchString(staticMap.Style) {
+		services.GlobalMetrics.RecordValidationError("staticmap", "style")
+		http.Error(w, "Invalid style name", http.StatusBadRequest)
 		return
 	}
 	if staticMap.Width == 0 || staticMap.Height == 0 {
 		services.GlobalMetrics.RecordValidationError("staticmap", "dimensions")
 		http.Error(w, "Invalid dimensions", http.StatusBadRequest)
+		return
+	}
+	if staticMap.Width > 4096 || staticMap.Height > 4096 {
+		services.GlobalMetrics.RecordError("staticmap", "dimensions_too_large")
+		http.Error(w, "Dimensions too large (max 4096x4096)", http.StatusBadRequest)
+		return
+	}
+	if staticMap.Scale > 4 {
+		services.GlobalMetrics.RecordError("staticmap", "scale_too_large")
+		http.Error(w, "Scale too large (max 4)", http.StatusBadRequest)
 		return
 	}
 	if staticMap.Style == "" {
@@ -397,13 +410,11 @@ func (h *StaticMapHandler) generateBaseStaticMap(ctx context.Context, staticMap 
 	extStyle := h.stylesController.GetExternalStyle(staticMap.Style)
 
 	if extStyle == nil {
-		// Local style: fractional zoom → viewport render (native float zoom).
-		// Integer zoom → tile stitching (cacheable via Cache/Tile), unless
-		// localUseViewport is set to skip the tile pipeline entirely.
-		if isFractional(staticMap.Zoom) || h.localUseViewport {
-			return h.generateBaseStaticMapFromAPIFn(ctx, staticMap)
-		}
-		return h.generateBaseStaticMapFromTilesFn(ctx, staticMap, extStyle)
+		// Local style: always use the in-process viewport renderer.
+		// The renderer handles arbitrary zoom (integer or fractional)
+		// directly; the per-tile disk cache that the stitching fallback
+		// would have populated is no longer used.
+		return h.generateBaseStaticMapFromAPIFn(ctx, staticMap)
 	}
 
 	if isFractional(staticMap.Zoom) {

@@ -13,3 +13,4 @@ docker-compose.*.yml
 bin/
 .env
 rampardos/rampardos.exe
+rampardos/server

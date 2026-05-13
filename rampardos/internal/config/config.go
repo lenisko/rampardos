@@ -1,8 +1,10 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -54,15 +56,6 @@ type Config struct {
 
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
-
-	// LocalStylesUseViewport bypasses tile stitching for local-style
-	// integer-zoom static maps, sending a single RenderViewport call
-	// to the Node renderer instead. Avoids the tile caching layer
-	// entirely for local styles — valuable when the tile working set
-	// exceeds the RAM LRU and most stitches decode-and-discard.
-	// External styles always tile-stitch (upstream providers can't
-	// render an arbitrary viewport).
-	LocalStylesUseViewport bool
 
 	// Admin styles preview tile centre. Drives the /admin/styles
 	// preview thumbnails; choose a latitude/longitude representative
@@ -129,8 +122,6 @@ func Load() *Config {
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
 
-		LocalStylesUseViewport: getEnvBool("LOCAL_STYLES_USE_VIEWPORT", true),
-
 		PreviewLatitude:  getEnvFloat("PREVIEW_LATITUDE", 52.5200),
 		PreviewLongitude: getEnvFloat("PREVIEW_LONGITUDE", 13.4050),
 
@@ -180,7 +171,15 @@ func getEnvBool(key string, defaultValue bool) bool {
 	if val == "" {
 		return defaultValue
 	}
-	return val == "true" || val == "1" || val == "yes"
+	switch strings.ToLower(val) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		slog.Warn("invalid value for env var", "var", key, "value", val)
+		return defaultValue
+	}
 }
 
 func getEnvUint32(key string, defaultValue ...uint32) *uint32 {
@@ -193,6 +192,7 @@ func getEnvUint32(key string, defaultValue ...uint32) *uint32 {
 	}
 	i, err := strconv.ParseUint(val, 10, 32)
 	if err != nil {
+		slog.Warn("invalid value for env var", "var", key, "value", val, "error", err)
 		return nil
 	}
 	u := uint32(i)

@@ -40,6 +40,7 @@ type CacheCleaner struct {
 	dropAfterMinutes  uint32
 	dropAll           bool
 	dropAllMu         sync.Mutex
+	started           sync.Once
 	ctx               context.Context
 	cancel            context.CancelFunc
 	logger            *slog.Logger
@@ -83,11 +84,13 @@ func (cc *CacheCleaner) Start() {
 		return
 	}
 
-	cc.logger.Info("Starting CacheCleaner",
-		"maxAgeMinutes", cc.maxAgeMinutes,
-		"clearDelaySeconds", cc.clearDelaySeconds)
+	cc.started.Do(func() {
+		cc.logger.Info("Starting CacheCleaner",
+			"maxAgeMinutes", cc.maxAgeMinutes,
+			"clearDelaySeconds", cc.clearDelaySeconds)
 
-	go cc.run()
+		go cc.run()
+	})
 }
 
 // Stop stops the cache cleaner
@@ -130,12 +133,20 @@ func (cc *CacheCleaner) IsDropPending() bool {
 // GetPendingDrops returns a list of folder names with pending drops
 func GetPendingDrops() []string {
 	cacheCleanerRegistryMu.RLock()
-	defer cacheCleanerRegistryMu.RUnlock()
+	type entry struct {
+		name string
+		cc   *CacheCleaner
+	}
+	entries := make([]entry, 0, len(cacheCleanerRegistry))
+	for name, cc := range cacheCleanerRegistry {
+		entries = append(entries, entry{name, cc})
+	}
+	cacheCleanerRegistryMu.RUnlock()
 
 	var pending []string
-	for name, cc := range cacheCleanerRegistry {
-		if cc.IsDropPending() {
-			pending = append(pending, name)
+	for _, e := range entries {
+		if e.cc.IsDropPending() {
+			pending = append(pending, e.name)
 		}
 	}
 	return pending

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,14 +19,15 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		// Only allow same-origin requests for WebSocket connections
 		origin := r.Header.Get("Origin")
 		if origin == "" {
-			return true // Allow requests without Origin header (same-origin)
+			return true
 		}
-		// Compare origin with the request host
-		host := r.Host
-		return strings.Contains(origin, host)
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
 	},
 }
 
@@ -231,11 +233,13 @@ func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 }
 
+const maxDatasetUploadBytes = 2 << 30 // 2GB
+
 // Add handles POST /admin/api/datasets/add (file upload)
 func (h *DatasetsHandler) Add(w http.ResponseWriter, r *http.Request) {
-	// Parse multipart form with large limit for mbtiles
-	if err := r.ParseMultipartForm(128 << 30); err != nil { // 128GB max
-		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+	r.Body = http.MaxBytesReader(w, r.Body, maxDatasetUploadBytes)
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB in memory, rest to temp file
+		http.Error(w, "Failed to parse form (file too large?)", http.StatusBadRequest)
 		return
 	}
 

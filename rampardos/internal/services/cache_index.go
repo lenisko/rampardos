@@ -78,6 +78,7 @@ func (c *CacheIndex) AddMarkerImage(path string, width, height int, img image.Im
 	defer c.markerImagesMu.Unlock()
 
 	if elem, ok := c.markerImages[key]; ok {
+		elem.Value.(*markerImageEntry).image = img
 		c.markerImagesLRU.MoveToFront(elem)
 		return
 	}

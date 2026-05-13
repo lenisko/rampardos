@@ -25,27 +25,37 @@ type StaticMap struct {
 	Circles   []Circle     `json:"circles,omitempty"`
 }
 
-// GetFormat returns the format or the configured default
-// If OverrideClientFormat is true, always returns the server default
+// GetFormat returns the format or the configured default.
+// If OverrideClientFormat is true, always returns the server default.
 func (s *StaticMap) GetFormat() ImageFormat {
-	if s.Format != nil && !OverrideClientFormat {
+	if s.Format != nil && !GetOverrideClientFormat() {
 		return *s.Format
 	}
-	return DefaultImageFormat
+	return GetDefaultImageFormat()
 }
-
-// OverrideClientFormat is set by config to ignore client-specified formats
-var OverrideClientFormat bool
 
 // Path returns the cache path for this static map
 func (s *StaticMap) Path() string {
 	return fmt.Sprintf("Cache/Static/%s.%s", s.PersistentHash(), s.GetFormat())
 }
 
-// PersistentHash generates a stable hash for cache key
+// PersistentHash generates a stable hash for cache key using a normalized form
+// so that nil Format == resolved default format, and Scale 0 == Scale 1.
 func (s *StaticMap) PersistentHash() string {
-	// Use sorted JSON for consistent hashing
-	data, _ := json.Marshal(s)
+	norm := *s
+	// Drop the raw Format pointer; resolved format is captured below.
+	norm.Format = nil
+	scale := norm.Scale
+	if scale == 0 {
+		scale = 1
+	}
+	norm.Scale = scale
+
+	type hashable struct {
+		StaticMap
+		ResolvedFormat ImageFormat `json:"_fmt"`
+	}
+	data, _ := json.Marshal(hashable{StaticMap: norm, ResolvedFormat: s.GetFormat()})
 	hash := sha256.Sum256(data)
 	encoded := base64.StdEncoding.EncodeToString(hash[:])
 	return strings.ReplaceAll(encoded, "/", "_")

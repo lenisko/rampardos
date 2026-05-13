@@ -134,14 +134,24 @@ func (p *stylePool) replaceWorker() {
 		fmt.Fprintf(osStderr, "renderer: failed to replace worker for style %q: %v\n", p.cfg.styleID, err)
 		return
 	}
+	// Re-check closed under lock before sending. close() may have run
+	// between spawn() returning and this point, draining the idle
+	// channel and setting closed=true. Without this check the worker
+	// would sit in the channel forever, leaked and never killed.
 	p.mu.Lock()
-	closed := p.closed
-	p.mu.Unlock()
-	if closed {
+	if p.closed {
+		p.mu.Unlock()
 		w.kill()
 		return
 	}
-	p.idle <- w
+	select {
+	case p.idle <- w:
+	default:
+		// Channel is unexpectedly full (shouldn't happen in normal
+		// operation); kill rather than block or leak.
+		w.kill()
+	}
+	p.mu.Unlock()
 }
 
 func (p *stylePool) close() {

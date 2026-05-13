@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -40,8 +41,8 @@ func main() {
 
 	slog.Info("Configuration loaded", "timeout", cfg.RequestTimeout, "debug", debugMode)
 
-	// Initialize Pyroscope profiling if configured
-	services.InitPyroscope(cfg)
+	// Initialize Pyroscope profiling if configured (profiler retained for graceful Stop on shutdown)
+	pyroscopeProfiler := services.InitPyroscope(cfg)
 
 	// Parse external styles from environment
 	var externalStyles []models.Style
@@ -117,7 +118,8 @@ func main() {
 		slog.Error("Failed to initialise renderer", "error", err)
 		os.Exit(1)
 	}
-	defer renderEngine.Close()
+	// renderEngine.Close() is called explicitly during shutdown (after the
+	// SIGHUP goroutine drains) to avoid a race between the goroutine and Close.
 
 	// Canary render: ensures the pool is live before we bind HTTP port.
 	if len(localStyleIDs) > 0 {
@@ -183,7 +185,7 @@ func main() {
 
 	// Initialize handlers
 	tileHandler := handlers.NewTileHandler(renderEngine, statsController, stylesController)
-	staticMapHandler := handlers.NewStaticMapHandler(renderEngine, tileHandler, statsController, stylesController, cfg.LocalStylesUseViewport)
+	staticMapHandler := handlers.NewStaticMapHandler(renderEngine, tileHandler, statsController, stylesController)
 	multiStaticMapHandler := handlers.NewMultiStaticMapHandler(staticMapHandler, statsController)
 	stylesHandler := handlers.NewStylesHandler(stylesController)
 	fontsHandler := handlers.NewFontsHandler(fontsController)
@@ -358,43 +360,97 @@ func main() {
 
 	// Handle SIGHUP for graceful reload (templates, renderer pools, tile cache).
 	// Triggered via: docker kill -s HUP <container> or kill -HUP <pid>
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGHUP)
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	hupCtx, cancelHup := context.WithCancel(context.Background())
+	hupDone := make(chan struct{})
 	go func() {
-		for range sigCh {
-			slog.Info("SIGHUP received, reloading...")
+		defer close(hupDone)
+		for {
+			select {
+			case <-hupCtx.Done():
+				return
+			case _, ok := <-hupCh:
+				if !ok {
+					return
+				}
+				slog.Info("SIGHUP received, reloading...")
 
-			// Reload templates from disk
-			if err := services.GlobalJetRenderer.LoadTemplatesFromDisk(); err != nil {
-				slog.Error("Failed to reload templates", "error", err)
-			} else {
-				slog.Info("Templates reloaded")
+				// Reload templates from disk
+				if err := services.GlobalJetRenderer.LoadTemplatesFromDisk(); err != nil {
+					slog.Error("Failed to reload templates", "error", err)
+				} else {
+					slog.Info("Templates reloaded")
+				}
+
+				// Reload renderer pools (picks up new styles, refreshes mbtiles)
+				reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
+					slog.Error("Failed to reload renderer", "error", err)
+				} else {
+					slog.Info("Renderer pools reloaded")
+				}
+				cancel()
+
+				// Invalidate every cached client response — same URL may
+				// produce different bytes after a style/dataset reload.
+				// Clients holding a previous ETag get a fresh download on
+				// their next request.
+				handlers.BumpContentVersion()
 			}
-
-			// Reload renderer pools (picks up new styles, refreshes mbtiles)
-			reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := renderEngine.ReloadStyles(reloadCtx); err != nil {
-				slog.Error("Failed to reload renderer", "error", err)
-			} else {
-				slog.Info("Renderer pools reloaded")
-			}
-			cancel()
-
-			// Invalidate every cached client response — same URL may
-			// produce different bytes after a style/dataset reload.
-			// Clients holding a previous ETag get a fresh download on
-			// their next request.
-			handlers.BumpContentVersion()
 		}
 	}()
 
-	// Start server
+	// Start server with graceful shutdown on SIGINT / SIGTERM.
 	addr := cfg.Hostname + ":" + cfg.Port
-	slog.Info("Starting server", "address", addr)
-	if err := http.ListenAndServe(addr, r); err != nil {
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		slog.Info("Starting server", "address", addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErr:
 		slog.Error("Server failed", "error", err)
 		os.Exit(1)
+	case sig := <-stop:
+		slog.Info("Shutdown signal received", "signal", sig)
 	}
+
+	// Stop the SIGHUP reload listener and wait for the goroutine to finish
+	// before closing the renderer — prevents a race between the goroutine's
+	// renderEngine.ReloadStyles call and renderEngine.Close.
+	signal.Stop(hupCh)
+	cancelHup()
+	<-hupDone
+	renderEngine.Close()
+
+	// Stop background services first to drain goroutines.
+	if pyroscopeProfiler != nil {
+		if err := pyroscopeProfiler.Stop(); err != nil {
+			slog.Warn("Pyroscope stop error", "error", err)
+		}
+	}
+
+	// Drain in-flight HTTP requests with a bounded grace period.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("Server shutdown error", "error", err)
+	}
+	slog.Info("Server stopped")
 }
 
 func initCacheCleaners(cfg *config.Config) {

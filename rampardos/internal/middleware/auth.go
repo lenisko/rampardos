@@ -33,10 +33,10 @@ func AdminAuth() func(http.Handler) http.Handler {
 			}
 
 			// Constant-time comparison to prevent timing attacks
-			userMatch := subtle.ConstantTimeCompare([]byte(reqUser), []byte(username)) == 1
-			passMatch := subtle.ConstantTimeCompare([]byte(reqPass), []byte(password)) == 1
+			userMatch := subtle.ConstantTimeCompare([]byte(reqUser), []byte(username))
+			passMatch := subtle.ConstantTimeCompare([]byte(reqPass), []byte(password))
 
-			if !userMatch || !passMatch {
+			if userMatch&passMatch != 1 {
 				services.GlobalMetrics.RecordHTTPError("admin_auth", http.StatusUnauthorized)
 				w.Header().Set("WWW-Authenticate", `Basic realm="Admin"`)
 				http.Error(w, "Invalid Login!", http.StatusUnauthorized)

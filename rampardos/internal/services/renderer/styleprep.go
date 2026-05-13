@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -33,8 +34,13 @@ func styleZoomOffset(src []byte) float64 {
 	if err := json.Unmarshal(src, &style); err != nil {
 		return 1.0
 	}
-	for _, s := range style.Sources {
-		ts := sourceTileSize(s.Type, s.TileSize)
+	names := make([]string, 0, len(style.Sources))
+	for name := range style.Sources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ts := sourceTileSize(style.Sources[name].Type, style.Sources[name].TileSize)
 		if ts <= 0 {
 			continue
 		}
@@ -79,6 +85,22 @@ func sourceTileSize(sourceType string, explicit *int) int {
 // Any http(s)// URLs are left untouched — they are assumed to be
 // legitimate CDN references, not placeholders.
 func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
+	// Validate id against path traversal: must be non-empty and contain
+	// only [A-Za-z0-9_-] with no path separators, "..", or null bytes.
+	if id == "" {
+		return nil, fmt.Errorf("renderer: style id must not be empty")
+	}
+	if strings.Contains(id, "..") || strings.Contains(id, "/") ||
+		strings.Contains(id, "\\") || strings.Contains(id, "\x00") {
+		return nil, fmt.Errorf("renderer: style id contains invalid characters: %q", id)
+	}
+	for _, c := range id {
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return nil, fmt.Errorf("renderer: style id contains invalid characters: %q", id)
+		}
+	}
+
 	var style map[string]any
 	if err := json.Unmarshal(src, &style); err != nil {
 		return nil, fmt.Errorf("renderer: parse style.json: %w", err)
@@ -86,6 +108,16 @@ func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 
 	if sprite, ok := style["sprite"].(string); ok && !isHTTP(sprite) {
 		style["sprite"] = "file://" + filepath.Join(cfg.StylesDir, id, "sprite")
+	} else if arr, ok := style["sprite"].([]any); ok {
+		for _, entry := range arr {
+			m, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			if u, ok := m["url"].(string); ok && !isHTTP(u) {
+				m["url"] = "file://" + filepath.Join(cfg.StylesDir, id, "sprite")
+			}
+		}
 	}
 
 	if glyphs, ok := style["glyphs"].(string); ok && !isHTTP(glyphs) {

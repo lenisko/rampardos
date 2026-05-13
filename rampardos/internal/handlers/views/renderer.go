@@ -1,6 +1,7 @@
 package views
 
 import (
+	"bytes"
 	"html/template"
 	"io/fs"
 	"log/slog"
@@ -90,8 +91,6 @@ func NewBaseContext() BaseContext {
 
 // Render renders a template with the given context
 func (r *TemplateRenderer) Render(w http.ResponseWriter, name string, data any) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
 	tmpl, ok := r.templates[name]
 	if !ok {
 		slog.Error("Template not found", "name", name)
@@ -99,8 +98,13 @@ func (r *TemplateRenderer) Render(w http.ResponseWriter, name string, data any) 
 		return
 	}
 
-	if err := tmpl.ExecuteTemplate(w, "base", data); err != nil {
+	var buf bytes.Buffer
+	if err := tmpl.ExecuteTemplate(&buf, "base", data); err != nil {
 		slog.Error("Failed to render template", "name", name, "error", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -35,11 +36,12 @@ func init() {
 // would produce (style reload, dataset reload). Cheap; safe to call
 // from any goroutine.
 //
-// Uses UnixNano (not Unix) so two reloads in the same second still
-// produce distinct epochs — clients with cached state from between
-// the two reloads will revalidate cleanly.
+// Uses Add(1) for a monotonic counter so concurrent bumps always
+// produce distinct epochs — Store(time.Now().UnixNano()) could race
+// to the same nanosecond on fast clocks and collapse two reloads into
+// one epoch, causing clients to miss an invalidation.
 func BumpContentVersion() {
-	contentVersionEpoch.Store(time.Now().UnixNano())
+	contentVersionEpoch.Add(1)
 }
 
 // contentETag returns an HTTP-compatible (quoted) ETag for a content-
@@ -106,12 +108,41 @@ func setStaticMapCacheHeaders(w http.ResponseWriter, path string) {
 // without rendering, encoding, or even consulting the disk cache is
 // the win — revalidation cost collapses from "full render path" to
 // "string compare."
-func servedNotModified(w http.ResponseWriter, r *http.Request) bool {
-	etag := w.Header().Get("ETag")
-	if etag == "" {
+// ifNoneMatchMatches reports whether the If-None-Match header from the
+// client matches etag per RFC 7232 §3.2 (comma-separated list of quoted
+// ETags, with "*" wildcard). Matching is strong (byte-for-byte); weak
+// ETags (W/"...") are not treated specially here because our server only
+// emits strong ETags.
+func ifNoneMatchMatches(header, etag string) bool {
+	if header == "" || etag == "" {
 		return false
 	}
-	if r.Header.Get("If-None-Match") != etag {
+	if header == "*" {
+		return true
+	}
+	for token := range strings.SplitSeq(header, ",") {
+		if strings.TrimSpace(token) == etag {
+			return true
+		}
+	}
+	return false
+}
+
+// servedNotModified short-circuits to 304 Not Modified when the
+// client-supplied If-None-Match matches the ETag we just set. Returns
+// true if 304 was written; caller should return immediately.
+//
+// Must be called AFTER setStaticMapCacheHeaders so the ETag header is
+// present (we read it back from w.Header() rather than recomputing).
+//
+// Why this is the whole game: a client with a matching ETag already
+// holds bytes equivalent to what we would render. Returning 304
+// without rendering, encoding, or even consulting the disk cache is
+// the win — revalidation cost collapses from "full render path" to
+// "string compare."
+func servedNotModified(w http.ResponseWriter, r *http.Request) bool {
+	etag := w.Header().Get("ETag")
+	if !ifNoneMatchMatches(r.Header.Get("If-None-Match"), etag) {
 		return false
 	}
 	w.WriteHeader(http.StatusNotModified)

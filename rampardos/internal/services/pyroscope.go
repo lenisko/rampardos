@@ -9,10 +9,11 @@ import (
 	"github.com/lenisko/rampardos/internal/config"
 )
 
-// InitPyroscope initializes Pyroscope profiling if configured
-func InitPyroscope(cfg *config.Config) {
+// InitPyroscope initializes Pyroscope profiling if configured.
+// Returns the running profiler so callers can Stop() it on shutdown; nil if disabled or failed.
+func InitPyroscope(cfg *config.Config) *pyroscope.Profiler {
 	if cfg.PyroscopeServerAddress == "" {
-		return
+		return nil
 	}
 
 	slog.Info("Pyroscope starting", "server", cfg.PyroscopeServerAddress)
@@ -51,10 +52,11 @@ func InitPyroscope(cfg *config.Config) {
 		pyroscopeConfig.BasicAuthPassword = cfg.PyroscopeBasicAuthPassword
 	}
 
-	_, err := pyroscope.Start(pyroscopeConfig)
+	profiler, err := pyroscope.Start(pyroscopeConfig)
 	if err != nil {
 		slog.Error("Pyroscope init failed", "error", err)
-	} else {
-		slog.Info("Pyroscope started successfully", "app", cfg.PyroscopeApplicationName)
+		return nil
 	}
+	slog.Info("Pyroscope started successfully", "app", cfg.PyroscopeApplicationName)
+	return profiler
 }

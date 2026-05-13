@@ -12,11 +12,11 @@ import (
 // Path() must match GetFormat() across the relevant precedence cases.
 func TestMultiStaticMap_PathHonoursFormat(t *testing.T) {
 	// Save and restore package-level config so the tests don't leak.
-	prevDefault := DefaultImageFormat
-	prevOverride := OverrideClientFormat
+	prevDefault := GetDefaultImageFormat()
+	prevOverride := GetOverrideClientFormat()
 	t.Cleanup(func() {
-		DefaultImageFormat = prevDefault
-		OverrideClientFormat = prevOverride
+		SetDefaultImageFormat(prevDefault)
+		SetOverrideClientFormat(prevOverride)
 	})
 
 	pngPtr := func() *ImageFormat { f := ImageFormatPNG; return &f }
@@ -39,8 +39,8 @@ func TestMultiStaticMap_PathHonoursFormat(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			DefaultImageFormat = tc.serverDefault
-			OverrideClientFormat = tc.serverOverride
+			SetDefaultImageFormat(tc.serverDefault)
+			SetOverrideClientFormat(tc.serverOverride)
 
 			m := &MultiStaticMap{Format: tc.clientFormat}
 			if got := m.GetFormat(); got != tc.wantFormat {

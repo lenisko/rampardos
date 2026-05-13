@@ -23,7 +23,8 @@ func DebugRequestBody() func(http.Handler) http.Handler {
 			if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 				contentType := r.Header.Get("Content-Type")
 
-				// Read body
+				// Read body (cap at 32 MB to prevent memory exhaustion)
+				r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
 					fmt.Printf("[DEBUG] Failed to read request body: %v\n", err)

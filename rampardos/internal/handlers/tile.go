@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -50,6 +51,16 @@ func (h *TileHandler) Get(w http.ResponseWriter, r *http.Request) {
 	yStr := chi.URLParam(r, "y")
 	scaleStr := chi.URLParam(r, "scale")
 	formatStr := chi.URLParam(r, "format")
+
+	// Defence-in-depth: the style is embedded into the cache filename
+	// and (for local styles) passed to the renderer's style lookup,
+	// which itself joins it into a filesystem path. Reject any value
+	// that isn't a strict identifier.
+	if _, err := services.SanitizeName(style); err != nil {
+		services.GlobalMetrics.RecordValidationError("tile", "style")
+		http.Error(w, "Invalid style parameter", http.StatusBadRequest)
+		return
+	}
 
 	z, err := strconv.Atoi(zStr)
 	if err != nil {
@@ -166,9 +177,19 @@ func (h *TileHandler) generateTileAndResponse(w http.ResponseWriter, r *http.Req
 
 	result, err := h.GenerateTile(r.Context(), style, z, x, y, scale, format)
 	if err != nil {
-		slog.Error("Failed to generate tile", "error", err)
+		// Client disconnects shouldn't be reported as server errors.
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		slog.Error("Failed to generate tile", "error", err, "style", style, "z", z, "x", x, "y", y)
 		services.GlobalMetrics.RecordError("tile", "generation_failed")
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusInternalServerError
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		// Generic body — internal error text may contain filesystem
+		// paths or renderer internals that public callers shouldn't see.
+		http.Error(w, "Failed to generate tile", status)
 		return
 	}
 

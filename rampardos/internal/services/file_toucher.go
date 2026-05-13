@@ -16,10 +16,11 @@ const (
 
 // FileToucher batches file touch operations
 type FileToucher struct {
-	mu     sync.Mutex
-	queue  []string
-	ctx    context.Context
-	cancel context.CancelFunc
+	mu      sync.Mutex
+	started sync.Once
+	queue   []string
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // NewFileToucher creates a new file toucher
@@ -35,7 +36,9 @@ func NewFileToucher() *FileToucher {
 
 // Start begins the background touch loop
 func (ft *FileToucher) Start() {
-	go ft.run()
+	ft.started.Do(func() {
+		go ft.run()
+	})
 }
 
 // Stop stops the file toucher

@@ -22,6 +22,7 @@ import (
 	"github.com/lenisko/rampardos/internal/services"
 	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 // rendererPNGBufferPool reuses png.EncoderBuffer across encodes so
@@ -114,6 +115,7 @@ type NodePoolRenderer struct {
 
 	mu    sync.RWMutex
 	pools map[string]*stylePool
+	sfg   singleflight.Group
 }
 
 // NewNodePoolRenderer creates a NodePoolRenderer. Pools are created
@@ -331,27 +333,44 @@ func (npr *NodePoolRenderer) getOrCreatePool(styleID string, scale uint8) (*styl
 		return pool, nil
 	}
 
-	// Slow path: create pool under write lock.
-	npr.mu.Lock()
-	defer npr.mu.Unlock()
+	// Slow path: use singleflight so concurrent requests for the same
+	// key serialize on a single loadPool call, while requests for other
+	// styles are unaffected (they run their own singleflight call in
+	// parallel). The global write lock is held only for the brief map
+	// install after workers are ready, not during the spawn/handshake.
+	v, err, _ := npr.sfg.Do(key, func() (any, error) {
+		// Re-check under read lock: another goroutine may have finished
+		// between our RUnlock above and sfg.Do acquiring the slot.
+		npr.mu.RLock()
+		if p, ok := npr.pools[key]; ok {
+			npr.mu.RUnlock()
+			return p, nil
+		}
+		npr.mu.RUnlock()
 
-	if pool, ok := npr.pools[key]; ok {
-		return pool, nil
-	}
+		stylePath := filepath.Join(npr.cfg.StylesDir, styleID, "style.json")
+		if _, err := os.Stat(stylePath); err != nil {
+			return nil, fmt.Errorf("renderer: unknown style %q (no style.json at %s)", styleID, stylePath)
+		}
 
-	stylePath := filepath.Join(npr.cfg.StylesDir, styleID, "style.json")
-	if _, err := os.Stat(stylePath); err != nil {
-		return nil, fmt.Errorf("renderer: unknown style %q (no style.json at %s)", styleID, stylePath)
-	}
+		ratio := int(scale)
+		slog.Info("Creating renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", npr.cfg.StylePoolSize, "globalRenderCap", npr.cfg.PoolSize)
+		p, err := npr.loadPool(styleID, ratio)
+		if err != nil {
+			return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
+		}
 
-	ratio := int(scale)
-	slog.Info("Creating renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", npr.cfg.StylePoolSize, "globalRenderCap", npr.cfg.PoolSize)
-	pool, err := npr.loadPool(styleID, ratio)
+		// Install the new pool under a brief write lock.
+		npr.mu.Lock()
+		npr.pools[key] = p
+		npr.mu.Unlock()
+
+		return p, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
+		return nil, err
 	}
-	npr.pools[key] = pool
-	return pool, nil
+	return v.(*stylePool), nil
 }
 
 // ReloadStyles tears down all existing pools and rebuilds them from

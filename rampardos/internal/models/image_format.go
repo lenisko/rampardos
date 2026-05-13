@@ -1,5 +1,7 @@
 package models
 
+import "sync"
+
 // ImageFormat represents supported image formats
 type ImageFormat string
 
@@ -10,8 +12,41 @@ const (
 	ImageFormatWEBP ImageFormat = "webp"
 )
 
-// DefaultImageFormat is the default format when none is specified (can be set by config)
-var DefaultImageFormat ImageFormat = ImageFormatPNG
+var (
+	defaultImageFormatMu sync.RWMutex
+	defaultImageFormat   ImageFormat = ImageFormatPNG
+
+	overrideClientFormatMu sync.RWMutex
+	overrideClientFormat   bool
+)
+
+// GetDefaultImageFormat returns the current default image format, safe for concurrent use.
+func GetDefaultImageFormat() ImageFormat {
+	defaultImageFormatMu.RLock()
+	defer defaultImageFormatMu.RUnlock()
+	return defaultImageFormat
+}
+
+// SetDefaultImageFormat sets the default image format, safe for concurrent use.
+func SetDefaultImageFormat(f ImageFormat) {
+	defaultImageFormatMu.Lock()
+	defer defaultImageFormatMu.Unlock()
+	defaultImageFormat = f
+}
+
+// GetOverrideClientFormat returns whether client-specified formats are overridden.
+func GetOverrideClientFormat() bool {
+	overrideClientFormatMu.RLock()
+	defer overrideClientFormatMu.RUnlock()
+	return overrideClientFormat
+}
+
+// SetOverrideClientFormat sets the override-client-format flag.
+func SetOverrideClientFormat(v bool) {
+	overrideClientFormatMu.Lock()
+	defer overrideClientFormatMu.Unlock()
+	overrideClientFormat = v
+}
 
 // IsValid checks if the format is supported
 func (f ImageFormat) IsValid() bool {

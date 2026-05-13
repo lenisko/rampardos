@@ -53,6 +53,11 @@ type worker struct {
 
 	renders  atomic.Int64
 	killOnce sync.Once
+	// exited is closed by the reaper goroutine started in kill() once
+	// the child process has been Wait()'d. Tests synchronise on this
+	// before inspecting cmd.ProcessState; production code does not
+	// need to read it.
+	exited chan struct{}
 }
 
 // spawnWorker starts a child process, waits for its handshake frame,
@@ -89,6 +94,7 @@ func spawnWorker(args workerArgs) (*worker, error) {
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: stdout,
+		exited: make(chan struct{}),
 	}
 
 	// Read the handshake with a deadline.
@@ -177,7 +183,12 @@ func (w *worker) kill() {
 			_ = syscall.Kill(-w.cmd.Process.Pid, syscall.SIGKILL)
 		}
 		// Reap asynchronously so the kernel can release resources.
-		go func() { _ = w.cmd.Wait() }()
+		// Closing w.exited after Wait() lets callers (notably tests)
+		// observe ProcessState without racing against the reaper.
+		go func() {
+			_ = w.cmd.Wait()
+			close(w.exited)
+		}()
 	})
 }
 

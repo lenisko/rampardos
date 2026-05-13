@@ -2,7 +2,10 @@ package services
 
 import (
 	"bufio"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -71,8 +74,13 @@ func (s *OpenFreeMapService) fetchLatestPlanetURL() (string, error) {
 	}
 	defer resp.Body.Close()
 
+	expectedHost, err := url.Parse(openFreeMapBaseURL)
+	if err != nil {
+		return "", err
+	}
+
 	var lastMbtilesPath string
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 10<<20))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.HasSuffix(line, ".mbtiles") && strings.Contains(line, "areas/planet/") {
@@ -88,5 +96,14 @@ func (s *OpenFreeMapService) fetchLatestPlanetURL() (string, error) {
 		return "", nil
 	}
 
-	return openFreeMapBaseURL + lastMbtilesPath, nil
+	finalURL := openFreeMapBaseURL + lastMbtilesPath
+	parsed, err := url.Parse(finalURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Host != expectedHost.Host {
+		return "", fmt.Errorf("SSRF check failed: constructed URL host %q does not match expected host %q", parsed.Host, expectedHost.Host)
+	}
+
+	return finalURL, nil
 }

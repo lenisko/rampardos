@@ -94,12 +94,19 @@ func TestWorkerHangIsKilledOnContextDeadline(t *testing.T) {
 		t.Errorf("dispatch took too long (%v); worker should have been killed quickly", elapsed)
 	}
 
-	// Verify the worker process is actually gone.
-	if w.cmd.ProcessState == nil {
-		// On some platforms ProcessState is populated only after Wait.
-		_ = w.cmd.Wait()
+	// Synchronise on the reaper goroutine kill() launched. After
+	// w.exited is closed, the reaper has finished cmd.Wait() and
+	// ProcessState is safe to read.
+	select {
+	case <-w.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("reaper goroutine did not finish within 2s")
 	}
-	if w.cmd.ProcessState != nil && !w.cmd.ProcessState.Exited() {
+	// ProcessState.Exited() is false for signal-terminated processes
+	// (SIGKILL doesn't count as a clean exit per Go's docs), so check
+	// only that ProcessState was set — which Wait() guarantees once
+	// the process has terminated, regardless of cause.
+	if w.cmd.ProcessState == nil {
 		t.Errorf("worker process still running after kill")
 	}
 }

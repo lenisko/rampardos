@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -14,6 +15,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	prommodel "github.com/prometheus/client_model/go"
 )
+
+// bucketLabel returns the input if it matches a strict identifier pattern and is short,
+// otherwise "other" — to prevent unbounded Prometheus label cardinality from user input.
+var labelSafeRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+func bucketLabel(s string) string {
+	if len(s) > 64 || !labelSafeRe.MatchString(s) {
+		return "other"
+	}
+	return s
+}
 
 // MetricsManager handles all Prometheus metrics
 type MetricsManager struct {
@@ -74,15 +86,15 @@ type MetricsManager struct {
 	tileDecodeDuration *prometheus.HistogramVec
 
 	// Viewport render time for the arbitrary-size maplibre-native
-	// path. Covers fractional-zoom staticmaps and the
-	// LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass; distinct from
-	// tile_generate_duration which only times per-tile work.
+	// path. Covers all local-style staticmaps (any zoom); distinct
+	// from tile_generate_duration which only times per-tile work for
+	// external styles.
 	rendererViewportDuration *prometheus.HistogramVec
 
-	// Renderer pool saturation tripwires. With LOCAL_STYLES_USE_VIEWPORT
-	// every local staticmap base is a live renderer call — there is no
-	// disk-cache buffer — so visibility into whether the Node workers
-	// are the bottleneck matters.
+	// Renderer pool saturation tripwires. Every local staticmap base
+	// is a live renderer call — there is no disk-cache buffer — so
+	// visibility into whether the Node workers are the bottleneck
+	// matters.
 	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker in (style, scale) pool
 	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
 	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
@@ -252,7 +264,7 @@ func newMetricsManager() *MetricsManager {
 
 		rendererViewportDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_viewport_duration_seconds",
-			Help:    "Time spent inside renderer.RenderViewport, covering fractional-zoom bases and the LOCAL_STYLES_USE_VIEWPORT integer-zoom bypass. Includes maplibre-native render + encode + IPC; excludes the caller's disk write.",
+			Help:    "Time spent inside renderer.RenderViewport, covering all local-style staticmap bases (integer and fractional zoom). Includes maplibre-native render + encode + IPC; excludes the caller's disk write.",
 			Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
 		}, []string{"style", "scale"}),
 
@@ -491,7 +503,7 @@ func (m *MetricsManager) RecordRequest(reqType, style string, cached bool, durat
 		cachedStr = "true"
 	}
 
-	m.requestsTotal.WithLabelValues(reqType, style, cachedStr).Inc()
+	m.requestsTotal.WithLabelValues(reqType, bucketLabel(style), cachedStr).Inc()
 
 	if cached {
 		m.cacheHitsTotal.WithLabelValues(reqType).Inc()
@@ -499,7 +511,7 @@ func (m *MetricsManager) RecordRequest(reqType, style string, cached bool, durat
 		m.cacheMissTotal.WithLabelValues(reqType).Inc()
 	}
 
-	m.requestDuration.WithLabelValues(reqType, style, cachedStr).Observe(duration)
+	m.requestDuration.WithLabelValues(reqType, bucketLabel(style), cachedStr).Observe(duration)
 }
 
 // IncrementInFlight increments the in-flight counter for a request type
@@ -518,7 +530,7 @@ func (m *MetricsManager) RecordTileRequest(style string, cached bool) {
 	if cached {
 		cachedStr = "true"
 	}
-	m.requestsTotal.WithLabelValues("tile", style, cachedStr).Inc()
+	m.requestsTotal.WithLabelValues("tile", bucketLabel(style), cachedStr).Inc()
 	if cached {
 		m.cacheHitsTotal.WithLabelValues("tile").Inc()
 	} else {
@@ -532,7 +544,7 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 	if cached {
 		cachedStr = "true"
 	}
-	m.requestsTotal.WithLabelValues("staticmap", style, cachedStr).Inc()
+	m.requestsTotal.WithLabelValues("staticmap", bucketLabel(style), cachedStr).Inc()
 	if cached {
 		m.cacheHitsTotal.WithLabelValues("staticmap").Inc()
 	} else {
@@ -541,24 +553,24 @@ func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
 }
 
 func (m *MetricsManager) RecordTileGenerate(style, source string, duration float64) {
-	m.tileGenerateDuration.WithLabelValues(style, source).Observe(duration)
+	m.tileGenerateDuration.WithLabelValues(bucketLabel(style), bucketLabel(source)).Observe(duration)
 }
 
 func (m *MetricsManager) RecordTileDecode(source string, duration float64) {
-	m.tileDecodeDuration.WithLabelValues(source).Observe(duration)
+	m.tileDecodeDuration.WithLabelValues(bucketLabel(source)).Observe(duration)
 }
 
 func (m *MetricsManager) RecordRendererViewport(style, scale string, duration float64) {
-	m.rendererViewportDuration.WithLabelValues(style, scale).Observe(duration)
+	m.rendererViewportDuration.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(duration)
 }
 
 func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeconds float64, idleAfter int) {
-	m.rendererPoolAcquireWait.WithLabelValues(style, scale).Observe(waitSeconds)
-	m.rendererPoolIdleWorkers.WithLabelValues(style, scale).Set(float64(idleAfter))
+	m.rendererPoolAcquireWait.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(waitSeconds)
+	m.rendererPoolIdleWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(idleAfter))
 }
 
 func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
-	m.rendererWorkerReplacements.WithLabelValues(style, scale, reason).Inc()
+	m.rendererWorkerReplacements.WithLabelValues(bucketLabel(style), bucketLabel(scale), reason).Inc()
 }
 
 // SetRendererGlobalCapacity is called once at renderer init to expose
@@ -593,7 +605,7 @@ func (m *MetricsManager) RecordMarkerRequest(domain string, cached bool) {
 	if cached {
 		cachedStr = "true"
 	}
-	m.requestsTotal.WithLabelValues("marker", domain, cachedStr).Inc()
+	m.requestsTotal.WithLabelValues("marker", bucketLabel(domain), cachedStr).Inc()
 	if cached {
 		m.cacheHitsTotal.WithLabelValues("marker").Inc()
 	} else {
@@ -603,17 +615,17 @@ func (m *MetricsManager) RecordMarkerRequest(domain string, cached bool) {
 
 // RecordHTTPClientRequest records an HTTP client request
 func (m *MetricsManager) RecordHTTPClientRequest(host string) {
-	m.httpClientRequests.WithLabelValues(host).Inc()
+	m.httpClientRequests.WithLabelValues(bucketLabel(host)).Inc()
 }
 
 // RecordHTTPClientError records an HTTP client error
 func (m *MetricsManager) RecordHTTPClientError(host string) {
-	m.httpClientErrors.WithLabelValues(host).Inc()
+	m.httpClientErrors.WithLabelValues(bucketLabel(host)).Inc()
 }
 
 // RecordHTTPClientDuration records HTTP client request duration
 func (m *MetricsManager) RecordHTTPClientDuration(host string, duration float64) {
-	m.httpClientDuration.WithLabelValues(host).Observe(duration)
+	m.httpClientDuration.WithLabelValues(bucketLabel(host)).Observe(duration)
 }
 
 // RecordError records an error
@@ -707,7 +719,7 @@ func (m *MetricsManager) RecordHTTPError(handler string, statusCode int) {
 
 // RecordTemplateError records a template rendering error
 func (m *MetricsManager) RecordTemplateError(templateName, reason string) {
-	m.errorsTotal.WithLabelValues("template_"+templateName, reason).Inc()
+	m.errorsTotal.WithLabelValues("template_"+bucketLabel(templateName), reason).Inc()
 	m.incrementDailyError("template")
 }
 
@@ -729,7 +741,7 @@ func (m *MetricsManager) SetFileRemoverQueueSize(folder string, size int) {
 
 // RecordTemplateRender records a template render
 func (m *MetricsManager) RecordTemplateRender(templateName, method, reqType string) {
-	m.templateRendersTotal.WithLabelValues(templateName, method, reqType).Inc()
+	m.templateRendersTotal.WithLabelValues(bucketLabel(templateName), method, reqType).Inc()
 }
 
 // SetCacheSize sets the cache size for a folder

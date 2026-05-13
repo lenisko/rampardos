@@ -69,13 +69,13 @@ func (sc *StylesController) loadExternalStyles() []models.Style {
 	return styles
 }
 
-func (sc *StylesController) saveExternalStyles() error {
-	sc.mu.RLock()
+// saveExternalStylesLocked serializes sc.externalStyles to disk.
+// Must be called with sc.mu held for writing.
+func (sc *StylesController) saveExternalStylesLocked() error {
 	styles := make([]models.Style, 0, len(sc.externalStyles))
 	for _, style := range sc.externalStyles {
 		styles = append(styles, style)
 	}
-	sc.mu.RUnlock()
 
 	data, err := json.MarshalIndent(styles, "", "  ")
 	if err != nil {
@@ -278,18 +278,18 @@ func (sc *StylesController) AddExternalStyle(style models.Style) error {
 
 	sc.mu.Lock()
 	sc.externalStyles[style.ID] = style
+	err := sc.saveExternalStylesLocked()
 	sc.mu.Unlock()
-
-	return sc.saveExternalStyles()
+	return err
 }
 
 // DeleteExternalStyle removes an external style
 func (sc *StylesController) DeleteExternalStyle(id string) error {
 	sc.mu.Lock()
 	delete(sc.externalStyles, id)
+	err := sc.saveExternalStylesLocked()
 	sc.mu.Unlock()
-
-	return sc.saveExternalStyles()
+	return err
 }
 
 // AddLocalStyle adds a local style from a ZIP file

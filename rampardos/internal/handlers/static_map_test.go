@@ -82,21 +82,21 @@ func TestGenerateBaseStaticMapDispatch(t *testing.T) {
 	basePath := filepath.Join(tmp, "base.png")
 	_ = os.Remove(basePath)
 
-	t.Run("local integer zoom -> stitch", func(t *testing.T) {
+	t.Run("local integer zoom -> viewport API", func(t *testing.T) {
+		// Local styles always use the in-process viewport renderer,
+		// regardless of integer vs fractional zoom. Tile stitching for
+		// local styles was removed.
 		rec := &dispatchRecord{}
 		h := newDispatchHandlerForTest(t, nil, rec)
 		sm := models.StaticMap{Style: "local", Zoom: 14, Width: 512, Height: 512}
 		if _, err := h.generateBaseStaticMap(ctx, sm, basePath); err != nil {
 			t.Fatal(err)
 		}
-		if rec.fromTiles != 1 || rec.fromAPI != 0 {
-			t.Errorf("want stitch, got fromTiles=%d fromAPI=%d", rec.fromTiles, rec.fromAPI)
-		}
-		if rec.lastExt != nil {
-			t.Errorf("want nil extStyle for local, got %+v", rec.lastExt)
+		if rec.fromAPI != 1 || rec.fromTiles != 0 {
+			t.Errorf("want viewport API, got fromAPI=%d fromTiles=%d", rec.fromAPI, rec.fromTiles)
 		}
 		if rec.lastWarn {
-			t.Errorf("did not expect approximation warning")
+			t.Errorf("did not expect approximation warning for local")
 		}
 	})
 

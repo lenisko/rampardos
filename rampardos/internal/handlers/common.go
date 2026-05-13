@@ -36,8 +36,9 @@ func ensureDir(dir string) {
 	if _, ok := knownDirs.Load(dir); ok {
 		return
 	}
-	os.MkdirAll(dir, 0755)
-	knownDirs.Store(dir, struct{}{})
+	if os.MkdirAll(dir, 0755) == nil {
+		knownDirs.Store(dir, struct{}{})
+	}
 }
 
 // serveFile serves an on-disk file with the same content-addressable

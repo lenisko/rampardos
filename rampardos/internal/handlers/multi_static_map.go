@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -103,8 +102,8 @@ func (h *MultiStaticMapHandler) PostTemplate(w http.ResponseWriter, r *http.Requ
 // GetPregenerated handles GET /multistaticmap/pregenerated/:id
 func (h *MultiStaticMapHandler) GetPregenerated(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	if id == "" || strings.Contains(id, "..") {
-		http.Error(w, "Missing id", http.StatusBadRequest)
+	if _, err := services.SanitizeName(id); err != nil {
+		http.Error(w, "Invalid id", http.StatusBadRequest)
 		return
 	}
 

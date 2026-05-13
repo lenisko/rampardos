@@ -120,6 +120,10 @@ func GenerateBaseStaticMapNative(staticMap models.StaticMap, tilePaths []string,
 		}
 	}
 
+	if len(positions) == 0 {
+		return nil, fmt.Errorf("no valid tile positions parsed")
+	}
+
 	// Create combined image
 	gridWidth := (maxX - minX + 1) * tileWidth
 	gridHeight := (maxY - minY + 1) * tileHeight
@@ -169,10 +173,10 @@ func drawPolygon(dc *gg.Context, staticMap models.StaticMap, polygon models.Poly
 		point := getRealOffset(
 			models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
 			models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-			staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+			staticMap.Zoom, scale, 0, 0, sm,
 		)
-		x := float64(point.x + int(staticMap.Width/2*uint16(scale)))
-		y := float64(point.y + int(staticMap.Height/2*uint16(scale)))
+		x := float64(point.x + int(staticMap.Width)*int(scale)/2)
+		y := float64(point.y + int(staticMap.Height)*int(scale)/2)
 
 		if i == 0 {
 			dc.MoveTo(x, y)
@@ -193,10 +197,10 @@ func drawPolygon(dc *gg.Context, staticMap models.StaticMap, polygon models.Poly
 			point := getRealOffset(
 				models.Coordinate{Latitude: coord[0], Longitude: coord[1]},
 				models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-				staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+				staticMap.Zoom, scale, 0, 0, sm,
 			)
-			x := float64(point.x + int(staticMap.Width/2*uint16(scale)))
-			y := float64(point.y + int(staticMap.Height/2*uint16(scale)))
+			x := float64(point.x + int(staticMap.Width)*int(scale)/2)
+			y := float64(point.y + int(staticMap.Height)*int(scale)/2)
 
 			if i == 0 {
 				dc.MoveTo(x, y)
@@ -216,10 +220,10 @@ func drawCircle(dc *gg.Context, staticMap models.StaticMap, circle models.Circle
 	point := getRealOffset(
 		coord,
 		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-		staticMap.Zoom, staticMap.Scale, 0, 0, sm,
+		staticMap.Zoom, scale, 0, 0, sm,
 	)
 	radiusCoord := coord.CoordinateAt(circle.Radius, 0)
-	radius := float64(getRealOffset(coord, radiusCoord, staticMap.Zoom, staticMap.Scale, 0, 0, sm).y)
+	radius := float64(getRealOffset(coord, radiusCoord, staticMap.Zoom, scale, 0, 0, sm).y)
 
 	x := float64(point.x + int(staticMap.Width)*int(scale)/2)
 	y := float64(point.y + int(staticMap.Height)*int(scale)/2)
@@ -301,11 +305,11 @@ func drawMarkerNRGBA(canvas *image.NRGBA, staticMap models.StaticMap, marker mod
 	realOffset := getRealOffset(
 		models.Coordinate{Latitude: marker.Latitude, Longitude: marker.Longitude},
 		models.Coordinate{Latitude: staticMap.Latitude, Longitude: staticMap.Longitude},
-		staticMap.Zoom, staticMap.Scale, int(marker.XOffset), int(marker.YOffset), sm,
+		staticMap.Zoom, scale, int(marker.XOffset), int(marker.YOffset), sm,
 	)
 
-	if abs(realOffset.x) > int(staticMap.Width+marker.Width)*int(scale)/2 ||
-		abs(realOffset.y) > int(staticMap.Height+marker.Height)*int(scale)/2 {
+	if abs(realOffset.x) > (int(staticMap.Width)+int(marker.Width))*int(scale)/2 ||
+		abs(realOffset.y) > (int(staticMap.Height)+int(marker.Height))*int(scale)/2 {
 		return
 	}
 

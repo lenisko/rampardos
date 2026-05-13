@@ -1050,6 +1050,3 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	}, nil
 }
 
-func init() {
-	image.RegisterFormat("png", pngHeader, Decode, DecodeConfig)
-}

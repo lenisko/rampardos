@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/lenisko/rampardos/internal/fileutil"
 )
 
 const (
@@ -141,10 +143,15 @@ func (dc *DatasetsController) SetActive(name string) error {
 	}
 
 	combinedPath := filepath.Join(dc.folder, "Combined.mbtiles")
-	os.Remove(combinedPath)
+	tmpPath := combinedPath + ".tmp"
 
 	source := filepath.Join("List", sanitized+".mbtiles")
-	if err := os.Symlink(source, combinedPath); err != nil {
+	os.Remove(tmpPath) // clean up any leftover temp
+	if err := os.Symlink(source, tmpPath); err != nil {
+		return fmt.Errorf("failed to create temp symlink: %w", err)
+	}
+	if err := os.Rename(tmpPath, combinedPath); err != nil {
+		os.Remove(tmpPath)
 		return fmt.Errorf("failed to link mbtiles: %w", err)
 	}
 
@@ -188,7 +195,7 @@ func (dc *DatasetsController) AddDataset(name string, data []byte) error {
 		return fmt.Errorf("invalid dataset name: %w", err)
 	}
 	path := filepath.Join(dc.listFolder, sanitized+".mbtiles")
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := fileutil.AtomicWriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write dataset: %w", err)
 	}
 
@@ -337,9 +344,14 @@ func (dc *DatasetsController) combineDatasets(datasets []string) error {
 
 	if len(datasets) == 1 {
 		// Just symlink - auto-activate the single dataset
-		os.Remove(combinedPath)
+		tmpPath := combinedPath + ".tmp"
 		source := filepath.Join("List", datasets[0]+".mbtiles")
-		if err := os.Symlink(source, combinedPath); err != nil {
+		os.Remove(tmpPath) // clean up any leftover temp
+		if err := os.Symlink(source, tmpPath); err != nil {
+			return fmt.Errorf("failed to create temp symlink: %w", err)
+		}
+		if err := os.Rename(tmpPath, combinedPath); err != nil {
+			os.Remove(tmpPath)
 			return fmt.Errorf("failed to link mbtiles: %w", err)
 		}
 		dc.mu.Lock()
