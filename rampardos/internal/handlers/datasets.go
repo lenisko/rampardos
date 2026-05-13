@@ -3,9 +3,12 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -234,32 +237,90 @@ func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Reques
 
 // Add handles POST /admin/api/datasets/add (file upload).
 //
-// mbtiles can be tens-to-hundreds of gigabytes (planet extracts), so
-// no MaxBytesReader cap is applied — admin endpoint, intentional
-// upload. ParseMultipartForm's 32MB in-memory cap means anything
-// larger spills to a temp file on disk, and AddDataset then streams
-// the multipart.File directly into the final path without buffering
-// the whole payload in RAM.
+// mbtiles can be tens-to-hundreds of gigabytes (planet extracts). To
+// avoid filling /tmp inside the container (Go's default multipart
+// spool location), we bypass r.ParseMultipartForm and iterate the
+// multipart body manually with r.MultipartReader. The file part is
+// streamed straight into a spool file inside the datasets list
+// folder — same filesystem as the final destination — so
+// CommitDataset finalises via a single atomic rename, no copy.
+//
+// No MaxBytesReader cap: this is an admin endpoint and operators
+// upload planet-scale extracts intentionally. The size guard is the
+// operator's disk quota on the datasets volume.
 func (h *DatasetsHandler) Add(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB in memory, rest spools to /tmp
-		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "Expected multipart upload", http.StatusBadRequest)
 		return
 	}
 
-	name := r.FormValue("name")
+	var (
+		name      string
+		spoolPath string
+	)
+	cleanup := func() {
+		if spoolPath != "" {
+			os.Remove(spoolPath)
+		}
+	}
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			cleanup()
+			http.Error(w, "Failed to read multipart body", http.StatusBadRequest)
+			return
+		}
+
+		switch part.FormName() {
+		case "name":
+			// Bounded read — name is a short identifier; a 1KB cap
+			// rejects pathological inputs without prejudging valid ones.
+			buf, readErr := io.ReadAll(io.LimitReader(part, 1024))
+			part.Close()
+			if readErr != nil {
+				cleanup()
+				http.Error(w, "Failed to read name", http.StatusBadRequest)
+				return
+			}
+			name = strings.TrimSpace(string(buf))
+		case "file":
+			if spoolPath != "" {
+				// Reject duplicate "file" parts — silently overwriting
+				// the first spool would leak it on disk.
+				part.Close()
+				cleanup()
+				http.Error(w, "Multiple file parts", http.StatusBadRequest)
+				return
+			}
+			spoolPath, err = h.datasetsController.SpoolUpload(part)
+			part.Close()
+			if err != nil {
+				slog.Error("Spool dataset upload", "error", err)
+				http.Error(w, "Failed to receive upload", http.StatusInternalServerError)
+				return
+			}
+		default:
+			part.Close()
+		}
+	}
+
 	if name == "" {
+		cleanup()
 		http.Error(w, "Missing name", http.StatusBadRequest)
 		return
 	}
-
-	file, _, err := r.FormFile("file")
-	if err != nil {
+	if spoolPath == "" {
 		http.Error(w, "Missing file", http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
 
-	if err := h.datasetsController.AddDataset(name, file); err != nil {
+	if err := h.datasetsController.CommitDataset(name, spoolPath); err != nil {
+		slog.Error("Commit dataset", "error", err, "name", name)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

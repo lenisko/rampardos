@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
-	"github.com/lenisko/rampardos/internal/fileutil"
 )
 
 const (
@@ -189,19 +187,66 @@ func (dc *DatasetsController) GetDatasets() ([]string, error) {
 	return datasets, nil
 }
 
-// AddDataset adds a new dataset by streaming src to disk. The
-// streaming form lets callers hand off a multipart.File or similar
-// without buffering the (potentially multi-gigabyte) payload in RAM.
-func (dc *DatasetsController) AddDataset(name string, src io.Reader) error {
+// SpoolUpload streams src to a tempfile under listFolder and returns
+// the temp path. The tempfile lives on the same filesystem as the
+// eventual destination, so CommitDataset can finalise via a single
+// rename (no cross-filesystem copy). The caller owns the returned
+// path: it MUST be passed to CommitDataset or os.Remove'd on any
+// other exit path.
+//
+// Spooling here rather than via Go's default os.TempDir() avoids
+// filling /tmp inside a container — multi-gigabyte mbtiles uploads
+// would otherwise spill onto whatever the runtime decides /tmp is,
+// often a small tmpfs or host-mounted scratch volume distinct from
+// the dataset filesystem.
+//
+// The tempfile name is dot-prefixed and ends in `.tmp` so GetDatasets
+// (which filters by `.mbtiles`) cannot observe in-progress uploads.
+func (dc *DatasetsController) SpoolUpload(src io.Reader) (string, error) {
+	if err := os.MkdirAll(dc.listFolder, 0o755); err != nil {
+		return "", fmt.Errorf("create list folder: %w", err)
+	}
+	f, err := os.CreateTemp(dc.listFolder, ".upload-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create spool file: %w", err)
+	}
+	tmp := f.Name()
+	if _, err := io.Copy(f, src); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", fmt.Errorf("stream upload: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", fmt.Errorf("sync spool: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("close spool: %w", err)
+	}
+	return tmp, nil
+}
+
+// CommitDataset moves a spooled upload to its final name and triggers
+// tile-join. The rename is atomic on POSIX since the spool tempfile
+// was created in the same directory as the destination. On any error
+// the spool file is removed.
+func (dc *DatasetsController) CommitDataset(name, spoolPath string) error {
 	sanitized, err := SanitizeName(name)
 	if err != nil {
+		os.Remove(spoolPath)
 		return fmt.Errorf("invalid dataset name: %w", err)
 	}
-	path := filepath.Join(dc.listFolder, sanitized+".mbtiles")
-	if err := fileutil.AtomicWriteReader(path, src, 0644); err != nil {
-		return fmt.Errorf("failed to write dataset: %w", err)
+	finalPath := filepath.Join(dc.listFolder, sanitized+".mbtiles")
+	if err := os.Chmod(spoolPath, 0o644); err != nil {
+		os.Remove(spoolPath)
+		return fmt.Errorf("chmod spool: %w", err)
 	}
-
+	if err := os.Rename(spoolPath, finalPath); err != nil {
+		os.Remove(spoolPath)
+		return fmt.Errorf("commit dataset: %w", err)
+	}
 	return dc.CombineTiles()
 }
 
