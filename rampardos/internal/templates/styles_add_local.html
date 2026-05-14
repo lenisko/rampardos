@@ -8,15 +8,12 @@
         <div class="mb-3">
             <label for="id" class="form-label">Style ID</label>
             <input type="text" class="form-control" id="id" name="id" required>
-        </div>
-        <div class="mb-3">
-            <label for="name" class="form-label">Style Name</label>
-            <input type="text" class="form-control" id="name" name="name" required>
+            <small class="form-text text-muted">Used as the directory name and URL slug. Letters, digits, hyphens, underscores only.</small>
         </div>
         <div class="mb-3">
             <label for="zip" class="form-label">Style ZIP File</label>
             <input type="file" class="form-control" id="zip" name="zip" accept=".zip" required>
-            <small class="form-text text-muted">ZIP should contain style.json, sprite.json, sprite.png, sprite@2x.json, sprite@2x.png</small>
+            <small class="form-text text-muted">ZIP should contain style.json (plus optional sprite.json, sprite.png, sprite@2x.json, sprite@2x.png). If you compressed a folder, the wrapper is detected and flattened automatically.</small>
         </div>
         <button type="submit" class="btn btn-primary">Upload</button>
         <a href="/admin/styles" class="btn btn-secondary">Cancel</a>

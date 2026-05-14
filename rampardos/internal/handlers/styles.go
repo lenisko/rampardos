@@ -75,9 +75,8 @@ func (h *StylesHandler) AddLocal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := r.FormValue("id")
-	name := r.FormValue("name")
-	if id == "" || name == "" {
-		http.Error(w, "ID and name are required", http.StatusBadRequest)
+	if id == "" {
+		http.Error(w, "ID is required", http.StatusBadRequest)
 		return
 	}
 
@@ -97,7 +96,7 @@ func (h *StylesHandler) AddLocal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Add local style
-	if err := h.stylesController.AddLocalStyle(id, name, zipData); err != nil {
+	if err := h.stylesController.AddLocalStyle(id, zipData); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

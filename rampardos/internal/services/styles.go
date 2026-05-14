@@ -292,9 +292,11 @@ func (sc *StylesController) DeleteExternalStyle(id string) error {
 	return err
 }
 
-// AddLocalStyle adds a local style from a ZIP file
+// AddLocalStyle adds a local style from a ZIP file.
 // ZIP should contain: style.json, sprite.json, sprite.png, sprite@2x.json, sprite@2x.png
-func (sc *StylesController) AddLocalStyle(id, name string, zipData []byte) error {
+// either at the root or under a single wrapper directory (the latter
+// is what Finder/Explorer's "compress folder" produces by default).
+func (sc *StylesController) AddLocalStyle(id string, zipData []byte) error {
 	sanitizedID, err := SanitizeName(id)
 	if err != nil {
 		return fmt.Errorf("invalid style ID: %w", err)
@@ -317,6 +319,14 @@ func (sc *StylesController) AddLocalStyle(id, name string, zipData []byte) error
 		return fmt.Errorf("failed to extract ZIP: %w", err)
 	}
 
+	// If the user compressed a folder (Finder/Explorer default), the
+	// zip contents live under a wrapper directory. Move them up so
+	// style.json ends up directly under styleDir.
+	if err := flattenSingleTopDir(styleDir); err != nil {
+		os.RemoveAll(styleDir)
+		return fmt.Errorf("failed to normalise extracted layout: %w", err)
+	}
+
 	// Verify required files exist
 	requiredFiles := []string{"style.json"}
 	for _, file := range requiredFiles {
@@ -331,8 +341,60 @@ func (sc *StylesController) AddLocalStyle(id, name string, zipData []byte) error
 		slog.Warn("Failed to update style.json paths", "error", err)
 	}
 
-	slog.Info("Added local style", "id", id, "name", name)
+	slog.Info("Added local style", "id", id)
 	return nil
+}
+
+// flattenSingleTopDir: if dir contains exactly one child directory
+// (ignoring platform metadata like __MACOSX, .DS_Store, Thumbs.db),
+// moves that directory's contents up into dir and removes the now
+// empty wrapper. Strips the metadata files unconditionally.
+func flattenSingleTopDir(dir string) error {
+	junk := map[string]bool{"__MACOSX": true, ".DS_Store": true, "Thumbs.db": true}
+
+	strip := func() error {
+		for k := range junk {
+			if err := os.RemoveAll(filepath.Join(dir, k)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := strip(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var real []os.DirEntry
+	for _, e := range entries {
+		if !junk[e.Name()] {
+			real = append(real, e)
+		}
+	}
+	if len(real) != 1 || !real[0].IsDir() {
+		return nil
+	}
+	wrapper := filepath.Join(dir, real[0].Name())
+	inner, err := os.ReadDir(wrapper)
+	if err != nil {
+		return err
+	}
+	for _, e := range inner {
+		from := filepath.Join(wrapper, e.Name())
+		to := filepath.Join(dir, e.Name())
+		if err := os.Rename(from, to); err != nil {
+			return fmt.Errorf("flatten %s: %w", e.Name(), err)
+		}
+	}
+	if err := os.Remove(wrapper); err != nil {
+		return err
+	}
+	// Re-strip in case the wrapper held its own metadata that just
+	// surfaced into dir.
+	return strip()
 }
 
 // updateStyleJSON updates the style.json with correct sprite and glyphs paths
