@@ -17,13 +17,15 @@ type StylesView struct {
 	previewLongitude float64
 }
 
-// NewStylesView creates a new styles view
-func NewStylesView(stylesController *services.StylesController, templates *TemplateRenderer) *StylesView {
+// NewStylesView creates a new styles view. previewLat/Lng set the
+// centre of the thumbnail renders on /admin/styles; they're wired
+// from PREVIEW_LATITUDE/PREVIEW_LONGITUDE via the config loader.
+func NewStylesView(stylesController *services.StylesController, templates *TemplateRenderer, previewLat, previewLng float64) *StylesView {
 	return &StylesView{
 		stylesController: stylesController,
 		templates:        templates,
-		previewLatitude:  52.5200, // Default Berlin
-		previewLongitude: 13.4050,
+		previewLatitude:  previewLat,
+		previewLongitude: previewLng,
 	}
 }
 

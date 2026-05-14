@@ -1,0 +1,21 @@
+{
+  "version": 8,
+  "name": "example",
+  "sprite": "{styleUrl}/sprite",
+  "glyphs": "{fontUrl}/{fontstack}/{range}.pbf",
+  "sources": {
+    "openmaptiles": {
+      "type": "vector",
+      "url": "mbtiles://openmaptiles"
+    }
+  },
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#f8f4f0"
+      }
+    }
+  ]
+}

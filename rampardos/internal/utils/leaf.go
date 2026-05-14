@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -91,15 +92,15 @@ func (r *LeafRenderer) processIfStatements(template string) string {
 		// Extract the full if block
 		fullBlock := template[ifStart : endifPos+6]
 
-		// Parse condition
-		condEnd := strings.Index(fullBlock, "):")
+		// Parse condition — use paren-depth scanner to avoid false matches on `):` inside the body
+		condEnd := findConditionEnd(fullBlock, 3) // 3 = index of `(` in `#if(`
 		if condEnd == -1 {
 			break
 		}
-		condition := fullBlock[4:condEnd]
+		condition := fullBlock[4 : condEnd-2] // between `#if(` and `):`
 
 		// Find #elseif, #else at same nesting level
-		body := fullBlock[condEnd+2 : len(fullBlock)-6]
+		body := fullBlock[condEnd : len(fullBlock)-6]
 
 		// Parse the if/elseif/else chain
 		replacement := r.processIfChain(condition, body)
@@ -141,15 +142,15 @@ func (r *LeafRenderer) processIfChain(condition string, body string) string {
 				elseifBlocks = append(elseifBlocks, body[currentBlockStart:i])
 			}
 
-			// Parse the elseif condition
-			condStart := i + 8 // len("#elseif(")
-			condEnd := strings.Index(body[condStart:], "):")
-			if condEnd == -1 {
+			// Parse the elseif condition — use paren-depth scanner
+			condStart := i + 8                                // len("#elseif("), points to `(`
+			condEndAbs := findConditionEnd(body, condStart-1) // condStart-1 = index of `(`
+			if condEndAbs == -1 {
 				i++
 				continue
 			}
-			elseifConditions = append(elseifConditions, body[condStart:condStart+condEnd])
-			currentBlockStart = condStart + condEnd + 2 // after "):"
+			elseifConditions = append(elseifConditions, body[condStart:condEndAbs-2]) // between `(` and `):`
+			currentBlockStart = condEndAbs                                            // after `):`
 			i = currentBlockStart
 		} else if depth == 0 && strings.HasPrefix(body[i:], "#else:") {
 			// Found #else at depth 0
@@ -225,12 +226,12 @@ func (r *LeafRenderer) processForLoops(template string) string {
 		// Extract the full for block
 		fullBlock := template[forStart : endforPos+7]
 
-		// Parse "item in collection"
-		headerEnd := strings.Index(fullBlock, "):")
+		// Parse "item in collection" — use paren-depth scanner to find closing `):`
+		headerEnd := findConditionEnd(fullBlock, 4) // 4 = index of `(` in `#for(`
 		if headerEnd == -1 {
 			break
 		}
-		header := fullBlock[5:headerEnd]
+		header := fullBlock[5 : headerEnd-2] // between `#for(` and `):`
 		parts := strings.Split(header, " in ")
 		if len(parts) != 2 {
 			break
@@ -238,7 +239,7 @@ func (r *LeafRenderer) processForLoops(template string) string {
 		itemName := strings.TrimSpace(parts[0])
 		collectionName := strings.TrimSpace(parts[1])
 
-		loopBody := fullBlock[headerEnd+2 : len(fullBlock)-7]
+		loopBody := fullBlock[headerEnd : len(fullBlock)-7]
 
 		collection := r.getValue(collectionName)
 		var result strings.Builder
@@ -248,9 +249,7 @@ func (r *LeafRenderer) processForLoops(template string) string {
 				// Create a new context with the loop variable
 				oldContext := r.context
 				r.context = make(map[string]any)
-				for k, v := range oldContext {
-					r.context[k] = v
-				}
+				maps.Copy(r.context, oldContext)
 				r.context[itemName] = item
 				r.context["index"] = idx
 
@@ -310,15 +309,7 @@ func (r *LeafRenderer) getValue(path string) any {
 func (r *LeafRenderer) evaluateCondition(condition string) bool {
 	condition = strings.TrimSpace(condition)
 
-	// Handle && (AND) - split and evaluate both sides
-	if strings.Contains(condition, " && ") {
-		parts := strings.SplitN(condition, " && ", 2)
-		if len(parts) == 2 {
-			return r.evaluateCondition(parts[0]) && r.evaluateCondition(parts[1])
-		}
-	}
-
-	// Handle || (OR) - split and evaluate both sides
+	// Handle || (OR) first — lower precedence than &&
 	if strings.Contains(condition, " || ") {
 		parts := strings.SplitN(condition, " || ", 2)
 		if len(parts) == 2 {
@@ -326,16 +317,24 @@ func (r *LeafRenderer) evaluateCondition(condition string) bool {
 		}
 	}
 
+	// Handle && (AND) — higher precedence than ||
+	if strings.Contains(condition, " && ") {
+		parts := strings.SplitN(condition, " && ", 2)
+		if len(parts) == 2 {
+			return r.evaluateCondition(parts[0]) && r.evaluateCondition(parts[1])
+		}
+	}
+
 	// Handle != nil check
-	if strings.HasSuffix(condition, " != nil") {
-		varName := strings.TrimSuffix(condition, " != nil")
+	if before, ok := strings.CutSuffix(condition, " != nil"); ok {
+		varName := before
 		value := r.getValue(varName)
 		return value != nil
 	}
 
 	// Handle == nil check
-	if strings.HasSuffix(condition, " == nil") {
-		varName := strings.TrimSuffix(condition, " == nil")
+	if before, ok := strings.CutSuffix(condition, " == nil"); ok {
+		varName := before
 		value := r.getValue(varName)
 		return value == nil
 	}
@@ -400,6 +399,28 @@ func (r *LeafRenderer) formatValue(value any) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// findConditionEnd returns the index just past the `):` that closes the condition
+// starting at parenStart (the index of the opening `(`).
+// Returns -1 if no balanced close is found.
+func findConditionEnd(s string, parenStart int) int {
+	depth := 0
+	for i := parenStart; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				if i+1 < len(s) && s[i+1] == ':' {
+					return i + 2 // index just after `):`
+				}
+				return -1
+			}
+		}
+	}
+	return -1
 }
 
 // RenderLeafTemplate is a convenience function to render a Leaf template

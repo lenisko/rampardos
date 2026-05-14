@@ -10,12 +10,23 @@ import (
 	"strings"
 )
 
+const (
+	maxZipEntries = 10000
+	maxZipBytes   = 10 * 1024 * 1024 * 1024 // 10 GB
+)
+
 // extractZip extracts a ZIP file from bytes to a destination directory
 func extractZip(zipData []byte, destDir string) error {
 	reader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return fmt.Errorf("failed to read ZIP: %w", err)
 	}
+
+	if len(reader.File) > maxZipEntries {
+		return fmt.Errorf("zip contains too many entries (%d > %d)", len(reader.File), maxZipEntries)
+	}
+
+	var totalBytes int64
 
 	for _, file := range reader.File {
 		// Sanitize path to prevent zip slip vulnerability
@@ -31,11 +42,28 @@ func extractZip(zipData []byte, destDir string) error {
 			continue
 		}
 
-		if file.FileInfo().IsDir() {
+		fi := file.FileInfo()
+		mode := fi.Mode()
+
+		// Skip symlinks and irregular files (devices, pipes, sockets)
+		if mode&os.ModeSymlink != 0 {
+			continue
+		}
+		if mode&(os.ModeDevice|os.ModeNamedPipe|os.ModeSocket|os.ModeCharDevice) != 0 {
+			continue
+		}
+
+		if fi.IsDir() {
 			if err := os.MkdirAll(destPath, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", name, err)
 			}
 			continue
+		}
+
+		// Check total bytes cap (use uncompressed size from zip header)
+		totalBytes += int64(file.UncompressedSize64)
+		if totalBytes > maxZipBytes {
+			return fmt.Errorf("zip extraction exceeds maximum allowed size (%d bytes)", maxZipBytes)
 		}
 
 		// Create parent directories
@@ -53,6 +81,11 @@ func extractZip(zipData []byte, destDir string) error {
 }
 
 func extractZipFile(file *zip.File, destPath string) error {
+	// Reject if destPath is already a symlink to prevent symlink-following writes
+	if fi, err := os.Lstat(destPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to overwrite symlink at %s", destPath)
+	}
+
 	rc, err := file.Open()
 	if err != nil {
 		return fmt.Errorf("failed to open ZIP entry %s: %w", file.Name, err)

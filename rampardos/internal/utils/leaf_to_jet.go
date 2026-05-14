@@ -154,13 +154,13 @@ func (c *LeafToJetConverter) convertIfStatements(template string) string {
 		// Extract the full if block
 		fullBlock := result[ifStart : endifPos+6]
 
-		// Parse condition
-		condEnd := strings.Index(fullBlock, "):")
+		// Parse condition — use paren-depth scanner to avoid false matches on `):` inside the body
+		condEnd := findConditionEnd(fullBlock, 3) // 3 = index of `(` in `#if(`
 		if condEnd == -1 {
 			break
 		}
-		condition := fullBlock[4:condEnd]
-		body := fullBlock[condEnd+2 : len(fullBlock)-6]
+		condition := fullBlock[4 : condEnd-2] // between `#if(` and `):`
+		body := fullBlock[condEnd : len(fullBlock)-6]
 
 		// Convert the if block to Jet
 		jetBlock := c.convertIfBlock(condition, body)
@@ -248,15 +248,15 @@ func (c *LeafToJetConverter) splitIfBody(body string) jetIfParts {
 				parts.elseifBlocks = append(parts.elseifBlocks, body[currentBlockStart:i])
 			}
 
-			// Parse the elseif condition
-			condStart := i + 8 // len("#elseif(")
-			condEnd := strings.Index(body[condStart:], "):")
-			if condEnd == -1 {
+			// Parse the elseif condition — use paren-depth scanner
+			condStart := i + 8 // len("#elseif("), points past `(`; condStart-1 = index of `(`
+			condEndAbs := findConditionEnd(body, condStart-1)
+			if condEndAbs == -1 {
 				i++
 				continue
 			}
-			parts.elseifConditions = append(parts.elseifConditions, body[condStart:condStart+condEnd])
-			currentBlockStart = condStart + condEnd + 2 // after "):"
+			parts.elseifConditions = append(parts.elseifConditions, body[condStart:condEndAbs-2]) // between `(` and `):`
+			currentBlockStart = condEndAbs                                                        // after `):`
 			i = currentBlockStart
 		} else if depth == 0 && strings.HasPrefix(body[i:], "#else:") {
 			// Found #else at depth 0

@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -109,14 +110,22 @@ func (dc *DatasetsController) IsCombined() bool {
 	return dc.isCombined
 }
 
-// reloadTileserverIfConfigured calls the reload callback if set
-func (dc *DatasetsController) reloadTileserverIfConfigured() {
+// reloadAfterDatasetChange is invoked when a dataset changes state
+// (added, deleted, or recombined). It calls the tileserver reload
+// callback if one is configured, and always schedules a drop of
+// Cache/Tile so stale raster tiles do not outlive the underlying
+// mbtiles visuals.
+func (dc *DatasetsController) reloadAfterDatasetChange() {
 	if dc.reloadTileserver != nil {
 		if err := dc.reloadTileserver(); err != nil {
 			slog.Error("Failed to reload tileserver", "error", err)
 		} else {
 			slog.Info("Tileserver reload triggered")
 		}
+	}
+	if cleaner := GetCacheCleaner("Tile"); cleaner != nil {
+		cleaner.ScheduleDropAll()
+		slog.Info("Scheduled Cache/Tile drop after dataset refresh")
 	}
 }
 
@@ -133,10 +142,15 @@ func (dc *DatasetsController) SetActive(name string) error {
 	}
 
 	combinedPath := filepath.Join(dc.folder, "Combined.mbtiles")
-	os.Remove(combinedPath)
+	tmpPath := combinedPath + ".tmp"
 
 	source := filepath.Join("List", sanitized+".mbtiles")
-	if err := os.Symlink(source, combinedPath); err != nil {
+	os.Remove(tmpPath) // clean up any leftover temp
+	if err := os.Symlink(source, tmpPath); err != nil {
+		return fmt.Errorf("failed to create temp symlink: %w", err)
+	}
+	if err := os.Rename(tmpPath, combinedPath); err != nil {
+		os.Remove(tmpPath)
 		return fmt.Errorf("failed to link mbtiles: %w", err)
 	}
 
@@ -148,7 +162,7 @@ func (dc *DatasetsController) SetActive(name string) error {
 	dc.mu.Unlock()
 
 	// Reload tileserver
-	dc.reloadTileserverIfConfigured()
+	dc.reloadAfterDatasetChange()
 
 	return nil
 }
@@ -165,8 +179,7 @@ func (dc *DatasetsController) GetDatasets() ([]string, error) {
 		if entry.IsDir() {
 			continue
 		}
-		if strings.HasSuffix(entry.Name(), ".mbtiles") {
-			name := strings.TrimSuffix(entry.Name(), ".mbtiles")
+		if name, ok := strings.CutSuffix(entry.Name(), ".mbtiles"); ok {
 			datasets = append(datasets, name)
 		}
 	}
@@ -174,17 +187,66 @@ func (dc *DatasetsController) GetDatasets() ([]string, error) {
 	return datasets, nil
 }
 
-// AddDataset adds a new dataset from file data
-func (dc *DatasetsController) AddDataset(name string, data []byte) error {
+// SpoolUpload streams src to a tempfile under listFolder and returns
+// the temp path. The tempfile lives on the same filesystem as the
+// eventual destination, so CommitDataset can finalise via a single
+// rename (no cross-filesystem copy). The caller owns the returned
+// path: it MUST be passed to CommitDataset or os.Remove'd on any
+// other exit path.
+//
+// Spooling here rather than via Go's default os.TempDir() avoids
+// filling /tmp inside a container — multi-gigabyte mbtiles uploads
+// would otherwise spill onto whatever the runtime decides /tmp is,
+// often a small tmpfs or host-mounted scratch volume distinct from
+// the dataset filesystem.
+//
+// The tempfile name is dot-prefixed and ends in `.tmp` so GetDatasets
+// (which filters by `.mbtiles`) cannot observe in-progress uploads.
+func (dc *DatasetsController) SpoolUpload(src io.Reader) (string, error) {
+	if err := os.MkdirAll(dc.listFolder, 0o755); err != nil {
+		return "", fmt.Errorf("create list folder: %w", err)
+	}
+	f, err := os.CreateTemp(dc.listFolder, ".upload-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("create spool file: %w", err)
+	}
+	tmp := f.Name()
+	if _, err := io.Copy(f, src); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", fmt.Errorf("stream upload: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", fmt.Errorf("sync spool: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("close spool: %w", err)
+	}
+	return tmp, nil
+}
+
+// CommitDataset moves a spooled upload to its final name and triggers
+// tile-join. The rename is atomic on POSIX since the spool tempfile
+// was created in the same directory as the destination. On any error
+// the spool file is removed.
+func (dc *DatasetsController) CommitDataset(name, spoolPath string) error {
 	sanitized, err := SanitizeName(name)
 	if err != nil {
+		os.Remove(spoolPath)
 		return fmt.Errorf("invalid dataset name: %w", err)
 	}
-	path := filepath.Join(dc.listFolder, sanitized+".mbtiles")
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("failed to write dataset: %w", err)
+	finalPath := filepath.Join(dc.listFolder, sanitized+".mbtiles")
+	if err := os.Chmod(spoolPath, 0o644); err != nil {
+		os.Remove(spoolPath)
+		return fmt.Errorf("chmod spool: %w", err)
 	}
-
+	if err := os.Rename(spoolPath, finalPath); err != nil {
+		os.Remove(spoolPath)
+		return fmt.Errorf("commit dataset: %w", err)
+	}
 	return dc.CombineTiles()
 }
 
@@ -194,9 +256,9 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 	if err != nil {
 		return fmt.Errorf("invalid dataset name: %w", err)
 	}
-	
+
 	path := filepath.Join(dc.listFolder, sanitized+".mbtiles")
-	
+
 	// Check if file exists before attempting deletion
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		// File doesn't exist, but we should still clean up any orphaned entries
@@ -213,7 +275,7 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 	dc.mu.Lock()
 	// Remove from uncombined markers
 	delete(dc.uncombined, sanitized)
-	
+
 	// Check if this was the active dataset
 	wasActive := dc.activeDataset == sanitized
 	dc.mu.Unlock()
@@ -232,15 +294,15 @@ func (dc *DatasetsController) DeleteDataset(name string) error {
 		} else {
 			slog.Info("Removed Combined.mbtiles symlink for deleted active dataset", "name", sanitized)
 		}
-		
+
 		// Update state
 		dc.mu.Lock()
 		dc.activeDataset = ""
 		dc.isCombined = false
 		dc.mu.Unlock()
-		
+
 		// Reload tileserver to reflect changes
-		dc.reloadTileserverIfConfigured()
+		dc.reloadAfterDatasetChange()
 	}
 
 	slog.Info("Dataset deletion completed", "name", sanitized)
@@ -330,16 +392,21 @@ func (dc *DatasetsController) combineDatasets(datasets []string) error {
 
 	if len(datasets) == 1 {
 		// Just symlink - auto-activate the single dataset
-		os.Remove(combinedPath)
+		tmpPath := combinedPath + ".tmp"
 		source := filepath.Join("List", datasets[0]+".mbtiles")
-		if err := os.Symlink(source, combinedPath); err != nil {
+		os.Remove(tmpPath) // clean up any leftover temp
+		if err := os.Symlink(source, tmpPath); err != nil {
+			return fmt.Errorf("failed to create temp symlink: %w", err)
+		}
+		if err := os.Rename(tmpPath, combinedPath); err != nil {
+			os.Remove(tmpPath)
 			return fmt.Errorf("failed to link mbtiles: %w", err)
 		}
 		dc.mu.Lock()
 		dc.activeDataset = datasets[0]
 		dc.isCombined = false
 		dc.mu.Unlock()
-		dc.reloadTileserverIfConfigured()
+		dc.reloadAfterDatasetChange()
 		return nil
 	}
 
@@ -365,7 +432,7 @@ func (dc *DatasetsController) combineDatasets(datasets []string) error {
 	// Update dataset sizes after combining
 	dc.UpdateAllDatasetSizes()
 
-	dc.reloadTileserverIfConfigured()
+	dc.reloadAfterDatasetChange()
 
 	return nil
 }

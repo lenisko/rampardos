@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/lenisko/rampardos/internal/models"
@@ -15,7 +14,6 @@ import (
 
 // StylesController manages map styles
 type StylesController struct {
-	tileServerURL   string
 	folder          string
 	fontsController *FontsController
 
@@ -24,12 +22,19 @@ type StylesController struct {
 }
 
 // NewStylesController creates a new styles controller
-func NewStylesController(tileServerURL string, externalStyles []models.Style, folder string, fontsController *FontsController) *StylesController {
+func NewStylesController(externalStyles []models.Style, folder string, fontsController *FontsController) *StylesController {
 	os.MkdirAll(folder, 0755)
 	os.MkdirAll(filepath.Join(folder, "External"), 0755)
 
+	// Bridge the legacy tileserver-gl-era flat layout
+	// (Styles/<id>.json) into the directory layout
+	// (Styles/<id>/style.json) this renderer expects. Runs once at
+	// startup and never overwrites existing <id>/style.json files.
+	if err := promoteFlatStyleFiles(folder); err != nil {
+		slog.Warn("Legacy style promotion encountered errors", "error", err)
+	}
+
 	sc := &StylesController{
-		tileServerURL:   tileServerURL,
 		folder:          folder,
 		fontsController: fontsController,
 		externalStyles:  make(map[string]models.Style),
@@ -64,13 +69,13 @@ func (sc *StylesController) loadExternalStyles() []models.Style {
 	return styles
 }
 
-func (sc *StylesController) saveExternalStyles() error {
-	sc.mu.RLock()
+// saveExternalStylesLocked serializes sc.externalStyles to disk.
+// Must be called with sc.mu held for writing.
+func (sc *StylesController) saveExternalStylesLocked() error {
 	styles := make([]models.Style, 0, len(sc.externalStyles))
 	for _, style := range sc.externalStyles {
 		styles = append(styles, style)
 	}
-	sc.mu.RUnlock()
 
 	data, err := json.MarshalIndent(styles, "", "  ")
 	if err != nil {
@@ -83,7 +88,7 @@ func (sc *StylesController) saveExternalStyles() error {
 
 // GetStyles returns all available styles
 func (sc *StylesController) GetStyles(ctx context.Context) ([]models.Style, error) {
-	localStyles, err := sc.loadLocalStyles(ctx)
+	localStyles, err := sc.GetLocalStyles()
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +179,7 @@ type styleUsage struct {
 
 // analyzeUsage parses style.json to find used fonts and icons
 func (sc *StylesController) analyzeUsage(id string) styleUsage {
-	stylePath := filepath.Join(sc.folder, id+".json")
+	stylePath := filepath.Join(sc.folder, id, "style.json")
 	data, err := os.ReadFile(stylePath)
 	if err != nil {
 		return styleUsage{}
@@ -253,49 +258,6 @@ func (sc *StylesController) analyzeAvailableIcons(id string) []string {
 	return icons
 }
 
-func (sc *StylesController) loadLocalStyles(ctx context.Context) ([]models.Style, error) {
-	// Try to fetch from tileserver
-	url := fmt.Sprintf("%s/styles.json", sc.tileServerURL)
-	resp, err := HTTPGet(ctx, url, 0)
-	if err != nil {
-		// Fall back to local files
-		return sc.loadLocalStylesFromDisk()
-	}
-	defer resp.Body.Close()
-
-	var styles []models.Style
-	if err := json.NewDecoder(resp.Body).Decode(&styles); err != nil {
-		return sc.loadLocalStylesFromDisk()
-	}
-
-	return styles, nil
-}
-
-func (sc *StylesController) loadLocalStylesFromDisk() ([]models.Style, error) {
-	entries, err := os.ReadDir(sc.folder)
-	if err != nil {
-		return nil, err
-	}
-
-	var styles []models.Style
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		if entry.Name() == "styles.json" {
-			continue
-		}
-
-		id := strings.TrimSuffix(entry.Name(), ".json")
-		styles = append(styles, models.Style{
-			ID:   id,
-			Name: id,
-		})
-	}
-
-	return styles, nil
-}
-
 // GetExternalStyle returns an external style by name
 func (sc *StylesController) GetExternalStyle(name string) *models.Style {
 	sc.mu.RLock()
@@ -316,28 +278,25 @@ func (sc *StylesController) AddExternalStyle(style models.Style) error {
 
 	sc.mu.Lock()
 	sc.externalStyles[style.ID] = style
+	err := sc.saveExternalStylesLocked()
 	sc.mu.Unlock()
-
-	return sc.saveExternalStyles()
+	return err
 }
 
 // DeleteExternalStyle removes an external style
 func (sc *StylesController) DeleteExternalStyle(id string) error {
 	sc.mu.Lock()
 	delete(sc.externalStyles, id)
+	err := sc.saveExternalStylesLocked()
 	sc.mu.Unlock()
-
-	return sc.saveExternalStyles()
+	return err
 }
 
-// GetTileServerURL returns the tile server URL
-func (sc *StylesController) GetTileServerURL() string {
-	return sc.tileServerURL
-}
-
-// AddLocalStyle adds a local style from a ZIP file
+// AddLocalStyle adds a local style from a ZIP file.
 // ZIP should contain: style.json, sprite.json, sprite.png, sprite@2x.json, sprite@2x.png
-func (sc *StylesController) AddLocalStyle(id, name string, zipData []byte) error {
+// either at the root or under a single wrapper directory (the latter
+// is what Finder/Explorer's "compress folder" produces by default).
+func (sc *StylesController) AddLocalStyle(id string, zipData []byte) error {
 	sanitizedID, err := SanitizeName(id)
 	if err != nil {
 		return fmt.Errorf("invalid style ID: %w", err)
@@ -360,6 +319,14 @@ func (sc *StylesController) AddLocalStyle(id, name string, zipData []byte) error
 		return fmt.Errorf("failed to extract ZIP: %w", err)
 	}
 
+	// If the user compressed a folder (Finder/Explorer default), the
+	// zip contents live under a wrapper directory. Move them up so
+	// style.json ends up directly under styleDir.
+	if err := flattenSingleTopDir(styleDir); err != nil {
+		os.RemoveAll(styleDir)
+		return fmt.Errorf("failed to normalise extracted layout: %w", err)
+	}
+
 	// Verify required files exist
 	requiredFiles := []string{"style.json"}
 	for _, file := range requiredFiles {
@@ -374,8 +341,60 @@ func (sc *StylesController) AddLocalStyle(id, name string, zipData []byte) error
 		slog.Warn("Failed to update style.json paths", "error", err)
 	}
 
-	slog.Info("Added local style", "id", id, "name", name)
+	slog.Info("Added local style", "id", id)
 	return nil
+}
+
+// flattenSingleTopDir: if dir contains exactly one child directory
+// (ignoring platform metadata like __MACOSX, .DS_Store, Thumbs.db),
+// moves that directory's contents up into dir and removes the now
+// empty wrapper. Strips the metadata files unconditionally.
+func flattenSingleTopDir(dir string) error {
+	junk := map[string]bool{"__MACOSX": true, ".DS_Store": true, "Thumbs.db": true}
+
+	strip := func() error {
+		for k := range junk {
+			if err := os.RemoveAll(filepath.Join(dir, k)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := strip(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var real []os.DirEntry
+	for _, e := range entries {
+		if !junk[e.Name()] {
+			real = append(real, e)
+		}
+	}
+	if len(real) != 1 || !real[0].IsDir() {
+		return nil
+	}
+	wrapper := filepath.Join(dir, real[0].Name())
+	inner, err := os.ReadDir(wrapper)
+	if err != nil {
+		return err
+	}
+	for _, e := range inner {
+		from := filepath.Join(wrapper, e.Name())
+		to := filepath.Join(dir, e.Name())
+		if err := os.Rename(from, to); err != nil {
+			return fmt.Errorf("flatten %s: %w", e.Name(), err)
+		}
+	}
+	if err := os.Remove(wrapper); err != nil {
+		return err
+	}
+	// Re-strip in case the wrapper held its own metadata that just
+	// surfaced into dir.
+	return strip()
 }
 
 // updateStyleJSON updates the style.json with correct sprite and glyphs paths
@@ -450,6 +469,19 @@ func (sc *StylesController) DeleteLocalStyle(id string) error {
 
 	slog.Info("Deleted local style", "id", id)
 	return nil
+}
+
+// GetLocalStyleIDs returns the IDs of all local styles.
+func (sc *StylesController) GetLocalStyleIDs() ([]string, error) {
+	styles, err := sc.GetLocalStyles()
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(styles))
+	for _, s := range styles {
+		ids = append(ids, s.ID)
+	}
+	return ids, nil
 }
 
 // GetLocalStyles returns only local styles (directories in styles folder)

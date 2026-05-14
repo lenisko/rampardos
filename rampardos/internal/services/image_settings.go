@@ -1,7 +1,7 @@
 package services
 
 import (
-	"image/png"
+	png "github.com/lenisko/rampardos/internal/utils/pngfast"
 
 	"github.com/lenisko/rampardos/internal/config"
 	"github.com/lenisko/rampardos/internal/models"
@@ -42,13 +42,13 @@ func InitImageSettings(cfg *config.Config) {
 	// Set the global default image format in models package
 	switch cfg.DefaultImageFormat {
 	case "jpeg", "jpg":
-		models.DefaultImageFormat = models.ImageFormatJPEG
+		models.SetDefaultImageFormat(models.ImageFormatJPEG)
 	case "webp":
-		models.DefaultImageFormat = models.ImageFormatWEBP
+		models.SetDefaultImageFormat(models.ImageFormatWEBP)
 	default:
-		models.DefaultImageFormat = models.ImageFormatPNG
+		models.SetDefaultImageFormat(models.ImageFormatPNG)
 	}
 
 	// Set override flag
-	models.OverrideClientFormat = cfg.OverrideClientFormat
+	models.SetOverrideClientFormat(cfg.OverrideClientFormat)
 }

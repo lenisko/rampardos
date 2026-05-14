@@ -1,111 +1,139 @@
-.PHONY: build run test clean docker docker-build docker-run fmt lint tidy help
+.PHONY: build run test test-integration test-coverage clean tidy fmt lint \
+       npm-install docker-build docker-push docker-compose-up docker-compose-down \
+       docker-compose-logs setup-dirs help
 
 # Binary name
 BINARY_NAME=rampardos
 BUILD_DIR=bin
 GO_DIR=rampardos
+WORKER_DIR=rampardos-render-worker
 
 # Go parameters
 GOCMD=go
 GOBUILD=$(GOCMD) build
-GORUN=$(GOCMD) run
 GOTEST=$(GOCMD) test
 GOCLEAN=$(GOCMD) clean
 GOMOD=$(GOCMD) mod
 GOFMT=gofmt
 
 # Build flags
-LDFLAGS=-ldflags="-w -s"
+GIT_COMMIT=$(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
+LDFLAGS=-ldflags="-w -s -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=$(GIT_COMMIT)"
+
+# Docker
+DOCKER_IMAGE=ghcr.io/lenisko/rampardos
+DOCKER_TAG=latest
+DOCKER_PLATFORMS=linux/amd64,linux/arm64
 
 # Default target
 all: build
 
-## build: Build the binary
-build:
-	@echo "Building..."
+## build: Build the Go binary and install Node worker deps
+build: npm-install
+	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
-	cd $(GO_DIR) && $(GOBUILD) $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
+	cd $(GO_DIR) && $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
+	@echo "Binary: $(BUILD_DIR)/$(BINARY_NAME)"
 
-## build-linux: Build for Linux (useful for Docker)
-build-linux:
-	@echo "Building for Linux..."
+## build-fast: Build Go binary only (skip npm install if already done)
+build-fast:
 	@mkdir -p $(BUILD_DIR)
-	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/server
+	cd $(GO_DIR) && $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
+
+## build-linux: Cross-compile for Linux amd64
+build-linux: npm-install
+	@mkdir -p $(BUILD_DIR)
+	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/server
 
 ## build-all: Build for multiple platforms
-build-all: build-linux
-	@echo "Building for macOS..."
-	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/server
-	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/server
+build-all: npm-install
+	@mkdir -p $(BUILD_DIR)
+	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/server
+	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/server
+	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/server
+	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/server
 
-## run: Run the application
-run:
-	@echo "Running..."
-	cd $(GO_DIR) && $(GORUN) ./cmd/server
+## npm-install: Install Node render worker dependencies
+npm-install:
+	@if [ ! -d "$(WORKER_DIR)/node_modules/@maplibre/maplibre-gl-native" ]; then \
+		echo "Installing render worker deps..."; \
+		cd $(WORKER_DIR) && npm install; \
+	fi
 
-## test: Run tests
+## run: Build and run locally with sensible defaults
+run: build
+	./start.sh
+
+## test: Run Go tests (no Node/maplibre required)
 test:
-	@echo "Testing..."
-	cd $(GO_DIR) && $(GOTEST) -v ./...
+	cd $(GO_DIR) && $(GOTEST) ./...
 
-## test-coverage: Run tests with coverage
+## test-integration: Run integration tests (requires npm install)
+test-integration: npm-install
+	cd $(GO_DIR) && $(GOTEST) -tags renderer_integration ./internal/services/renderer/ -v -timeout 60s
+
+## test-coverage: Run tests with coverage report
 test-coverage:
-	@echo "Testing with coverage..."
-	cd $(GO_DIR) && $(GOTEST) -v -coverprofile=coverage.out ./...
+	cd $(GO_DIR) && $(GOTEST) -coverprofile=coverage.out ./...
 	cd $(GO_DIR) && $(GOCMD) tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report: $(GO_DIR)/coverage.html"
 
-## clean: Clean build artifacts
+## clean: Remove build artifacts and caches
 clean:
-	@echo "Cleaning..."
 	$(GOCLEAN)
 	rm -rf $(BUILD_DIR)
-	rm -f coverage.out coverage.html
+	rm -f $(GO_DIR)/coverage.out $(GO_DIR)/coverage.html
 
-## tidy: Tidy and verify dependencies
+## tidy: Tidy and verify Go dependencies
 tidy:
-	@echo "Tidying dependencies..."
 	cd $(GO_DIR) && $(GOMOD) tidy
 	cd $(GO_DIR) && $(GOMOD) verify
 
-## fmt: Format code
+## fmt: Format Go code
 fmt:
-	@echo "Formatting..."
 	$(GOFMT) -s -w $(GO_DIR)
 
 ## lint: Run linter (requires golangci-lint)
 lint:
-	@echo "Linting..."
-	@which golangci-lint > /dev/null || (echo "golangci-lint not installed. Run: brew install golangci-lint" && exit 1)
+	@which golangci-lint > /dev/null || (echo "Install: brew install golangci-lint" && exit 1)
 	cd $(GO_DIR) && golangci-lint run
 
-## docker-build: Build Docker image
+## docker-build: Build multi-arch Docker image locally
 docker-build:
-	@echo "Building Docker image..."
-	docker build --build-arg GIT_COMMIT=$$(git rev-parse HEAD) -t $(BINARY_NAME):latest .
+	docker buildx build \
+		--platform $(DOCKER_PLATFORMS) \
+		--tag $(DOCKER_IMAGE):$(DOCKER_TAG) \
+		.
 
-## docker-run: Run Docker container
-docker-run:
-	@echo "Running Docker container..."
-	docker run -p 9000:9000 -e TILE_SERVER_URL=http://host.docker.internal:8080 $(BINARY_NAME):latest
+## docker-build-local: Build for current platform only (faster)
+docker-build-local:
+	docker build -t $(DOCKER_IMAGE):local .
+
+## docker-push: Build and push multi-arch image to registry
+docker-push:
+	docker buildx build \
+		--platform $(DOCKER_PLATFORMS) \
+		--tag $(DOCKER_IMAGE):$(DOCKER_TAG) \
+		--push \
+		.
 
 ## docker-compose-up: Start with docker-compose
 docker-compose-up:
-	docker-compose up -d
+	docker compose up -d
 
 ## docker-compose-down: Stop docker-compose
 docker-compose-down:
-	docker-compose down
+	docker compose down
 
 ## docker-compose-logs: View docker-compose logs
 docker-compose-logs:
-	docker-compose logs -f
+	docker compose logs -f
 
 ## setup-dirs: Create required directories
 setup-dirs:
-	@echo "Creating directories..."
-	mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable
-	mkdir -p TileServer/Fonts TileServer/Styles TileServer/Datasets
-	mkdir -p Templates Markers Temp
+	@mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable
+	@mkdir -p TileServer/Fonts TileServer/Styles TileServer/Datasets
+	@mkdir -p Templates Markers Temp
 
 ## help: Show this help
 help:

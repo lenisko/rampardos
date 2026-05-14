@@ -38,7 +38,6 @@ type StatsContext struct {
 	Memory             MemoryDisplay
 	Uptime             string
 	GitCommit          string
-	TileserverRestarts uint64
 }
 
 // CacheSizeDisplay represents cache size for display
@@ -198,7 +197,6 @@ func (v *StatsView) Render(w http.ResponseWriter, r *http.Request) {
 		Memory:             memory,
 		Uptime:             uptime,
 		GitCommit:          version.ShortCommit(),
-		TileserverRestarts: services.GlobalMetrics.GetTileserverRestarts(),
 	}
 
 	v.templates.Render(w, "stats.html", ctx)

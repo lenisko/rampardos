@@ -15,22 +15,14 @@ import (
 
 // HTTPService handles all HTTP client operations
 type HTTPService struct {
-	generalClient    *http.Client
-	tileserverClient *http.Client
-	downloadClient   *http.Client // For large file downloads (no overall timeout)
-	tileserverHost   string
+	generalClient  *http.Client
+	downloadClient *http.Client // For large file downloads (no overall timeout)
 }
 
 var globalHTTPService *HTTPService
 
 // InitHTTPService initializes the global HTTP service with config
 func InitHTTPService(cfg *config.Config) {
-	tileserverURL, _ := url.Parse(cfg.TileServerURL)
-	tileserverHost := ""
-	if tileserverURL != nil {
-		tileserverHost = tileserverURL.Host
-	}
-
 	globalHTTPService = &HTTPService{
 		generalClient: &http.Client{
 			Timeout: cfg.HTTPTimeout, // 0 = unlimited
@@ -38,15 +30,6 @@ func InitHTTPService(cfg *config.Config) {
 				MaxIdleConns:        cfg.HTTPMaxConns,
 				MaxIdleConnsPerHost: cfg.HTTPMaxConns,
 				MaxConnsPerHost:     cfg.HTTPMaxConns,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		},
-		tileserverClient: &http.Client{
-			Timeout: cfg.HTTPTileserverTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        cfg.HTTPTileserverMaxConns,
-				MaxIdleConnsPerHost: cfg.HTTPTileserverMaxConns,
-				MaxConnsPerHost:     cfg.HTTPTileserverMaxConns,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
@@ -60,15 +43,11 @@ func InitHTTPService(cfg *config.Config) {
 				IdleConnTimeout:       90 * time.Second,
 			},
 		},
-		tileserverHost: tileserverHost,
 	}
 }
 
-// getClient returns the appropriate client based on the host
-func (s *HTTPService) getClient(host string) *http.Client {
-	if host == s.tileserverHost {
-		return s.tileserverClient
-	}
+// getClient returns the appropriate client for the given host.
+func (s *HTTPService) getClient(_ string) *http.Client {
 	return s.generalClient
 }
 
@@ -122,30 +101,50 @@ func DownloadFile(ctx context.Context, fromURL, toPath, expectedType string, tim
 		}
 	}
 
-	// Ensure directory exists
+	// Write to a temp file then rename atomically, so concurrent
+	// readers never see a partially-downloaded file.
 	dir := filepath.Dir(toPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	file, err := os.Create(toPath)
+	file, err := os.CreateTemp(filepath.Dir(toPath), filepath.Base(toPath)+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("failed to create file: %w", err)
 	}
-	defer file.Close()
 
+	tmpName := file.Name()
 	written, err := io.Copy(file, resp.Body)
+	file.Close()
 	if err != nil {
-		os.Remove(toPath)
+		os.Remove(tmpName)
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
 	if written == 0 {
-		os.Remove(toPath)
+		os.Remove(tmpName)
 		return fmt.Errorf("failed to load file. Got empty data")
 	}
 
+	if err := os.Rename(tmpName, toPath); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
 	return nil
+}
+
+// cancelOnClose wraps a ReadCloser to call cancel() when Close() is invoked.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return err
 }
 
 // HTTPGet performs a GET request and returns the response.
@@ -165,7 +164,20 @@ func HTTPGet(ctx context.Context, fromURL string, timeout time.Duration) (*http.
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
-		_ = cancel // caller handles context
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fromURL, nil)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "TileserverCache")
+		client := globalHTTPService.getClient(host)
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+		return resp, nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fromURL, nil)

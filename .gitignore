@@ -5,7 +5,12 @@
 /Markers
 /TileServer
 /Temp
+# Tests that exercise on-disk caching create Cache/ subtrees in
+# whatever cwd they ran from (e.g. rampardos/internal/handlers/Cache/).
+# Match anywhere, not just root.
+**/Cache/
 docker-compose.*.yml
 bin/
 .env
 rampardos/rampardos.exe
+rampardos/server

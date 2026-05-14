@@ -48,6 +48,15 @@ type DownloadManager struct {
 // ErrDownloadCancelled is returned when a download is cancelled
 var ErrDownloadCancelled = fmt.Errorf("download cancelled")
 
+// downloadHTTPClient is a shared HTTP client for all downloads, allocated once to avoid transport leaks.
+var downloadHTTPClient = &http.Client{
+	Timeout: 0,
+	Transport: &http.Transport{
+		ResponseHeaderTimeout: 60 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+	},
+}
+
 // NewDownloadManager creates a new download manager
 func NewDownloadManager(onComplete func(name string, err error)) *DownloadManager {
 	return &DownloadManager{
@@ -239,13 +248,7 @@ func (dm *DownloadManager) downloadWithProgress(ctx context.Context, name, fromU
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", written))
 		}
 
-		client := &http.Client{
-			Timeout: 0,
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 60 * time.Second,
-				IdleConnTimeout:       90 * time.Second,
-			},
-		}
+		client := downloadHTTPClient
 
 		resp, err := client.Do(req)
 		if err != nil {

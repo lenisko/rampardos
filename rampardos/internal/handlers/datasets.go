@@ -1,33 +1,35 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 	"github.com/lenisko/rampardos/internal/services"
+	"github.com/lenisko/rampardos/internal/services/renderer"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		// Only allow same-origin requests for WebSocket connections
 		origin := r.Header.Get("Origin")
 		if origin == "" {
-			return true // Allow requests without Origin header (same-origin)
+			return true
 		}
-		// Compare origin with the request host
-		host := r.Host
-		return strings.Contains(origin, host)
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
 	},
 }
 
@@ -35,12 +37,14 @@ var upgrader = websocket.Upgrader{
 type DatasetsHandler struct {
 	datasetsController *services.DatasetsController
 	downloadManager    *services.DownloadManager
+	renderer           renderer.Renderer
 }
 
 // NewDatasetsHandler creates a new datasets handler
-func NewDatasetsHandler(datasetsController *services.DatasetsController) *DatasetsHandler {
+func NewDatasetsHandler(datasetsController *services.DatasetsController, r renderer.Renderer) *DatasetsHandler {
 	h := &DatasetsHandler{
 		datasetsController: datasetsController,
+		renderer:           r,
 	}
 
 	// Create download manager with completion callback
@@ -216,83 +220,107 @@ func (h *DatasetsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // ReloadTileserver handles POST /admin/api/datasets/reload-tileserver
 func (h *DatasetsHandler) ReloadTileserver(w http.ResponseWriter, r *http.Request) {
-	pid, err := findTileserverPID()
-	if err != nil {
-		slog.Error("Failed to find tileserver PID", "error", err)
-		http.Error(w, "Failed to find tileserver process: "+err.Error(), http.StatusInternalServerError)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	if err := h.renderer.ReloadStyles(ctx); err != nil {
+		slog.Error("Renderer reload failed", "error", err)
+		http.Error(w, "Failed to reload renderer: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	if err := sendSIGHUP(pid); err != nil {
-		slog.Error("Failed to send SIGHUP to tileserver", "pid", pid, "error", err)
-		http.Error(w, "Failed to reload tileserver: "+err.Error(), http.StatusInternalServerError)
-		return
+	if cleaner := services.GetCacheCleaner("Tile"); cleaner != nil {
+		cleaner.ScheduleDropAll()
 	}
-
-	slog.Info("Tileserver reloaded", "pid", pid)
+	slog.Info("Renderer reloaded")
 	w.WriteHeader(http.StatusOK)
 }
 
-// findTileserverPID finds the PID of the tileserver process using pidof
-func findTileserverPID() (int, error) {
-	cmd := exec.Command("pidof", "node")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("pidof failed: %w", err)
-	}
-
-	pidStr := strings.TrimSpace(string(output))
-	if pidStr == "" {
-		return 0, fmt.Errorf("tileserver process not found")
-	}
-
-	// Take first PID if multiple
-	pids := strings.Split(pidStr, " ")
-	pid, err := strconv.Atoi(pids[0])
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID: %w", err)
-	}
-
-	return pid, nil
-}
-
-// sendSIGHUP sends SIGHUP signal to the given PID
-func sendSIGHUP(pid int) error {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process: %w", err)
-	}
-	return proc.Signal(syscall.SIGHUP)
-}
-
-// Add handles POST /admin/api/datasets/add (file upload)
+// Add handles POST /admin/api/datasets/add (file upload).
+//
+// mbtiles can be tens-to-hundreds of gigabytes (planet extracts). To
+// avoid filling /tmp inside the container (Go's default multipart
+// spool location), we bypass r.ParseMultipartForm and iterate the
+// multipart body manually with r.MultipartReader. The file part is
+// streamed straight into a spool file inside the datasets list
+// folder — same filesystem as the final destination — so
+// CommitDataset finalises via a single atomic rename, no copy.
+//
+// No MaxBytesReader cap: this is an admin endpoint and operators
+// upload planet-scale extracts intentionally. The size guard is the
+// operator's disk quota on the datasets volume.
 func (h *DatasetsHandler) Add(w http.ResponseWriter, r *http.Request) {
-	// Parse multipart form with large limit for mbtiles
-	if err := r.ParseMultipartForm(128 << 30); err != nil { // 128GB max
-		http.Error(w, "Failed to parse form", http.StatusBadRequest)
+	mr, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "Expected multipart upload", http.StatusBadRequest)
 		return
 	}
 
-	name := r.FormValue("name")
+	var (
+		name      string
+		spoolPath string
+	)
+	cleanup := func() {
+		if spoolPath != "" {
+			os.Remove(spoolPath)
+		}
+	}
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			cleanup()
+			http.Error(w, "Failed to read multipart body", http.StatusBadRequest)
+			return
+		}
+
+		switch part.FormName() {
+		case "name":
+			// Bounded read — name is a short identifier; a 1KB cap
+			// rejects pathological inputs without prejudging valid ones.
+			buf, readErr := io.ReadAll(io.LimitReader(part, 1024))
+			part.Close()
+			if readErr != nil {
+				cleanup()
+				http.Error(w, "Failed to read name", http.StatusBadRequest)
+				return
+			}
+			name = strings.TrimSpace(string(buf))
+		case "file":
+			if spoolPath != "" {
+				// Reject duplicate "file" parts — silently overwriting
+				// the first spool would leak it on disk.
+				part.Close()
+				cleanup()
+				http.Error(w, "Multiple file parts", http.StatusBadRequest)
+				return
+			}
+			spoolPath, err = h.datasetsController.SpoolUpload(part)
+			part.Close()
+			if err != nil {
+				slog.Error("Spool dataset upload", "error", err)
+				http.Error(w, "Failed to receive upload", http.StatusInternalServerError)
+				return
+			}
+		default:
+			part.Close()
+		}
+	}
+
 	if name == "" {
+		cleanup()
 		http.Error(w, "Missing name", http.StatusBadRequest)
 		return
 	}
-
-	file, _, err := r.FormFile("file")
-	if err != nil {
+	if spoolPath == "" {
 		http.Error(w, "Missing file", http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "Failed to read file", http.StatusInternalServerError)
-		return
-	}
-
-	if err := h.datasetsController.AddDataset(name, data); err != nil {
+	if err := h.datasetsController.CommitDataset(name, spoolPath); err != nil {
+		slog.Error("Commit dataset", "error", err, "name", name)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
