@@ -33,6 +33,8 @@
  */
 
 const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const zlib = require("zlib");
 const Database = require("better-sqlite3");
 const mbgl = require("@maplibre/maplibre-gl-native");
@@ -113,6 +115,72 @@ function readTile(z, x, y) {
   return data;
 }
 
+// Remote sprite/glyph resources (e.g. raw.githubusercontent.com-hosted
+// sprite sheets) are fetched once per worker process on first request,
+// then cached on disk in <styleDir>/.remote/ so subsequent worker
+// startups, recycles, and process restarts replay from local files.
+// The cache is scoped to the style: removing the style directory also
+// removes its remote cache.
+const remoteCacheDir = path.join(path.dirname(args["style-path"]), ".remote");
+const remoteFetchMaxBytes = 50 * 1024 * 1024; // 50 MB
+const remoteFetchTimeoutMs = 30 * 1000;
+
+function remoteCachePath(url) {
+	const hash = crypto.createHash("sha256").update(url).digest("hex");
+	let ext = "";
+	try {
+		ext = path.extname(new URL(url).pathname);
+	} catch (_) {
+		// Malformed URL — no extension. The fetch below will reject it
+		// before we get here, but be defensive.
+	}
+	return path.join(remoteCacheDir, hash + ext);
+}
+
+async function fetchRemoteResource(url) {
+	const cachePath = remoteCachePath(url);
+	try {
+		return fs.readFileSync(cachePath);
+	} catch (_) {
+		// Cache miss; fall through to network fetch.
+	}
+
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), remoteFetchTimeoutMs);
+	let res;
+	try {
+		res = await fetch(url, { signal: ctrl.signal });
+	} finally {
+		clearTimeout(timer);
+	}
+	if (!res.ok) {
+		throw new Error(`HTTP ${res.status} ${res.statusText} for ${url}`);
+	}
+	const cl = res.headers.get("content-length");
+	if (cl && Number(cl) > remoteFetchMaxBytes) {
+		throw new Error(`remote resource too large (${cl} bytes) for ${url}`);
+	}
+	const ab = await res.arrayBuffer();
+	if (ab.byteLength > remoteFetchMaxBytes) {
+		throw new Error(`remote resource too large (${ab.byteLength} bytes) for ${url}`);
+	}
+	const buf = Buffer.from(ab);
+
+	// Persist to the per-style cache. Concurrent workers may race here;
+	// the rename is atomic on POSIX so the last writer wins cleanly.
+	// Cache write failures are non-fatal — the render still succeeds
+	// using the in-memory buffer we already have.
+	try {
+		fs.mkdirSync(remoteCacheDir, { recursive: true });
+		const tmp = cachePath + ".tmp." + process.pid + "." + Date.now();
+		fs.writeFileSync(tmp, buf);
+		fs.renameSync(tmp, cachePath);
+	} catch (_) {
+		// Best-effort cache; the render itself doesn't depend on it.
+	}
+	return buf;
+}
+
 // parseMbtilesTileURL assumes the URL prefix matches byte-for-byte
 // what rampardos/internal/services/renderer/styleprep.go writes into
 // the vector source URL. If that rewrite format ever changes (e.g.
@@ -184,6 +252,14 @@ try {
           const filePath = fileURLToPath(url);
           const data = fs.readFileSync(filePath);
           callback(null, { data });
+          return;
+        }
+        if (url.startsWith("https://") || url.startsWith("http://")) {
+          // Async fetch — maplibre-native invokes the callback whenever
+          // we resolve, and won't issue the dependent render until then.
+          fetchRemoteResource(url)
+            .then((data) => callback(null, { data }))
+            .catch((err) => callback(err));
           return;
         }
         callback(new Error(`unsupported url scheme: ${url}`));
