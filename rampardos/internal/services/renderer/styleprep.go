@@ -77,13 +77,22 @@ func sourceTileSize(sourceType string, explicit *int) int {
 //     "file://<fontsDir>/{fontstack}/{range}.pbf"
 //     (the {fontstack} and {range} tokens are preserved — they are
 //     resolved per-request by the worker's callback, not here)
-//   - sources.*.url: "mbtiles://<name>"  ->
-//     "mbtiles://<absolute-mbtiles-file>"
-//     (the <name> part is ignored — rampardos uses a single combined
-//     mbtiles per deployment)
+//   - sources.*.url for vector sources (or sources with no explicit
+//     type, which MapLibre defaults to vector) is always rewritten to
+//     "mbtiles://<absolute-mbtiles-file>", regardless of the incoming
+//     scheme. This collapses several upstream variants — "mbtiles://X",
+//     "https://api.maptiler.com/tiles/v3/tiles.json?key={key}",
+//     "mapbox://openmaptiles.X" — onto the operator's combined
+//     mbtiles, which is the only data source the local renderer has.
 //
-// Any http(s)// URLs are left untouched — they are assumed to be
-// legitimate CDN references, not placeholders.
+// Raster, raster-dem, geojson, image, and video source URLs are left
+// alone: they may legitimately point at remote CDNs / tile services
+// (e.g. a hillshade overlay), and the worker's http(s) branch fetches
+// them on demand.
+//
+// http(s) URLs for sprite and glyphs are left untouched — they are
+// assumed to be legitimate CDN references and the worker now fetches
+// and caches them.
 func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 	// Validate id against path traversal: must be non-empty and contain
 	// only [A-Za-z0-9_-] with no path separators, "..", or null bytes.
@@ -131,11 +140,17 @@ func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 			if !ok {
 				continue
 			}
-			url, ok := src["url"].(string)
-			if !ok {
+			if _, ok := src["url"].(string); !ok {
 				continue
 			}
-			if strings.HasPrefix(url, "mbtiles://") {
+			// Vector sources (and sources with no explicit type, per
+			// MapLibre's vector default) are always served from the
+			// local combined mbtiles. This covers upstream variants
+			// that would otherwise reach the worker as raw URLs —
+			// MapTiler tiles.json with an unsubstituted {key}, mapbox://
+			// references, etc.
+			srcType, _ := src["type"].(string)
+			if srcType == "vector" || srcType == "" {
 				src["url"] = "mbtiles://" + cfg.MbtilesFile
 			}
 		}

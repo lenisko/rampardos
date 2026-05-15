@@ -80,6 +80,110 @@ func TestPrepareStyleKeepsHTTPGlyphsUnchanged(t *testing.T) {
 	}
 }
 
+// Vector source URLs must be rewritten to the local mbtiles even
+// when the incoming URL is an HTTP TileJSON (the form MapTiler's
+// download-style export uses) or has an unsubstituted {key}
+// placeholder. The previous logic only rewrote mbtiles:// URLs and
+// left these alone, which led to runtime "HTTP 403" failures when the
+// worker tried to fetch the URL directly.
+func TestPrepareStyleRewritesAllVectorSources(t *testing.T) {
+	cfg := Config{StylesDir: "/s", FontsDir: "/f", MbtilesFile: "/d/Combined.mbtiles"}
+	wantURL := "mbtiles:///d/Combined.mbtiles"
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "https TileJSON with {key} placeholder",
+			body: `{"version":8,"sources":{"omt":{"type":"vector","url":"https://api.maptiler.com/tiles/v3/tiles.json?key={key}"}}}`,
+		},
+		{
+			name: "http TileJSON",
+			body: `{"version":8,"sources":{"omt":{"type":"vector","url":"http://example.com/tiles.json"}}}`,
+		},
+		{
+			name: "mapbox:// reference",
+			body: `{"version":8,"sources":{"omt":{"type":"vector","url":"mapbox://openmaptiles.v3"}}}`,
+		},
+		{
+			name: "mbtiles:// placeholder (existing behaviour)",
+			body: `{"version":8,"sources":{"omt":{"type":"vector","url":"mbtiles://openmaptiles"}}}`,
+		},
+		{
+			name: "no type field, defaults to vector",
+			body: `{"version":8,"sources":{"omt":{"url":"https://api.maptiler.com/tiles/v3/tiles.json?key=X"}}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := PrepareStyle("x", []byte(tc.body), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal(out, &parsed); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := parsed["sources"].(map[string]any)["omt"].(map[string]any)["url"].(string)
+			if got != wantURL {
+				t.Errorf("source url: got %q, want %q", got, wantURL)
+			}
+		})
+	}
+}
+
+// Raster, raster-dem, geojson, image, and video sources are NOT
+// rewritten: they may legitimately point at remote CDNs (e.g. a
+// hillshade overlay served from a separate tile service).
+func TestPrepareStyleLeavesNonVectorSourcesAlone(t *testing.T) {
+	cfg := Config{StylesDir: "/s", FontsDir: "/f", MbtilesFile: "/d/Combined.mbtiles"}
+
+	cases := []struct {
+		name      string
+		body      string
+		wantURL   string
+		sourceKey string
+	}{
+		{
+			name:      "raster source",
+			body:      `{"version":8,"sources":{"hill":{"type":"raster","url":"https://hillshade.example.com/tiles.json","tileSize":256}}}`,
+			wantURL:   "https://hillshade.example.com/tiles.json",
+			sourceKey: "hill",
+		},
+		{
+			name:      "raster-dem source",
+			body:      `{"version":8,"sources":{"terrain":{"type":"raster-dem","url":"https://terrain.example.com/tiles.json"}}}`,
+			wantURL:   "https://terrain.example.com/tiles.json",
+			sourceKey: "terrain",
+		},
+		{
+			name:      "geojson source",
+			body:      `{"version":8,"sources":{"places":{"type":"geojson","url":"https://example.com/places.geojson"}}}`,
+			wantURL:   "https://example.com/places.geojson",
+			sourceKey: "places",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := PrepareStyle("x", []byte(tc.body), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal(out, &parsed); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := parsed["sources"].(map[string]any)[tc.sourceKey].(map[string]any)["url"].(string)
+			if got != tc.wantURL {
+				t.Errorf("source url: got %q, want %q (rewrite should only touch vector sources)", got, tc.wantURL)
+			}
+		})
+	}
+}
+
 func TestStyleZoomOffset(t *testing.T) {
 	cases := []struct {
 		name string
