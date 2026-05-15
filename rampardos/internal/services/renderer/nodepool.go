@@ -192,6 +192,17 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 		return nil, fmt.Errorf("prepare style: %w", err)
 	}
 
+	// Materialise composite font directories for any compound
+	// `text-font` arrays in the style. The render worker resolves
+	// glyph URLs by reading <fontsDir>/<fontstack>/<range>.pbf
+	// verbatim, so a stack like ["Metropolis Regular","Noto Sans
+	// Regular"] needs a real directory at <fontsDir>/Metropolis
+	// Regular,Noto Sans Regular/. We generate one here from the
+	// constituent fonts so the worker stays a thin file-reader.
+	if err := EnsureCompositeFontstacks(raw, npr.cfg.FontsDir); err != nil {
+		return nil, fmt.Errorf("compose fontstacks: %w", err)
+	}
+
 	// Atomic write via tempfile + rename: ReloadStyles calls loadPool
 	// outside any lock, so plain os.WriteFile's truncate window would
 	// let a worker spawning in parallel read a zero-length or partial
