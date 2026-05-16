@@ -73,8 +73,6 @@ services:
       - ./TileServer:/app/TileServer
       - ./Markers:/app/Markers
     environment:
-      PORT: ${PORT:-9000}
-      HOSTNAME: ${HOSTNAME:-0.0.0.0}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       PREVIEW_LATITUDE: ${PREVIEW_LATITUDE:-51.5165753}
