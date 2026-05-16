@@ -33,12 +33,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /fontnik && cd /fontnik && \
-    if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
-    CXXFLAGS="-Wno-error=maybe-uninitialized" npm install --build-from-source \
-        github:lenisko/node-fontnik#fix-build-errors-node14; \
+RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+    git clone --depth 1 -b fix-build-errors-node14 https://github.com/lenisko/node-fontnik.git /fontnik \
+    && cd /fontnik \
+    && mkdir .toolchain \
+    && CC=gcc CXX=g++ CXXFLAGS="-Wno-error=maybe-uninitialized" \
+       npm install --build-from-source --foreground-scripts; \
     else \
-    npm install fontnik@0.7.4; \
+    mkdir -p /fontnik && cd /fontnik && npm install fontnik@0.7.4; \
     fi
 RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "*.map" -o -name "LICENSE*" -o -name "README*" -o -name "CHANGELOG*" \) -delete \
     && find /fontnik/node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" -o -name "example" -o -name "examples" \) -exec rm -rf {} + 2>/dev/null || true
@@ -111,7 +113,11 @@ COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
 # Fontnik (build-glyphs for font processing)
 COPY --from=fontnik-build /fontnik /app/fontnik
-RUN ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs
+RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
+      ln -s /app/fontnik/bin/build-glyphs /usr/local/bin/build-glyphs; \
+    else \
+      ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs; \
+    fi
 
 # Go binary
 COPY --from=rampardos-build /out/rampardos /app/rampardos
