@@ -37,7 +37,8 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
     git clone --depth 1 -b fix-build-errors-node14 https://github.com/lenisko/node-fontnik.git /fontnik \
     && cd /fontnik \
     && mkdir .toolchain \
-    && CXXFLAGS="-Wno-error=maybe-uninitialized" npm install --build-from-source; \
+    && CC=gcc CXX=g++ CXXFLAGS="-Wno-error=maybe-uninitialized" \
+       npm install --build-from-source --foreground-scripts; \
     else \
     mkdir -p /fontnik && cd /fontnik && npm install fontnik@0.7.4; \
     fi
@@ -112,7 +113,11 @@ COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
 # Fontnik (build-glyphs for font processing)
 COPY --from=fontnik-build /fontnik /app/fontnik
-RUN ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs
+RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
+      ln -s /app/fontnik/bin/build-glyphs /usr/local/bin/build-glyphs; \
+    else \
+      ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs; \
+    fi
 
 # Go binary
 COPY --from=rampardos-build /out/rampardos /app/rampardos
