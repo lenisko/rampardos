@@ -33,13 +33,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
-RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
-    git clone --depth 1 -b fix-build-errors-node14 https://github.com/lenisko/node-fontnik.git /fontnik \
-    && cd /fontnik \
-    && mkdir .toolchain \
-    && CXXFLAGS="-Wno-error=maybe-uninitialized" npm install --build-from-source; \
+RUN mkdir -p /fontnik && cd /fontnik && \
+    if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
+    CXXFLAGS="-Wno-error=maybe-uninitialized" npm install --build-from-source \
+        github:lenisko/node-fontnik#fix-build-errors-node14; \
     else \
-    mkdir -p /fontnik && cd /fontnik && npm install fontnik@0.7.4; \
+    npm install fontnik@0.7.4; \
     fi
 RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "*.map" -o -name "LICENSE*" -o -name "README*" -o -name "CHANGELOG*" \) -delete \
     && find /fontnik/node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" -o -name "example" -o -name "examples" \) -exec rm -rf {} + 2>/dev/null || true
