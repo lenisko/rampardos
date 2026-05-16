@@ -42,7 +42,6 @@ type DatasetsContext struct {
 	PageID         string
 	PageName       string
 	Datasets       []DatasetItem
-	OpenFreeMapURL string
 	HasUncombined  bool
 	IsCombined     bool   // true if multiple datasets are combined
 	ActiveDataset  string // name of active dataset (empty if combined)
@@ -67,7 +66,6 @@ type DatasetsDeleteContext struct {
 // Render handles GET /admin/datasets
 func (v *DatasetsView) Render(w http.ResponseWriter, r *http.Request) {
 	datasetNames, _ := v.datasetsController.GetDatasets()
-	openFreeMapURL, _ := v.openFreeMapService.GetLatestPlanetURL()
 	downloads := v.downloadManager.GetAllDownloads()
 	activeDataset := v.datasetsController.GetActiveDataset()
 	isCombined := v.datasetsController.IsCombined()
@@ -131,7 +129,6 @@ func (v *DatasetsView) Render(w http.ResponseWriter, r *http.Request) {
 		PageID:         "datasets",
 		PageName:       "Datasets",
 		Datasets:       datasets,
-		OpenFreeMapURL: openFreeMapURL,
 		HasUncombined:  v.datasetsController.HasUncombined(),
 		IsCombined:     isCombined,
 		ActiveDataset:  activeDataset,

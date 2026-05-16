@@ -2,19 +2,6 @@
 
 {{define "scripts"}}
 <script>
-    function copyOpenFreeMapURL() {
-        const input = document.getElementById('openfreemap-url');
-        const text = input.value;
-        if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(text).then(function() {
-                input.select();
-            });
-        } else {
-            input.select();
-            document.execCommand('copy');
-        }
-    }
-
     function showError(error) {
         showToast('Download Error: ' + error, 'danger');
     }
@@ -240,17 +227,5 @@
     </div>
     {{end}}
 
-    {{if .OpenFreeMapURL}}
-    <div class="alert alert-info mt-4" role="alert">
-        <i class="fas fa-info-circle"></i>
-        You can find the latest dump of OpenStreetMap for the whole World (over 90GB) under:
-        <div class="input-group mt-2">
-            <input type="text" class="form-control" id="openfreemap-url" value="{{.OpenFreeMapURL}}" readonly onclick="copyOpenFreeMapURL()">
-            <button class="btn btn-outline-secondary" type="button" onclick="copyOpenFreeMapURL()">
-                <i class="fas fa-copy"></i>
-            </button>
-        </div>
-    </div>
-    {{end}}
 </div>
 {{end}}

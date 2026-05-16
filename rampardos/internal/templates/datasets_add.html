@@ -10,6 +10,7 @@
         var dateStr = match ? match[1] : '';
         $('#name').val('openfreemap-' + dateStr);
         $('#url').val(url);
+        $('#openfreemap-info').removeClass('d-none');
     }
     
     function downloadDataset() {
@@ -70,6 +71,10 @@
         <div class="mb-3">
             <label for="url" class="form-label">Download URL (.mbtiles)</label>
             <input type="url" class="form-control" id="url" name="url" required>
+            <div id="openfreemap-info" class="alert alert-warning mt-2 d-none" role="alert">
+                <i class="fas fa-exclamation-triangle"></i>
+                Filled with latest OpenFreeMap planet dump (~90GB). Download will take a while and requires significant disk space.
+            </div>
         </div>
         <button type="submit" id="submit" class="btn btn-primary">Download</button>
         <span id="status" class="ms-3"></span>
