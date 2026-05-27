@@ -67,36 +67,35 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates curl git xz-utils \
  && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://mise.run | sh
-ENV PATH=/root/.local/bin:$PATH
+SHELL ["/bin/bash", "-c"]
 WORKDIR /ffi
 RUN git clone "${MLN_FFI_REPO}" . \
  && git checkout ${MLN_FFI_REV}
-RUN mise trust --yes
-# Install only the tools the C library build actually needs:
-# - pixi provides the C++ env (clang/cmake/ninja + maplibre-native CXX deps).
-# - python satisfies the {{ tools.python.path }} template in the root
-#   mise.toml's [env] block (sets UV_PYTHON for the uv binding tooling we
-#   don't use; mise still has to resolve the template at activate time).
-# The root mise.toml also lists dotnet, Java, Rust, Node, Zig, etc. for
-# the other bindings and a planned C# binding (upstream issue #48 — not
-# implemented); `mise install` with no args fails on dotnet@10.0.203 in
-# this container env.
-RUN mise install pixi python
-SHELL ["/bin/bash", "-c"]
 
-# mise's [hooks] postinstall normally pulls the maplibre-native submodule
-# and runs `pixi install`. With only pixi+python installed, hk/uv/pnpm
-# steps in the hook fail (as warnings) and the whole hook is skipped,
-# leaving third_party/maplibre-native empty and pixi unfetched. Do the
-# essential bits explicitly.
+# Bypass mise entirely. The FFI's mise.toml lists tools for every
+# binding (dotnet, Java, Rust, Node, Zig, Python, ...) and mise's
+# auto-install fires during `mise activate` even when we only ask for
+# pixi explicitly — turning every missing tool into a build break
+# (dotnet@10.0.203 needs libicu, Java pulls in 200MB, etc.).
+#
+# pixi is the only tool that does real work for the C library build:
+# it provides the C++ env (clang/cmake/ninja) plus the maplibre-native
+# source via submodules. Install it directly from the official script
+# and drive the build with pixi commands.
+RUN curl -fsSL https://pixi.sh/install.sh | bash
+ENV PATH=/root/.pixi/bin:$PATH
+
+# Fetch the maplibre-native submodule (normally done by mise's
+# postinstall hook).
 RUN git submodule sync --recursive third_party/maplibre-native \
- && git submodule update --init --recursive --depth 1 third_party/maplibre-native \
- && mise exec pixi -- pixi install --locked
+ && git submodule update --init --recursive --depth 1 third_party/maplibre-native
 
-# Resolve TARGETARCH (amd64|arm64) → MapLibre variant arch suffix (x64|arm64),
-# select the EGL (OpenGL) variant, and stash the resulting variant name for
-# later RUN steps to read.
+# Install the pixi-managed conda env (clang/cmake/ninja + upstream's
+# CXX deps including pinned libicu/libuv/libjpeg/libwebp/libpng).
+RUN pixi install --locked
+
+# Resolve TARGETARCH (amd64|arm64) → MapLibre variant arch suffix
+# (x64|arm64), select the EGL (OpenGL) variant, stash the variant name.
 RUN case "$TARGETARCH" in \
         arm64) MLN_ARCH=arm64;; \
         amd64) MLN_ARCH=x64;; \
@@ -106,11 +105,18 @@ RUN case "$TARGETARCH" in \
  && echo "$MLN_VARIANT" > /tmp/mln_variant \
  && cat /tmp/mln_variant
 
-# Build the variant. mise's MISE_ENV var activates the per-variant config
-# under mise.toml's [env.<variant>] block.
-RUN MISE_ENV=$(cat /tmp/mln_variant) \
- && eval "$(mise activate bash)" \
- && mise run build
+# Configure + build via pixi directly. Replicates `mise run build`
+# from the FFI's [tasks.build] (which is just `cmake --build`
+# preceded by `cmake -S . -B ... -G Ninja -D...`). The env vars
+# (MLN_FFI_VARIANT, MLN_FFI_BUILD_DIR, etc.) are normally injected
+# by .mise/config.<variant>.toml; set them inline since we're not
+# using mise.
+RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
+ && BUILD_DIR="build/${MLN_VARIANT}" \
+ && pixi run --locked -- cmake -S . -B "$BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DMLN_FFI_RENDER_BACKEND=opengl \
+ && pixi run --locked -- cmake --build "$BUILD_DIR" --parallel
 
 # Stable downstream path: symlink build/<variant>/ to build/current/ so
 # later stages don't need to thread the variant name through.
