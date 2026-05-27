@@ -119,10 +119,12 @@ RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
  && pixi run --locked -- cmake --build "$BUILD_DIR" --parallel
 
 # Stable downstream path: symlink build/<variant>/ to build/current/ so
-# later stages don't need to thread the variant name through.
+# later stages don't need to thread the variant name through. The new
+# FFI doesn't emit a pkg-config .pc file (the Go binding consumes the
+# library via CGO_CFLAGS/CGO_LDFLAGS env vars instead of pkg-config),
+# so only assert the .so.
 RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
  && test -f build/${MLN_VARIANT}/libmaplibre-native-c.so \
- && test -f build/${MLN_VARIANT}/pkgconfig/maplibre-native-c.pc \
  && ln -sfn ${MLN_VARIANT} build/current \
  && ls -la build/current/
 
@@ -208,11 +210,11 @@ RUN npm install --omit=optional \
 # ================================
 FROM golang:1.26 AS rampardos-build
 ENV DEBIAN_FRONTEND=noninteractive
-# pkg-config resolves the binding's #cgo pkg-config: maplibre-native-c
-# directive against the .pc file shipped under build/current/pkgconfig.
 # libegl1-mesa-dev provides egl.pc — required because egl_linux.go
-# declares `#cgo linux pkg-config: egl`. Compile-time dep only; the
-# runtime libegl-mesa0 / libgl1-mesa-dri ship on the runtime image.
+# declares `#cgo linux pkg-config: egl`. The maplibre binding itself
+# doesn't use pkg-config (consumes the library via the CGO_CFLAGS /
+# CGO_LDFLAGS env vars set below). Compile-time dep only; the runtime
+# libegl-mesa0 / libgl1-mesa-dri ship on the runtime image.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libegl1-mesa-dev \
  && rm -rf /var/lib/apt/lists/*
@@ -225,8 +227,8 @@ COPY rampardos/go.mod rampardos/go.sum ./
 RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
-    PKG_CONFIG_PATH=/ffi/build/current/pkgconfig \
-    CGO_LDFLAGS="-Wl,-rpath-link=/ffi/build/current -Wl,-rpath,/opt/rampardos/lib" \
+    CGO_CFLAGS="-I/ffi/include" \
+    CGO_LDFLAGS="-L/ffi/build/current -lmaplibre-native-c -Wl,-rpath-link=/ffi/build/current -Wl,-rpath,/opt/rampardos/lib" \
     CGO_ENABLED=1 \
     go build -trimpath -tags 'nodynamic mln_ffi' \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
