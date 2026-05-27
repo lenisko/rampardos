@@ -558,7 +558,14 @@ func (w *goWorker) init() error {
 		return fmt.Errorf("renderer: new map: %w", err)
 	}
 
-	w.sess, err = w.m.AttachOpenGLOwnedTexture(maplibre.OpenGLOwnedTextureDescriptor{
+	// AttachOpenGLOffscreen: framebuffer with a renderbuffer color
+	// attachment (no exposed texture handle). Matches mbgl's
+	// HeadlessBackend layout, which the Node binding uses — avoids the
+	// texture-attached FBO's per-render sync overhead on Mesa software
+	// stacks. We only need CPU readback via
+	// RenderSessionHandle.ReadPremultipliedRGBA8Into, so the texture
+	// handle the owned-texture path exposed was never used anyway.
+	w.sess, err = w.m.AttachOpenGLOffscreen(maplibre.OpenGLOffscreenDescriptor{
 		Extent: maplibre.RenderTargetExtent{
 			Width:       w.curW,
 			Height:      w.curH,
@@ -567,7 +574,7 @@ func (w *goWorker) init() error {
 		Context: w.egl.descriptor(),
 	})
 	if err != nil {
-		return fmt.Errorf("renderer: attach OpenGL owned texture: %w", err)
+		return fmt.Errorf("renderer: attach OpenGL offscreen render target: %w", err)
 	}
 
 	// Set style URL but don't wait for the style-loaded event in init.

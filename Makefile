@@ -31,7 +31,7 @@ DOCKER_PLATFORMS=linux/amd64
 # docs/superpowers/plans/2026-05-01-in-process-go-renderer.md.
 # MLN_FFI_REV MUST stay in sync with the ARG in the Dockerfile's
 # mln-ffi-build stage; bump both together when the Go binding changes.
-MLN_FFI_REV ?= 8ea33450649d126786ca52e5f182a777cdf34605
+MLN_FFI_REV ?= 856d5ae139a185f1cb292c60745199bdc8c0a672
 MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi-linux
 
 # Default target
