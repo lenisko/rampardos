@@ -9,13 +9,12 @@
 // Adapted from examples/go-readback/main.go in the upstream
 // maplibre-native-ffi checkout (commit 2587cf28854ae0636f6d8512572c0f387b58e81a).
 //
-// Uses Desktop OpenGL 3.3 Core (not OpenGL ES) to match Node's GLX
-// path's driver code in Mesa. The original upstream example used ES3
-// because that's what the binding's reference Linux example tests;
-// prod measurement showed Go-via-ES is ~55% slower than Node-via-
-// Desktop-GL across the full latency distribution, and the gap is
-// uniform across percentiles (not a Go-side glue cost). Switching to
-// Desktop GL puts us on the same Mesa code path Node uses.
+// Uses Desktop OpenGL 3.3 Compatibility Profile (not Core, not ES) to
+// match Node's GLX path. The original upstream example used ES3 (~55%
+// slower than Node across the full distribution); Desktop GL Core was
+// also slower than ES3 in prod measurement; glxinfo showed Node sees
+// "OpenGL 3.3 (Compatibility Profile)" so Compatibility is the
+// specific code path mbgl/Mesa-llvmpipe is most optimized for.
 //
 // Uses a tiny pbuffer surface to satisfy eglMakeCurrent. The display
 // backend is picked via EGL_PLATFORM=surfaceless in the runtime image's
@@ -77,7 +76,7 @@ static int mln_go_egl_init(mln_go_egl_context *out, char *err, size_t err_len) {
     EGLint context_attribs[] = {
         EGL_CONTEXT_MAJOR_VERSION, 3,
         EGL_CONTEXT_MINOR_VERSION, 3,
-        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
         EGL_NONE
     };
     out->share_context = eglCreateContext(out->display, out->config, EGL_NO_CONTEXT, context_attribs);
