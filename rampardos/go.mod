@@ -9,7 +9,7 @@ require (
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/gorilla/websocket v1.5.3
 	github.com/grafana/pyroscope-go v1.2.7
-	github.com/jfberry/maplibre-native-go v0.0.0-20260502093845-ff0b90ec193e
+	github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0
 	github.com/klauspost/compress v1.18.2
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/image v0.34.0
@@ -37,3 +37,9 @@ require (
 	golang.org/x/text v0.32.0
 	google.golang.org/protobuf v1.36.11
 )
+
+// Upstream binding is not yet published as a public module — the
+// rampardos-build Docker stage copies bindings/go out of the
+// mln-ffi-build stage and exposes it at /vendor-maplibre-go. Local dev
+// outside Docker doesn't compile (matches the deployment constraint).
+replace github.com/maplibre/maplibre-native-ffi/bindings/go => /vendor-maplibre-go

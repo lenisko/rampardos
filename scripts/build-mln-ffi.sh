@@ -28,13 +28,14 @@
 set -euo pipefail
 
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi-linux}"
-MLN_FFI_REV="${MLN_FFI_REV:-b43836502281b9d091d7d78b7ad3219a9c805c7e}"
+MLN_FFI_REPO="${MLN_FFI_REPO:-https://github.com/jfberry/maplibre-native-ffi}"
+MLN_FFI_REV="${MLN_FFI_REV:-2587cf28854ae0636f6d8512572c0f387b58e81a}"
 
 mkdir -p "$MLN_FFI_DIR_HOST"
 
 if [ ! -d "$MLN_FFI_DIR_HOST/.git" ]; then
     echo ">> cloning maplibre-native-ffi at $MLN_FFI_REV into $MLN_FFI_DIR_HOST"
-    git clone https://github.com/sargunv/maplibre-native-ffi "$MLN_FFI_DIR_HOST"
+    git clone "$MLN_FFI_REPO" "$MLN_FFI_DIR_HOST"
 fi
 
 echo ">> checking out $MLN_FFI_REV"

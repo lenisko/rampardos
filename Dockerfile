@@ -59,7 +59,9 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # See scripts/build-mln-ffi.sh for the host-side equivalent.
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
-ARG MLN_FFI_REV=b43836502281b9d091d7d78b7ad3219a9c805c7e
+ARG MLN_FFI_REPO=https://github.com/jfberry/maplibre-native-ffi
+ARG MLN_FFI_REV=2587cf28854ae0636f6d8512572c0f387b58e81a
+ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -68,13 +70,42 @@ RUN apt-get update \
 RUN curl -fsSL https://mise.run | sh
 ENV PATH=/root/.local/bin:$PATH
 WORKDIR /ffi
-RUN git clone https://github.com/sargunv/maplibre-native-ffi . \
+RUN git clone "${MLN_FFI_REPO}" . \
  && git checkout ${MLN_FFI_REV}
 RUN mise trust --yes && mise install
 SHELL ["/bin/bash", "-c"]
-RUN eval "$(mise activate bash)" && mise run build
-RUN test -f build/libmaplibre-native-c.so \
- && test -f build/pkgconfig/maplibre-native-c.pc
+
+# Resolve TARGETARCH (amd64|arm64) → MapLibre variant arch suffix (x64|arm64),
+# select the EGL (OpenGL) variant, and stash the resulting variant name for
+# later RUN steps to read.
+RUN case "$TARGETARCH" in \
+        arm64) MLN_ARCH=arm64;; \
+        amd64) MLN_ARCH=x64;; \
+        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
+    esac \
+ && MLN_VARIANT="linux-${MLN_ARCH}-egl" \
+ && echo "$MLN_VARIANT" > /tmp/mln_variant \
+ && cat /tmp/mln_variant
+
+# Build the variant. mise's MISE_ENV var activates the per-variant config
+# under mise.toml's [env.<variant>] block.
+RUN MISE_ENV=$(cat /tmp/mln_variant) \
+ && eval "$(mise activate bash)" \
+ && mise run build
+
+# Stable downstream path: symlink build/<variant>/ to build/current/ so
+# later stages don't need to thread the variant name through.
+RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
+ && test -f build/${MLN_VARIANT}/libmaplibre-native-c.so \
+ && test -f build/${MLN_VARIANT}/pkgconfig/maplibre-native-c.pc \
+ && ln -sfn ${MLN_VARIANT} build/current \
+ && ls -la build/current/
+
+# Vendor the Go binding source so the rampardos-build stage can consume it
+# via a go.mod `replace` directive. Bound to the FFI commit → guarantees
+# binding version == C ABI version.
+RUN cp -r bindings/go /vendor-maplibre-go \
+ && ls /vendor-maplibre-go | head -20
 
 # The FFI's CMake links the .so against the pixi conda env's libs
 # (libicu 78, libuv 1, libjpeg 8, libwebp 7, libpng16) — versions that
@@ -86,13 +117,14 @@ RUN test -f build/libmaplibre-native-c.so \
 # Strategy: ldd recursively expands the dependency closure, awk filters
 # to entries living under /ffi/.pixi/, cp -L dereferences any symlinks
 # so the destination filename matches the DT_NEEDED soname directly.
-# Bundled libs land alongside libmaplibre-native-c.so in /ffi/build,
+# Bundled libs land alongside libmaplibre-native-c.so in build/current/,
 # so both -L${libdir} from pkg-config and the dynamic linker's view of
 # the .so's transitive deps resolve in one place.
-RUN for lib in $(LD_LIBRARY_PATH=/ffi/.pixi/envs/default/lib ldd build/libmaplibre-native-c.so | awk '/=> .*pixi/ {print $3}'); do \
-        cp -L "$lib" build/; \
+RUN BUILD=build/current \
+ && for lib in $(LD_LIBRARY_PATH=/ffi/.pixi/envs/default/lib ldd ${BUILD}/libmaplibre-native-c.so | awk '/=> .*pixi/ {print $3}'); do \
+        cp -L "$lib" ${BUILD}/; \
     done \
- && ls -la build/*.so*
+ && ls -la ${BUILD}/*.so*
 
 # RPATH the bundled .so to find its transitive deps via $ORIGIN (its
 # own directory) at load time, regardless of where the runtime image
@@ -106,13 +138,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends patchelf binutils \
  && rm -rf /var/lib/apt/lists/* \
  && set -x \
- && for lib in build/*.so*; do \
+ && for lib in build/current/*.so*; do \
         patchelf --set-rpath '$ORIGIN' "$lib" \
           || echo "WARN: patchelf failed on $lib"; \
     done \
  && set +x \
  && echo "--- libmaplibre-native-c.so DT_RUNPATH/DT_RPATH ---" \
- && readelf -d build/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
+ && readelf -d build/current/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
 # ================================
 # Render worker deps (maplibre-gl-native + better-sqlite3)
@@ -151,23 +183,25 @@ RUN npm install --omit=optional \
 # ================================
 FROM golang:1.26 AS rampardos-build
 ENV DEBIAN_FRONTEND=noninteractive
-# libvulkan-dev provides vulkan.pc — required because the binding's
-# texture_vulkan_linux.go declares `#cgo linux pkg-config: vulkan`.
-# Compile-time dep only; the runtime libvulkan1 / mesa-vulkan-drivers
-# are installed on the runtime image.
+# pkg-config resolves the binding's #cgo pkg-config: maplibre-native-c
+# directive against the .pc file shipped under build/current/pkgconfig.
+# libegl1-mesa-dev provides egl.pc — required because egl_linux.go
+# declares `#cgo linux pkg-config: egl`. Compile-time dep only; the
+# runtime libegl-mesa0 / libgl1-mesa-dri ship on the runtime image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config libvulkan-dev \
+ && apt-get install -y --no-install-recommends pkg-config libegl1-mesa-dev \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=mln-ffi-build /ffi/build /ffi/build
+COPY --from=mln-ffi-build /ffi/build/current /ffi/build/current
 COPY --from=mln-ffi-build /ffi/include /ffi/include
+COPY --from=mln-ffi-build /vendor-maplibre-go /vendor-maplibre-go
 WORKDIR /src
 COPY --from=git-info /git-commit.txt /git-commit.txt
 COPY rampardos/go.mod rampardos/go.sum ./
 RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
-    PKG_CONFIG_PATH=/ffi/build/pkgconfig \
-    CGO_LDFLAGS="-Wl,-rpath-link=/ffi/build -Wl,-rpath,/opt/rampardos/lib" \
+    PKG_CONFIG_PATH=/ffi/build/current/pkgconfig \
+    CGO_LDFLAGS="-Wl,-rpath-link=/ffi/build/current -Wl,-rpath,/opt/rampardos/lib" \
     CGO_ENABLED=1 \
     go build -trimpath -tags 'nodynamic mln_ffi' \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
@@ -190,9 +224,10 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends nodejs \
     # maplibre-native (Node binding) runtime deps — Mesa/OpenGL headless
     libglx0 libgl1 libegl1 libgbm1 libopengl0 \
-    # maplibre-native (Go binding via FFI) runtime deps — Vulkan with the
-    # lavapipe software rasterizer for fully headless render
-    libvulkan1 mesa-vulkan-drivers \
+    # maplibre-native (Go binding via FFI) runtime deps — Mesa EGL with
+    # the llvmpipe software DRI driver for fully headless render. EGL
+    # surfaceless platform is selected via EGL_PLATFORM=surfaceless below.
+    libegl-mesa0 libgl1-mesa-dri \
     # maplibre-native common deps
     libcurl4 libjpeg8 libwebp7 libpng16-16 libicu74 \
     libuv1 \
@@ -226,7 +261,7 @@ RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
 # of this Dockerfile registered /opt/rampardos/lib with ldconfig globally,
 # which shadowed Ubuntu's libpng for the Node renderer and caused a
 # version-mismatch abort on RENDERER_BACKEND=node-pool selection.
-COPY --from=mln-ffi-build /ffi/build /tmp/ffi-build
+COPY --from=mln-ffi-build /ffi/build/current /tmp/ffi-build
 RUN mkdir -p /opt/rampardos/lib \
  && cp -L /tmp/ffi-build/*.so* /opt/rampardos/lib/ \
  && rm -rf /tmp/ffi-build
@@ -264,6 +299,10 @@ ENV DISPLAY=:0
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV MESA_GL_VERSION_OVERRIDE=3.3
 ENV RENDERER_WORKER_SCRIPT=/app/render-worker/render-worker.js
+# EGL surfaceless platform — selects Mesa's headless EGL implementation
+# so the Go renderer's EGL context creation (egl_linux.go) works without
+# an X display. Node renderer continues to use Xvfb (started below).
+ENV EGL_PLATFORM=surfaceless
 EXPOSE 9000
 
 # Start Xvfb (virtual framebuffer) then rampardos. maplibre-native
