@@ -29,7 +29,7 @@ set -euo pipefail
 
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi-linux}"
 MLN_FFI_REPO="${MLN_FFI_REPO:-https://github.com/jfberry/maplibre-native-ffi}"
-MLN_FFI_REV="${MLN_FFI_REV:-2587cf28854ae0636f6d8512572c0f387b58e81a}"
+MLN_FFI_REV="${MLN_FFI_REV:-8ea33450649d126786ca52e5f182a777cdf34605}"
 
 mkdir -p "$MLN_FFI_DIR_HOST"
 
