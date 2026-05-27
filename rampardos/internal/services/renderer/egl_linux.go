@@ -8,11 +8,19 @@
 //
 // Adapted from examples/go-readback/main.go in the upstream
 // maplibre-native-ffi checkout (commit 2587cf28854ae0636f6d8512572c0f387b58e81a).
-// Uses OpenGL ES 3.0 (matches upstream MapLibre Native's expected client
-// API) with a tiny pbuffer surface to satisfy eglMakeCurrent. The
-// display backend is picked via EGL_PLATFORM=surfaceless in the runtime
-// image's env so eglGetDisplay(EGL_DEFAULT_DISPLAY) returns Mesa's
-// surfaceless platform.
+//
+// Uses Desktop OpenGL 3.3 Core (not OpenGL ES) to match Node's GLX
+// path's driver code in Mesa. The original upstream example used ES3
+// because that's what the binding's reference Linux example tests;
+// prod measurement showed Go-via-ES is ~55% slower than Node-via-
+// Desktop-GL across the full latency distribution, and the gap is
+// uniform across percentiles (not a Go-side glue cost). Switching to
+// Desktop GL puts us on the same Mesa code path Node uses.
+//
+// Uses a tiny pbuffer surface to satisfy eglMakeCurrent. The display
+// backend is picked via EGL_PLATFORM=surfaceless in the runtime image's
+// env so eglGetDisplay(EGL_DEFAULT_DISPLAY) returns Mesa's surfaceless
+// platform.
 package renderer
 
 /*
@@ -43,14 +51,14 @@ static int mln_go_egl_init(mln_go_egl_context *out, char *err, size_t err_len) {
         snprintf(err, err_len, "eglInitialize failed (0x%x)", eglGetError());
         return -2;
     }
-    if (eglBindAPI(EGL_OPENGL_ES_API) == EGL_FALSE) {
-        snprintf(err, err_len, "eglBindAPI(EGL_OPENGL_ES_API) failed (0x%x)", eglGetError());
+    if (eglBindAPI(EGL_OPENGL_API) == EGL_FALSE) {
+        snprintf(err, err_len, "eglBindAPI(EGL_OPENGL_API) failed (0x%x)", eglGetError());
         return -3;
     }
 
     EGLint config_attribs[] = {
         EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
         EGL_RED_SIZE,        8,
         EGL_GREEN_SIZE,      8,
         EGL_BLUE_SIZE,       8,
@@ -67,7 +75,9 @@ static int mln_go_egl_init(mln_go_egl_context *out, char *err, size_t err_len) {
     }
 
     EGLint context_attribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 3,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
         EGL_NONE
     };
     out->share_context = eglCreateContext(out->display, out->config, EGL_NO_CONTEXT, context_attribs);
