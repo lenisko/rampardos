@@ -73,15 +73,26 @@ WORKDIR /ffi
 RUN git clone "${MLN_FFI_REPO}" . \
  && git checkout ${MLN_FFI_REV}
 RUN mise trust --yes
-# Install only pixi (which provides the C++ build env: clang/cmake/ninja
-# and the upstream maplibre-native source). The root mise.toml also lists
-# dotnet, Java, Rust, Node, Python, Zig, etc. for the other bindings and
-# a planned C# binding (upstream issue #48 — not implemented yet); `mise
-# install` with no args tries to install everything, which fails on
-# dotnet@10.0.203 in this container env. The Linux EGL C library build
-# only needs pixi to be installed.
-RUN mise install pixi
+# Install only the tools the C library build actually needs:
+# - pixi provides the C++ env (clang/cmake/ninja + maplibre-native CXX deps).
+# - python satisfies the {{ tools.python.path }} template in the root
+#   mise.toml's [env] block (sets UV_PYTHON for the uv binding tooling we
+#   don't use; mise still has to resolve the template at activate time).
+# The root mise.toml also lists dotnet, Java, Rust, Node, Zig, etc. for
+# the other bindings and a planned C# binding (upstream issue #48 — not
+# implemented); `mise install` with no args fails on dotnet@10.0.203 in
+# this container env.
+RUN mise install pixi python
 SHELL ["/bin/bash", "-c"]
+
+# mise's [hooks] postinstall normally pulls the maplibre-native submodule
+# and runs `pixi install`. With only pixi+python installed, hk/uv/pnpm
+# steps in the hook fail (as warnings) and the whole hook is skipped,
+# leaving third_party/maplibre-native empty and pixi unfetched. Do the
+# essential bits explicitly.
+RUN git submodule sync --recursive third_party/maplibre-native \
+ && git submodule update --init --recursive --depth 1 third_party/maplibre-native \
+ && mise exec pixi -- pixi install --locked
 
 # Resolve TARGETARCH (amd64|arm64) → MapLibre variant arch suffix (x64|arm64),
 # select the EGL (OpenGL) variant, and stash the resulting variant name for
