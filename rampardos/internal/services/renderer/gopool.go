@@ -649,12 +649,17 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	} else {
 		w.buf = w.buf[:want]
 	}
+	readStart := time.Now()
 	info, err := w.sess.ReadPremultipliedRGBA8Into(w.buf)
+	readDur := time.Since(readStart)
 	if err != nil {
 		return nil, fmt.Errorf("renderer: read pixels: %w", err)
 	}
 	if int(info.Width) != physW || int(info.Height) != physH {
 		return nil, fmt.Errorf("renderer: size mismatch: got %dx%d, want %dx%d", info.Width, info.Height, physW, physH)
+	}
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.RecordRendererReadback(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, readDur.Seconds())
 	}
 
 	out := image.NewNRGBA(image.Rect(0, 0, physW, physH))
@@ -686,9 +691,13 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 	// path so we can see whether render time is dominated by pump
 	// iterations (cgo overhead), sleep backoff (idle waiting), mbgl
 	// warm-up (time to first event = file-source / tile-fetch wait),
-	// or the actual render work (RenderUpdate cgo cost).
+	// or the actual render work (RenderUpdate cgo cost). renderUpdateCnt
+	// captures multi-pass behaviour — mbgl may emit multiple
+	// RenderUpdateAvailable events per still image as tiles arrive
+	// progressively; each one triggers a full draw.
 	pumpStart := time.Now()
 	iterations := 0
+	renderUpdateCnt := 0
 	var totalSleep, totalRenderUpdate time.Duration
 	var timeToFirstEvent time.Duration
 	firstEventSeen := false
@@ -722,6 +731,7 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 					return fmt.Errorf("renderer: RenderUpdate: %w", err)
 				}
 				totalRenderUpdate += time.Since(ruStart)
+				renderUpdateCnt++
 				rendered = true
 			case maplibre.RuntimeEventMapStillImageFinished:
 				if !rendered {
@@ -734,6 +744,7 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 						totalSleep.Seconds(),
 						timeToFirstEvent.Seconds(),
 						totalRenderUpdate.Seconds(),
+						renderUpdateCnt,
 					)
 				}
 				return nil

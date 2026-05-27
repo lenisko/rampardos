@@ -105,10 +105,12 @@ type MetricsManager struct {
 	// time-to-first-event, and total RenderUpdate cgo time. These were
 	// added to isolate a structural Go-vs-Node gap; only emitted from
 	// the GoPoolRenderer's pump (no equivalent for nodepool).
-	rendererPumpIterations    *prometheus.HistogramVec // iterations per render
-	rendererPumpSleep         *prometheus.HistogramVec // total sleep seconds per render
-	rendererPumpTimeToFirstEv *prometheus.HistogramVec // seconds from pump start to first non-nil event
-	rendererPumpRenderUpdate  *prometheus.HistogramVec // total seconds in sess.RenderUpdate() cgo per render
+	rendererPumpIterations      *prometheus.HistogramVec // iterations per render
+	rendererPumpSleep           *prometheus.HistogramVec // total sleep seconds per render
+	rendererPumpTimeToFirstEv   *prometheus.HistogramVec // seconds from pump start to first non-nil event
+	rendererPumpRenderUpdate    *prometheus.HistogramVec // total seconds in sess.RenderUpdate() cgo per render
+	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // number of RuntimeEventMapRenderUpdateAvailable events per render (>1 = mbgl multi-pass)
+	rendererReadback            *prometheus.HistogramVec // seconds in sess.ReadPremultipliedRGBA8Into() cgo per render
 
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
@@ -317,6 +319,18 @@ func newMetricsManager() *MetricsManager {
 			Name:    "rampardos_renderer_pump_render_update_seconds_per_render",
 			Help:    "Total seconds spent inside sess.RenderUpdate() cgo calls per render. This is the actual mbgl render work (one cgo call per RuntimeEventMapRenderUpdateAvailable event); the remainder of total render time is mbgl warm-up + pump overhead + readback.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5},
+		}, []string{"style", "scale"}),
+
+		rendererPumpRenderUpdateCnt: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_render_update_count_per_render",
+			Help:    "Number of RuntimeEventMapRenderUpdateAvailable events drained per render. >1 means mbgl emitted multiple incremental draws before declaring the still image finished (e.g. as tiles arrived progressively).",
+			Buckets: []float64{1, 2, 3, 5, 10, 20, 50},
+		}, []string{"style", "scale"}),
+
+		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_readback_seconds_per_render",
+			Help:    "Seconds in sess.ReadPremultipliedRGBA8Into() cgo per render. This is the synchronous glReadPixels-equivalent. On Mesa llvmpipe with a renderbuffer FBO this should be sub-ms for 512×512×4; large values indicate driver-side stall or wrong attachment type.",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
 		}, []string{"style", "scale"}),
 
 		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
@@ -608,7 +622,7 @@ func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason st
 	m.rendererWorkerReplacements.WithLabelValues(bucketLabel(style), bucketLabel(scale), reason).Inc()
 }
 
-// RecordRendererPumpBreakdown emits the four per-render diagnostic
+// RecordRendererPumpBreakdown emits the per-render diagnostic
 // histograms for the Go renderer's pump loop. Called once per render
 // from GoPoolRenderer's pumpUntilStillFinished. Decomposes total
 // render time so we can see what's actually contributing to it.
@@ -618,11 +632,20 @@ func (m *MetricsManager) RecordRendererPumpBreakdown(
 	sleepSeconds float64,
 	timeToFirstEventSeconds float64,
 	renderUpdateSeconds float64,
+	renderUpdateCount int,
 ) {
 	m.rendererPumpIterations.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(iterations))
 	m.rendererPumpSleep.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(sleepSeconds)
 	m.rendererPumpTimeToFirstEv.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(timeToFirstEventSeconds)
 	m.rendererPumpRenderUpdate.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(renderUpdateSeconds)
+	m.rendererPumpRenderUpdateCnt.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(renderUpdateCount))
+}
+
+// RecordRendererReadback emits the per-render readback histogram.
+// Called once per render from renderOne, right around the
+// sess.ReadPremultipliedRGBA8Into() call.
+func (m *MetricsManager) RecordRendererReadback(style, scale string, seconds float64) {
+	m.rendererReadback.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(seconds)
 }
 
 // SetRendererGlobalCapacity is called once at renderer init to expose
