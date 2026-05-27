@@ -681,10 +681,23 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
+
+	// Per-render breakdown stats. Emitted to Prometheus on the success
+	// path so we can see whether render time is dominated by pump
+	// iterations (cgo overhead), sleep backoff (idle waiting), mbgl
+	// warm-up (time to first event = file-source / tile-fetch wait),
+	// or the actual render work (RenderUpdate cgo cost).
+	pumpStart := time.Now()
+	iterations := 0
+	var totalSleep, totalRenderUpdate time.Duration
+	var timeToFirstEvent time.Duration
+	firstEventSeen := false
+
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		iterations++
 		if err := w.rt.RunOnce(); err != nil {
 			return fmt.Errorf("renderer: RunOnce: %w", err)
 		}
@@ -697,16 +710,31 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			if ev == nil {
 				break
 			}
+			if !firstEventSeen {
+				timeToFirstEvent = time.Since(pumpStart)
+				firstEventSeen = true
+			}
 			productive = true
 			switch ev.Type {
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
+				ruStart := time.Now()
 				if err := w.sess.RenderUpdate(); err != nil {
 					return fmt.Errorf("renderer: RenderUpdate: %w", err)
 				}
+				totalRenderUpdate += time.Since(ruStart)
 				rendered = true
 			case maplibre.RuntimeEventMapStillImageFinished:
 				if !rendered {
 					return fmt.Errorf("renderer: still image finished without a render frame")
+				}
+				if services.GlobalMetrics != nil {
+					services.GlobalMetrics.RecordRendererPumpBreakdown(
+						w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
+						iterations,
+						totalSleep.Seconds(),
+						timeToFirstEvent.Seconds(),
+						totalRenderUpdate.Seconds(),
+					)
 				}
 				return nil
 			case maplibre.RuntimeEventMapLoadingFailed:
@@ -722,7 +750,9 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		// parse / glyph load / render update gets drained with
 		// sub-µs latency instead of waiting up to 100 µs.
 		if !productive {
+			sleepStart := time.Now()
 			time.Sleep(100 * time.Microsecond)
+			totalSleep += time.Since(sleepStart)
 		}
 	}
 	return fmt.Errorf("renderer: still image timed out after %s", budget)

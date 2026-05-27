@@ -99,6 +99,17 @@ type MetricsManager struct {
 	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
 	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
 
+	// Go-renderer per-render breakdown. Decomposes the total per-render
+	// wall time (rendererViewportDuration) so we can see where the time
+	// actually goes: pump iteration count, sleep time, mbgl warm-up
+	// time-to-first-event, and total RenderUpdate cgo time. These were
+	// added to isolate a structural Go-vs-Node gap; only emitted from
+	// the GoPoolRenderer's pump (no equivalent for nodepool).
+	rendererPumpIterations    *prometheus.HistogramVec // iterations per render
+	rendererPumpSleep         *prometheus.HistogramVec // total sleep seconds per render
+	rendererPumpTimeToFirstEv *prometheus.HistogramVec // seconds from pump start to first non-nil event
+	rendererPumpRenderUpdate  *prometheus.HistogramVec // total seconds in sess.RenderUpdate() cgo per render
+
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
 	// saturation metrics above.
@@ -283,6 +294,30 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_renderer_worker_replacements_total",
 			Help: "Worker processes killed and respawned. reason=error counts abnormal dispatch failures; reason=lifetime counts routine recycling after workerLifetime renders.",
 		}, []string{"style", "scale", "reason"}),
+
+		rendererPumpIterations: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_iterations_per_render",
+			Help:    "Number of RunOnce/PollEvent iterations the Go renderer's pump loop executed per render. High counts with low pump_sleep mean cgo-overhead-bound; high counts with high pump_sleep mean mbgl is slow to produce events.",
+			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000},
+		}, []string{"style", "scale"}),
+
+		rendererPumpSleep: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_sleep_seconds_per_render",
+			Help:    "Total seconds the Go renderer's pump spent in time.Sleep per render. The adaptive pump only sleeps when no events were drained; this metric quantifies how much of total render time is wasted in idle-poll backoff.",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"style", "scale"}),
+
+		rendererPumpTimeToFirstEv: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_time_to_first_event_seconds",
+			Help:    "Seconds from RequestStillImage to the first non-nil event drained by the pump. Measures mbgl's warm-up cost: how long mbgl takes to start producing render updates (driven by tile/glyph/sprite fetch latency through MainResourceLoader).",
+			Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
+		}, []string{"style", "scale"}),
+
+		rendererPumpRenderUpdate: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_render_update_seconds_per_render",
+			Help:    "Total seconds spent inside sess.RenderUpdate() cgo calls per render. This is the actual mbgl render work (one cgo call per RuntimeEventMapRenderUpdateAvailable event); the remainder of total render time is mbgl warm-up + pump overhead + readback.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5},
+		}, []string{"style", "scale"}),
 
 		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "rampardos_renderer_global_capacity",
@@ -571,6 +606,23 @@ func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeco
 
 func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
 	m.rendererWorkerReplacements.WithLabelValues(bucketLabel(style), bucketLabel(scale), reason).Inc()
+}
+
+// RecordRendererPumpBreakdown emits the four per-render diagnostic
+// histograms for the Go renderer's pump loop. Called once per render
+// from GoPoolRenderer's pumpUntilStillFinished. Decomposes total
+// render time so we can see what's actually contributing to it.
+func (m *MetricsManager) RecordRendererPumpBreakdown(
+	style, scale string,
+	iterations int,
+	sleepSeconds float64,
+	timeToFirstEventSeconds float64,
+	renderUpdateSeconds float64,
+) {
+	m.rendererPumpIterations.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(iterations))
+	m.rendererPumpSleep.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(sleepSeconds)
+	m.rendererPumpTimeToFirstEv.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(timeToFirstEventSeconds)
+	m.rendererPumpRenderUpdate.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(renderUpdateSeconds)
 }
 
 // SetRendererGlobalCapacity is called once at renderer init to expose
