@@ -72,7 +72,15 @@ ENV PATH=/root/.local/bin:$PATH
 WORKDIR /ffi
 RUN git clone "${MLN_FFI_REPO}" . \
  && git checkout ${MLN_FFI_REV}
-RUN mise trust --yes && mise install
+RUN mise trust --yes
+# Install only pixi (which provides the C++ build env: clang/cmake/ninja
+# and the upstream maplibre-native source). The root mise.toml also lists
+# dotnet, Java, Rust, Node, Python, Zig, etc. for the other bindings and
+# a planned C# binding (upstream issue #48 — not implemented yet); `mise
+# install` with no args tries to install everything, which fails on
+# dotnet@10.0.203 in this container env. The Linux EGL C library build
+# only needs pixi to be installed.
+RUN mise install pixi
 SHELL ["/bin/bash", "-c"]
 
 # Resolve TARGETARCH (amd64|arm64) → MapLibre variant arch suffix (x64|arm64),
