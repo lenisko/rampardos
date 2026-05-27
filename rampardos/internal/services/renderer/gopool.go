@@ -658,13 +658,18 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// CRITICAL: do not insert time.Sleep between iterations. Upstream's
-// reference measurements show a 1 ms sleep here costs ~2.5x p50 latency
-// because it puts a hard floor on per-frame latency that's roughly the
-// sleep duration. runtime.Gosched() yields to the Go scheduler without
-// parking the OS thread, which is what we want — the worker pumps
-// full-tilt while a still image is in flight, then idles on the
-// command channel between renders.
+// Sleep cadence: 100 µs between RunOnce iterations. With
+// runtime.Gosched (the original choice from upstream's reference
+// numbers) the pump spins ~40k iterations per 20 ms render, each
+// firing two cgo calls (RunOnce + PollEvent) ≈ 12 ms of pure cgo
+// round-trip overhead per render. Prod measurement showed this was
+// the dominant chunk of the Go-vs-Node p50 gap. A 100 µs sleep cuts
+// the iteration count ~200x (≈200 iters per 20 ms render) while
+// adding at most 100 µs of completion-event latency — net 11+ ms
+// faster per render at this load. The upstream brief warned against
+// `time.Sleep(1ms)` (2.5× p50), but that was measured at synthetic
+// high QPS where latency dominated; here the cgo cost dominates so
+// trading latency for fewer cgo hops is the right knob.
 //
 // Adapted from examples/go-readback/main.go in the upstream
 // maplibre-native-ffi checkout.
@@ -705,7 +710,7 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
-		runtime.Gosched()
+		time.Sleep(100 * time.Microsecond)
 	}
 	return fmt.Errorf("renderer: still image timed out after %s", budget)
 }
