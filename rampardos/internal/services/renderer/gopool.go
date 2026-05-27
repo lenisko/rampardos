@@ -665,21 +665,19 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// Sleep cadence: 100 µs between RunOnce iterations. With
-// runtime.Gosched (the original choice from upstream's reference
-// numbers) the pump spins ~40k iterations per 20 ms render, each
-// firing two cgo calls (RunOnce + PollEvent) ≈ 12 ms of pure cgo
-// round-trip overhead per render. Prod measurement showed this was
-// the dominant chunk of the Go-vs-Node p50 gap. A 100 µs sleep cuts
-// the iteration count ~200x (≈200 iters per 20 ms render) while
-// adding at most 100 µs of completion-event latency — net 11+ ms
-// faster per render at this load. The upstream brief warned against
-// `time.Sleep(1ms)` (2.5× p50), but that was measured at synthetic
-// high QPS where latency dominated; here the cgo cost dominates so
-// trading latency for fewer cgo hops is the right knob.
+// Adaptive sleep cadence: 100 µs between iterations ONLY when the
+// previous iteration drained no events. When events ARE flowing
+// (mbgl making progress — tiles parsed, glyphs loaded, render
+// updates queued), we re-poll immediately. mbgl emits ~30-100 async
+// checkpoints per render (tile workers signal back to main thread
+// per parsed tile, plus glyph/image fetches); unconditionally
+// sleeping 100 µs between each checkpoint added ~3-10 ms wall-time
+// per render — the bulk of the residual gap to Node's HeadlessFrontend
+// path, which uses uv_run(UV_RUN_NOWAIT) with no userspace sleep.
 //
 // Adapted from examples/go-readback/main.go in the upstream
-// maplibre-native-ffi checkout.
+// maplibre-native-ffi checkout, with the productive-iter optimisation
+// from bindings/go's RenderStill helper.
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
@@ -690,6 +688,7 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		if err := w.rt.RunOnce(); err != nil {
 			return fmt.Errorf("renderer: RunOnce: %w", err)
 		}
+		productive := false
 		for {
 			ev, err := w.rt.PollEvent()
 			if err != nil {
@@ -698,6 +697,7 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			if ev == nil {
 				break
 			}
+			productive = true
 			switch ev.Type {
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
 				if err := w.sess.RenderUpdate(); err != nil {
@@ -717,7 +717,13 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
-		time.Sleep(100 * time.Microsecond)
+		// Only sleep when mbgl had nothing to deliver this iteration.
+		// While work is flowing, re-poll immediately so each tile
+		// parse / glyph load / render update gets drained with
+		// sub-µs latency instead of waiting up to 100 µs.
+		if !productive {
+			time.Sleep(100 * time.Microsecond)
+		}
 	}
 	return fmt.Errorf("renderer: still image timed out after %s", budget)
 }
