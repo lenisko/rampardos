@@ -670,19 +670,18 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// Adaptive sleep cadence: 100 µs between iterations ONLY when the
-// previous iteration drained no events. When events ARE flowing
-// (mbgl making progress — tiles parsed, glyphs loaded, render
-// updates queued), we re-poll immediately. mbgl emits ~30-100 async
-// checkpoints per render (tile workers signal back to main thread
-// per parsed tile, plus glyph/image fetches); unconditionally
-// sleeping 100 µs between each checkpoint added ~3-10 ms wall-time
-// per render — the bulk of the residual gap to Node's HeadlessFrontend
-// path, which uses uv_run(UV_RUN_NOWAIT) with no userspace sleep.
-//
-// Adapted from examples/go-readback/main.go in the upstream
-// maplibre-native-ffi checkout, with the productive-iter optimisation
-// from bindings/go's RenderStill helper.
+// Idle backoff: runtime.Gosched() on iterations that drained no
+// events. The earlier approach used time.Sleep(100µs), which on
+// Linux with CONFIG_HZ=1000 actually sleeps ~1ms (kernel scheduler
+// timer resolution). With ~14 idle iterations per render between
+// event bursts, that cost ~14ms wall-time per render — the dominant
+// remaining gap to Node's libuv pump (which uses
+// uv_run(UV_RUN_NOWAIT), spinning when no events are queued without
+// any userspace sleep). Gosched is ~50ns, doesn't park the OS
+// thread, and matches libuv's spin-when-empty behaviour. Burns one
+// CPU core during active renders (worker idles on the cmds channel
+// between renders, so global CPU cost is bounded by N_workers ×
+// render_duty_cycle).
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
@@ -756,13 +755,15 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
-		// Only sleep when mbgl had nothing to deliver this iteration.
-		// While work is flowing, re-poll immediately so each tile
-		// parse / glyph load / render update gets drained with
-		// sub-µs latency instead of waiting up to 100 µs.
+		// On idle iterations, yield to the Go scheduler without
+		// parking the OS thread. Productive iterations re-poll
+		// immediately. See block comment above for why
+		// time.Sleep(100µs) was a per-render ~14ms penalty on Linux.
+		// totalSleep stays in the metrics breakdown so we can verify
+		// the Gosched path produces ~0ms accumulated sleep wait.
 		if !productive {
 			sleepStart := time.Now()
-			time.Sleep(100 * time.Microsecond)
+			runtime.Gosched()
 			totalSleep += time.Since(sleepStart)
 		}
 	}
