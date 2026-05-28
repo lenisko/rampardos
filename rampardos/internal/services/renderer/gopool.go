@@ -670,21 +670,22 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// Uses RunBlocking, which wraps uv_run(loop, UV_RUN_ONCE): the
-// thread parks in epoll_wait and wakes in microseconds when mbgl
-// emits an event. Replaces the previous time.Sleep(100µs)/Gosched
-// pump, which suffered ~6ms of wake-up latency per render due to
-// kernel timer granularity (CONFIG_HZ=1000 → 1ms rounding). With
-// the blocking variant, the renderer's pump matches Node's libuv
-// pump behaviour and per-render wake-up overhead is bounded by
-// scheduler latency (~µs), not timer resolution (~ms).
+// Uses WaitForEvent: the FFI internally loops uv_run(UV_RUN_ONCE)
+// until a runtime event is queued (drainable by PollEvent), or
+// until timeout. All libuv-internal wake-ups are absorbed in C
+// without crossing back to Go, so each WaitForEvent return
+// corresponds to actual runtime-event work for us to do.
 //
-// Note: pumpSleep metric below now measures time spent in
-// RunBlocking (i.e. time the worker was parked in epoll_wait).
-// This is the time mbgl spent waiting for worker threads to
-// deliver tile/glyph/sprite data — unavoidable real wait, not
-// userspace sleep overhead. Should approximately equal the
-// per-render "mbgl-was-blocked" time.
+// The earlier RunBlocking variant wakes on every libuv tick (not
+// just runtime-event-producing ones); prod measurement showed
+// ~968 wake-ups per render of which ~15 (1.5%) actually had a
+// runtime event. Each spurious wake paid a cgo round-trip + Go
+// scheduler hop. WaitForEvent removes those by filtering in C.
+//
+// pumpSleep metric below measures cumulative time spent inside
+// WaitForEvent — this is real mbgl I/O wait (worker threads
+// parsing tiles, file source SQLite queries, etc.), not userspace
+// scheduling overhead.
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
@@ -714,17 +715,16 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		}
 		iterations++
 
-		// Block in epoll_wait until mbgl has events (or remaining
-		// budget expires). Returns when uv_run(UV_RUN_ONCE) made
-		// progress. Cumulative blocked time is recorded in
-		// totalSleep — keeps the metric meaningful (now: time mbgl
-		// was waiting for worker threads / I/O) rather than
-		// userspace sleep overhead.
+		// Block in C-side loop driving libuv until a runtime event is
+		// queued (drainable by PollEvent) or budget expires. cgo
+		// returns once per runtime event, not once per libuv tick —
+		// spurious-wake filter is in C (FFI runtime->events.empty()
+		// under the same lock as the producer).
 		blockStart := time.Now()
-		hadEvent, err := w.rt.RunBlocking(remaining)
+		hadEvent, err := w.rt.WaitForEvent(remaining)
 		totalSleep += time.Since(blockStart)
 		if err != nil {
-			return fmt.Errorf("renderer: RunBlocking: %w", err)
+			return fmt.Errorf("renderer: WaitForEvent: %w", err)
 		}
 		if !hadEvent {
 			// timer fired with no work — outer check will return
