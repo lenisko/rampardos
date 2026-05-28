@@ -687,7 +687,6 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // parsing tiles, file source SQLite queries, etc.), not userspace
 // scheduling overhead.
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
-	rendered := false
 	deadline := time.Now().Add(budget)
 
 	// Per-render breakdown stats. Emitted to Prometheus on the success
@@ -732,18 +731,15 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			continue
 		}
 
-		// Drain all events from this WaitForEvent return. Coalesce
-		// multiple RenderUpdateAvailable events into a SINGLE
-		// sess.RenderUpdate() call — mbgl's HeadlessFrontend
-		// (the path the Node binding uses) does this implicitly via
-		// libuv's uv_async_send coalescing: AsyncTask::send is
-		// idempotent across multiple sends-before-pump, firing the
-		// renderFrame callback once with the latest updateParameters.
-		// Each updateParameters_ supersedes the previous, so calling
-		// RenderUpdate per emitted event is doing N redundant draws
-		// where Node does 1. Prod measurement under WaitForEvent:
-		// ~18 events per render × ~0.6ms cgo+GL = ~11ms wasted.
-		pendingRenderUpdate := false
+		// Option B: skip every intermediate RenderUpdateAvailable
+		// event. Only call sess.RenderUpdate() ONCE when
+		// MapStillImageFinished arrives, using whatever the latest
+		// state mbgl accumulated. Risk: if mbgl needs intermediate
+		// RenderUpdates to commit state before StillImageFinished
+		// fires, this deadlocks (we hit the budget timeout). Bench
+		// proven inconclusive; testing in prod with a revert plan.
+		// If deadlock: render-timeout errors in logs after ~15s,
+		// revert to the per-drain coalesce.
 		for {
 			ev, err := w.rt.PollEvent()
 			if err != nil {
@@ -758,22 +754,17 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			}
 			switch ev.Type {
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
-				pendingRenderUpdate = true
+				// Skip — do NOT call RenderUpdate. mbgl's latest
+				// updateParameters will be picked up by the single
+				// RenderUpdate call on StillImageFinished.
 			case maplibre.RuntimeEventMapStillImageFinished:
-				// Flush any pending update before finishing.
-				if pendingRenderUpdate {
-					ruStart := time.Now()
-					if err := w.sess.RenderUpdate(); err != nil {
-						return fmt.Errorf("renderer: RenderUpdate: %w", err)
-					}
-					totalRenderUpdate += time.Since(ruStart)
-					renderUpdateCnt++
-					rendered = true
-					pendingRenderUpdate = false
+				// Single render with the final accumulated state.
+				ruStart := time.Now()
+				if err := w.sess.RenderUpdate(); err != nil {
+					return fmt.Errorf("renderer: RenderUpdate: %w", err)
 				}
-				if !rendered {
-					return fmt.Errorf("renderer: still image finished without a render frame")
-				}
+				totalRenderUpdate += time.Since(ruStart)
+				renderUpdateCnt++
 				if services.GlobalMetrics != nil {
 					services.GlobalMetrics.RecordRendererPumpBreakdown(
 						w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
@@ -792,18 +783,6 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			case maplibre.RuntimeEventMapStillImageFailed:
 				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
-		}
-		// Drain pass finished without StillImageFinished — flush any
-		// pending render-update so mbgl can make forward progress on
-		// the next WaitForEvent cycle.
-		if pendingRenderUpdate {
-			ruStart := time.Now()
-			if err := w.sess.RenderUpdate(); err != nil {
-				return fmt.Errorf("renderer: RenderUpdate: %w", err)
-			}
-			totalRenderUpdate += time.Since(ruStart)
-			renderUpdateCnt++
-			rendered = true
 		}
 	}
 }
