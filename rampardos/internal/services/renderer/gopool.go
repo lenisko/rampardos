@@ -670,18 +670,28 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// Idle backoff: runtime.Gosched() on iterations that drained no
-// events. The earlier approach used time.Sleep(100µs), which on
-// Linux with CONFIG_HZ=1000 actually sleeps ~1ms (kernel scheduler
-// timer resolution). With ~14 idle iterations per render between
-// event bursts, that cost ~14ms wall-time per render — the dominant
-// remaining gap to Node's libuv pump (which uses
-// uv_run(UV_RUN_NOWAIT), spinning when no events are queued without
-// any userspace sleep). Gosched is ~50ns, doesn't park the OS
-// thread, and matches libuv's spin-when-empty behaviour. Burns one
-// CPU core during active renders (worker idles on the cmds channel
-// between renders, so global CPU cost is bounded by N_workers ×
-// render_duty_cycle).
+// Idle backoff: time.Sleep(100µs). On Linux this rounds up to
+// kernel timer resolution (~1ms on CONFIG_HZ=1000). The instrumented
+// breakdown shows ~14ms of accumulated sleep wait per render at
+// scale=1, but this is NOT wasted time — it's mbgl waiting for tile
+// workers to deliver parsed tile/glyph/sprite data via worker
+// threads. The actual unrecoverable cost is wake-up latency: when
+// mbgl emits an event mid-sleep, we don't notice until the kernel
+// timer fires, losing ~500µs per event on average. Node's libuv
+// pump uses uv_run(UV_RUN_ONCE) which blocks on epoll_wait and
+// wakes in microseconds when events become ready, saving ~6ms per
+// render vs our 1ms-granularity sleep.
+//
+// runtime.Gosched() was tried as an alternative and turned out
+// worse: ~18µs per call due to scheduler contention with HTTP
+// handlers + dispatcher goroutines, plus tighter polling causes
+// mbgl to emit MORE incremental render updates (~16 vs ~12),
+// increasing total RenderUpdate cgo time. Net: +3ms worse.
+//
+// The real fix would be an FFI-side mln_runtime_run_blocking that
+// exposes uv_run(UV_RUN_ONCE). With microsecond-latency wake-up
+// our p50 should drop from ~28ms to ~16ms (matching/beating Node's
+// 20ms). Tracked as a follow-up FFI request.
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
@@ -755,15 +765,14 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
-		// On idle iterations, yield to the Go scheduler without
-		// parking the OS thread. Productive iterations re-poll
-		// immediately. See block comment above for why
-		// time.Sleep(100µs) was a per-render ~14ms penalty on Linux.
-		// totalSleep stays in the metrics breakdown so we can verify
-		// the Gosched path produces ~0ms accumulated sleep wait.
+		// Idle iterations sleep 100µs (rounds up to ~1ms on Linux
+		// CONFIG_HZ=1000). See block comment above — sleep is mbgl
+		// waiting for worker threads, not wasted time. The wake-up
+		// latency loss vs Node's epoll-based pump is the remaining
+		// structural gap.
 		if !productive {
 			sleepStart := time.Now()
-			runtime.Gosched()
+			time.Sleep(100 * time.Microsecond)
 			totalSleep += time.Since(sleepStart)
 		}
 	}
