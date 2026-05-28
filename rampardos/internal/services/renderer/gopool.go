@@ -670,28 +670,21 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// Idle backoff: time.Sleep(100µs). On Linux this rounds up to
-// kernel timer resolution (~1ms on CONFIG_HZ=1000). The instrumented
-// breakdown shows ~14ms of accumulated sleep wait per render at
-// scale=1, but this is NOT wasted time — it's mbgl waiting for tile
-// workers to deliver parsed tile/glyph/sprite data via worker
-// threads. The actual unrecoverable cost is wake-up latency: when
-// mbgl emits an event mid-sleep, we don't notice until the kernel
-// timer fires, losing ~500µs per event on average. Node's libuv
-// pump uses uv_run(UV_RUN_ONCE) which blocks on epoll_wait and
-// wakes in microseconds when events become ready, saving ~6ms per
-// render vs our 1ms-granularity sleep.
+// Uses RunBlocking, which wraps uv_run(loop, UV_RUN_ONCE): the
+// thread parks in epoll_wait and wakes in microseconds when mbgl
+// emits an event. Replaces the previous time.Sleep(100µs)/Gosched
+// pump, which suffered ~6ms of wake-up latency per render due to
+// kernel timer granularity (CONFIG_HZ=1000 → 1ms rounding). With
+// the blocking variant, the renderer's pump matches Node's libuv
+// pump behaviour and per-render wake-up overhead is bounded by
+// scheduler latency (~µs), not timer resolution (~ms).
 //
-// runtime.Gosched() was tried as an alternative and turned out
-// worse: ~18µs per call due to scheduler contention with HTTP
-// handlers + dispatcher goroutines, plus tighter polling causes
-// mbgl to emit MORE incremental render updates (~16 vs ~12),
-// increasing total RenderUpdate cgo time. Net: +3ms worse.
-//
-// The real fix would be an FFI-side mln_runtime_run_blocking that
-// exposes uv_run(UV_RUN_ONCE). With microsecond-latency wake-up
-// our p50 should drop from ~28ms to ~16ms (matching/beating Node's
-// 20ms). Tracked as a follow-up FFI request.
+// Note: pumpSleep metric below now measures time spent in
+// RunBlocking (i.e. time the worker was parked in epoll_wait).
+// This is the time mbgl spent waiting for worker threads to
+// deliver tile/glyph/sprite data — unavoidable real wait, not
+// userspace sleep overhead. Should approximately equal the
+// per-render "mbgl-was-blocked" time.
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
@@ -711,15 +704,34 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 	var timeToFirstEvent time.Duration
 	firstEventSeen := false
 
-	for time.Now().Before(deadline) {
+	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		iterations++
-		if err := w.rt.RunOnce(); err != nil {
-			return fmt.Errorf("renderer: RunOnce: %w", err)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("renderer: still image timed out after %s", budget)
 		}
-		productive := false
+		iterations++
+
+		// Block in epoll_wait until mbgl has events (or remaining
+		// budget expires). Returns when uv_run(UV_RUN_ONCE) made
+		// progress. Cumulative blocked time is recorded in
+		// totalSleep — keeps the metric meaningful (now: time mbgl
+		// was waiting for worker threads / I/O) rather than
+		// userspace sleep overhead.
+		blockStart := time.Now()
+		hadEvent, err := w.rt.RunBlocking(remaining)
+		totalSleep += time.Since(blockStart)
+		if err != nil {
+			return fmt.Errorf("renderer: RunBlocking: %w", err)
+		}
+		if !hadEvent {
+			// timer fired with no work — outer check will return
+			// timeout on next loop iteration.
+			continue
+		}
+
 		for {
 			ev, err := w.rt.PollEvent()
 			if err != nil {
@@ -732,7 +744,6 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				timeToFirstEvent = time.Since(pumpStart)
 				firstEventSeen = true
 			}
-			productive = true
 			switch ev.Type {
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
 				ruStart := time.Now()
@@ -765,18 +776,7 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
-		// Idle iterations sleep 100µs (rounds up to ~1ms on Linux
-		// CONFIG_HZ=1000). See block comment above — sleep is mbgl
-		// waiting for worker threads, not wasted time. The wake-up
-		// latency loss vs Node's epoll-based pump is the remaining
-		// structural gap.
-		if !productive {
-			sleepStart := time.Now()
-			time.Sleep(100 * time.Microsecond)
-			totalSleep += time.Since(sleepStart)
-		}
 	}
-	return fmt.Errorf("renderer: still image timed out after %s", budget)
 }
 
 // unpremultiplyRGBA converts premultiplied RGBA bytes (binding output)
