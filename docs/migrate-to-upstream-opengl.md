@@ -17,8 +17,17 @@ The output is two deployable container images per build (`*:opengl-<sha>`, `*:vu
 
 - **Our fork:** https://github.com/jfberry/maplibre-native-ffi
 - **Branch:** `go-opengl-linux`
-- **Commit SHA to pin:** `2587cf28854ae0636f6d8512572c0f387b58e81a`
-  - Contains: full upstream `golang` branch + `origin/main` merge (WGL/EGL C ABI support) + our two commits adding Go OpenGL Linux binding & `go-readback` example.
+- **Commit SHA to pin:** `9b349e12beeb732575b1227f09e0f866b67b13f0`
+  - Contains:
+    - upstream `golang` branch merged with `origin/main` (WGL/EGL C ABI support)
+    - `fa264fd` — Go binding for OpenGL Linux render targets
+    - `2587cf2` — `go-readback` example
+    - `8ea3345` — texture session: drop `glFinish()` from `swap()`, switch `ContextMode` to `Unique` (matches mbgl `HeadlessBackend`). Single biggest perf change.
+    - `856d5ae` — `AttachOpenGLOffscreen` + `OpenGLOffscreenDescriptor` (renderbuffer-color FBO, mbgl `HeadlessBackend` layout). Optional alternative to owned-texture.
+    - `19807fc` — `BypassResourceLoader` (opt-in via `MLN_FFI_RESOURCE_LOADER=bypass`). Synchronous MainResourceLoader replacement. Spike result: doesn't move the needle on measured workloads, kept as documented option.
+    - `dfd7091` — `mln_runtime_run_blocking` + `RuntimeHandle.RunBlocking(timeout)`. Bounded libuv-blocking pump primitive. Requires submodule bump — `.gitmodules` now points at `jfberry/maplibre-native` for a small RunLoop patch.
+    - `7206a1a` — **`mln_runtime_wait_for_event` + `RuntimeHandle.WaitForEvent(timeout)`**. Filters spurious libuv-internal wakes *inside C* — only returns when the runtime event queue is non-empty or the timeout expires. This is the primitive to use when the next caller step is `PollEvent`. Each spurious wake costs one mutex acquire instead of a cgo crossing.
+    - `9b349e1` — **render-update event coalescing in the runtime queue.** One `MAP_RENDER_UPDATE_AVAILABLE` per map per pump cycle instead of one per `onInvalidate`, matching mbgl's `HeadlessFrontend` (which coalesces implicitly via `uv_async_send`). Caller contract unchanged — still "render the latest" per event. Validated against EGL: byte-identical output, cold-frame events drop (12→5 at z3, 14→5 at z5), warm frames stay at 1, `StillImageFinished` always fires (no deadlock). Under our `WaitForEvent` pump the per-drain burst accumulates larger, so `pump_render_update_count` should fall toward ~1 — verify in prod metrics.
 
 The Go binding lives at `bindings/go/` inside that repo. Working examples to copy patterns from:
 
@@ -26,22 +35,67 @@ The Go binding lives at `bindings/go/` inside that repo. Working examples to cop
 - **`examples/go-readback/main.go`** — full lifecycle reference: EGL context setup, attach owned-texture session, request still image, drive RunOnce/PollEvent pump, readback to PPM. Most of `egl_linux.go` for this repo should be a direct copy of the cgo preamble + `eglContext` type there.
 - **`bindings/go/maplibre_abi_test.go`** — shows how to query `SupportedRenderBackends()` + `SupportedOpenGLContextProviders()` at runtime.
 
-Cross-reference (validated locally — do not redo these unless the migration produces wildly different numbers):
+Cross-reference (validated locally — Mesa software stack in Apple Silicon Docker linux/arm64). Two workload modes; **only the cache-killer numbers are representative of a real tile-server load.** The linear-walk numbers are kept for context but should NOT be used as the target for prod sizing.
 
-| Metric | OpenGL (llvmpipe) via upstream binding, **Gosched pump** | Vulkan (lavapipe) via old jfberry binding |
-|---|---|---|
-| Frames | 1000 | 1000 |
-| Workload | z15, 512×512, klokantech-basic, GB OSM mbtiles, walk SE from Dumfries | same |
-| FPS | 425.9 | 416.5 |
-| p50 | 2.02 ms | 1.50 ms |
-| p99 | 6.58 ms | 9.15 ms |
-| frame max | 8.40 ms | 16.66 ms |
-| RSS warmup → end | 146.4 → 150.1 MiB (+3.7) | 170.9 → 179.3 MiB (+8.5) |
+### Workload: linear walk (NOT representative — high cache reuse)
+
+Adjacent ~1 km steps SE from Dumfries at z15. After warmup, mbgl's in-memory tile pyramid covers most of the viewport from the previous frame, so per-frame I/O is minimal. FPS looks great but the resource pipeline isn't exercised.
+
+| Metric | OpenGL (llvmpipe) owned-texture |
+|---|---|
+| Median FPS (3 replicates) | 810 |
+| p50 | 1.10 ms |
+| p99 | 2.95 ms |
+| tile/frame requested | 5.0 (3.3 from cache / 1.6 from net) |
+
+### Workload: cache-killer (random viewports in GB bbox) — **use this for tuning**
+
+Each frame teleports the camera to a uniformly random point in the GB mainland bounding box (`lat 50.0–58.5`, `lon -6.0–1.5`) with a seeded PRNG. This mimics tile-server traffic where successive requests have no temporal coherence. Available in the bench as `--walk-mode random-gb`.
+
+| Metric | OpenGL (llvmpipe) owned-texture, actor loader |
+|---|---|
+| Median FPS (3 replicates) | 387 |
+| p50 | 1.86 ms |
+| p90 | ~4.0 ms |
+| p99 | 13.47 ms |
+| frame max | ~32 ms |
+| tile/frame requested | 7.4 (5.1 cache / 2.3 net) |
+| tile/frame loaded | 5.2 (2.9 cache / 2.3 net) |
+| tile/frame parsed | 10.9 started / 8.3 finished (24% mid-flight cancels) |
 
 Notes:
-- Software renderers (Mesa llvmpipe/lavapipe) on Apple Silicon Docker linux/arm64. Real hardware GPU paths will be much faster.
-- The OpenGL FPS is slightly *ahead* of Vulkan in this configuration, with a tighter p99 and lower frame-max. p50 is still ~25% behind Vulkan, which is the GPU API itself (lavapipe vs llvmpipe at fixed-cost ops), not pump cadence.
-- An earlier measurement with `time.Sleep(time.Millisecond)` between RunOnce calls gave OpenGL 191.7 FPS / p50 5.14 ms — 2.2× worse FPS, 2.5× worse p50. **The pump cadence is by far the largest perf knob in this code path.** See the `pumpUntilStillFinished` skeleton in §B3 for the right pattern (`runtime.Gosched()`, no sleep).
+- Software renderers (Mesa llvmpipe/lavapipe). Real hardware GPU paths will be much faster.
+- **Use the cache-killer numbers** when sizing prod capacity. The linear-walk's ~800 FPS is what mbgl gives you when nothing is loading; under real traffic you'll see ~400 FPS / p99 ~13 ms on this software stack.
+- **The single largest perf knob found so far is the pump cadence**: `time.Sleep(1*time.Millisecond)` between `RunOnce` calls gave 191.7 FPS — 2.8× worse than the hybrid `RunOnce` + `RunBlocking(10ms)` pump in §B3. `runtime.Gosched()` works too but burns 100% of one core per worker; `RunBlocking` parks in `epoll_wait`.
+
+### What we tried that didn't help
+
+| Change | Verdict |
+|---|---|
+| `AttachOpenGLOffscreen` (renderbuffer color FBO) vs owned-texture | Within 1–2% noise on both workloads. Optional. |
+| `MLN_FFI_RESOURCE_LOADER=bypass` (synchronous MainResourceLoader) | Within noise even under cache-killer. Code is kept opt-in but default stays on `actor`. |
+| Mesa env vars (`vblank_mode=0`, `mesa_glthread=true`, `MESA_SHADER_CACHE_DIR`, …) | Variance dominates. A few hurt p99 (notably `mesa_glthread=true`). See "Mesa tuning" below — recommended set is now **none**. |
+| `MESA_VK_VERSION_OVERRIDE=1.3` | Catastrophic frame-max spikes (91 ms). Don't set. `1.2` is benign-or-slight-win. |
+
+### Where the remaining cost lives
+
+Per-tile telemetry under cache-killer (the `tile/frame …` lines the bench now prints) shows the dominant cost is in `mbgl::MBTilesFileSource` itself, not the loader above it:
+
+1. **Single worker thread per `MBTilesFileSource`** — all ~2.3 net fetches per frame serialise through one thread.
+2. **SQLite per-request statement parse** — `mbtiles_file_source.cpp` builds the SQL string by integer concatenation and constructs a new `mapbox::sqlite::Statement` per tile, throwing away the prepared bytecode every time. Should be cacheable per database.
+3. **Tile decompression** — `util::decompress(*response.data)` runs on the same worker thread; gzipped GB OSM tiles are 1–3 ms each to decompress.
+
+Optimisation candidates we have NOT tried, cheapest first:
+
+- **Pre-decompressed mbtiles.** Re-export the GB data without per-tile gzip compression. Zero code change in the binding; modest disk-size cost. Should remove the 1–3 ms decompression cost per net fetch.
+- **MBTilesFileSource statement cache.** Small mbgl patch (or vendor a replacement `FileSourceType::Mbtiles` factory in the FFI). Steady-state win is probably <1% but it's free perf.
+- **Per-source thread pool.** Replace `MBTilesFileSource`'s single worker with a small pool so the ~2.3 net fetches/frame go in parallel. Bigger change; biggest potential upside.
+
+### Mesa tuning — what we tried, in short
+
+A sweep through `vblank_mode=0`, `mesa_glthread=true`, `MESA_SHADER_CACHE_DIR`, `LP_NUM_THREADS=N`, `MESA_NO_ERROR=1`, `MESA_VK_VERSION_OVERRIDE` produced no robust wins on either workload (3+ replicates each). Initial single-shot results suggested ~+24% from `vblank_mode=0 mesa_glthread=true` but those evaporated on replication and `mesa_glthread=true` introduced 35–55 ms tail-latency spikes (the GL marshalling thread fights the Go scheduler).
+
+**Recommended Mesa env: none.** If you want to A/B in your prod env anyway, do it with N ≥ 5 replicates per config and measure p99 + frame max separately from median FPS. The one solid don't: never set `MESA_VK_VERSION_OVERRIDE=1.3` — frame max spikes 6× in our test.
 
 ## Track A: Dockerfile changes
 
@@ -249,24 +303,45 @@ func (w *worker) renderOne(req ViewportRequest) (*image.NRGBA, error) {
     return nrgbaFromPremultipliedRGBA8(w.buf, info), nil
 }
 
-// Pump cadence: do NOT sleep between RunOnce/PollEvent iterations. The
-// previous jfberry-binding renderer earned a 2-4x p50 reduction by pumping
-// mln_runtime_run_once as aggressively as the scheduler allowed. A 1ms sleep
-// (which seems harmless) puts a hard floor on per-frame latency that's
-// roughly the sleep duration; combined with the natural arrival jitter of
-// the MapStillImageFinished event, you lose 30-50% of the latency budget.
+// Pump cadence: WaitForEvent + drain.
 //
-// runtime.Gosched() yields to the Go scheduler without parking the OS
-// thread, which is what we want — workers pump full-tilt while a still
-// image is in flight, then idle on a request channel between renders.
-// CPU rises to ~100% of one core PER active worker; size the pool with
-// that in mind.
+// WaitForEvent blocks in libuv's epoll_wait until at least one runtime event
+// is queued for PollEvent (or up to the timeout). Spurious libuv-internal
+// wakeups are filtered inside C so they don't roundtrip through cgo; this is
+// the primitive you want when the next step is always "drain events".
+//
+// Do NOT use time.Sleep here. A 1 ms sleep alone gave 191.7 FPS vs ~810
+// with the right pump pattern.
+//
+// runtime.Gosched() works too but busy-spins at 100% of one core per active
+// worker; WaitForEvent parks the thread in epoll_wait. CPU drops to ~30% of
+// one core per worker for the same throughput, which lets you pack more
+// workers into the same CPU quota.
+//
+// Pre-7206a1a, the pump used RunOnce + RunBlocking(10ms-on-idle). That works
+// but pays a cgo crossing per libuv-internal wake; on workloads where
+// non-event wakes outnumber productive events (the rampardos prod
+// measurement was 60:1) those crossings dominate. WaitForEvent removes
+// that overhead. On bench workloads where every wake is productive, the two
+// patterns are equivalent.
 func pumpUntilStillFinished(rt *maplibre.RuntimeHandle, sess *maplibre.RenderSessionHandle, budget time.Duration) error {
     rendered := false
     deadline := time.Now().Add(budget)
     for time.Now().Before(deadline) {
-        if err := rt.RunOnce(); err != nil {
-            return fmt.Errorf("RunOnce: %w", err)
+        remaining := time.Until(deadline)
+        if remaining <= 0 {
+            break
+        }
+        // Cap each wait at 10 ms so other lifecycle checks (cancellation,
+        // health probes from the pool) can fire periodically. WaitForEvent's
+        // internal loop already bounds the wait correctly; this outer cap
+        // is just a heartbeat granularity.
+        wait := remaining
+        if wait > 10*time.Millisecond {
+            wait = 10 * time.Millisecond
+        }
+        if _, err := rt.WaitForEvent(wait); err != nil {
+            return fmt.Errorf("WaitForEvent: %w", err)
         }
         for {
             ev, err := rt.PollEvent()
@@ -295,7 +370,6 @@ func pumpUntilStillFinished(rt *maplibre.RuntimeHandle, sess *maplibre.RenderSes
                 return fmt.Errorf("still image failed: %s", ev.Message)
             }
         }
-        runtime.Gosched()
     }
     return fmt.Errorf("render still timed out after %s", budget)
 }
@@ -371,7 +445,11 @@ docker run --rm \
   /opt/rampardos/bin/rampardos --help
 ```
 
-For real perf comparison, use `rampardos-rust-poc/rampardos-render-worker-rs/scripts/backend-bench.sh` — it already has a `BACKEND=vulkan|opengl` matrix for the Rust worker. Add the Go worker the same way (separate `--go-binary` per backend, pointing at the relevant container's binary or at `bench-vulkan` / `bench-opengl` host binaries). The bench docs at `/Users/james/GolandProjects/maplibre-native-go/docs/bench-go-worker.md` describe the protocol.
+For real perf comparison, two complementary harnesses:
+
+1. **`github.com/jfberry/maplibre-bench-opengl`** — standalone Go bench dedicated to the upstream binding. Drives the same workload as the rampardos renderer (klokantech-basic + GB OSM mbtiles, same z15 viewport) but isolates the per-frame cost from the rampardos orchestrator overhead. Has a `--walk-mode random-gb` cache-killer mode that defeats mbgl's in-memory tile cache (mimics tile-server traffic where successive requests have no temporal coherence) and prints per-frame tile-action telemetry. **Use this as the reference for perf changes** — it's where the numbers in the perf table above came from. `make uk-walk` runs the linear-walk default; override `BENCH_ARGS` for cache-killer.
+
+2. **`rampardos-rust-poc/rampardos-render-worker-rs/scripts/backend-bench.sh`** — drives the orchestrator + worker E2E. Already has a `BACKEND=vulkan|opengl` matrix for the Rust worker. Extend the Go worker branch the same way (separate `--go-binary` per backend, pointing at the relevant container's binary). The bench docs at `/Users/james/GolandProjects/maplibre-native-go/docs/bench-go-worker.md` describe the worker protocol.
 
 ## Production deployment
 
@@ -380,9 +458,25 @@ Two images per build (`*:opengl-<sha>`, `*:vulkan-<sha>`). To deploy:
 1. Pull whichever image to the prod host.
 2. Set in the orchestrator (k8s/compose/systemd):
    - `RENDERER_BACKEND=go-pool` (or whatever existing var picks the in-process renderer)
-   - `RENDERER_GPU_BACKEND=opengl`
+   - `RENDERER_GPU_BACKEND=opengl` (or `vulkan`)
    - `EGL_PLATFORM=surfaceless` (always, for headless containers)
 3. **Do NOT** set `LIBGL_ALWAYS_SOFTWARE=true` in prod unless you want to force the software path. Without it, EGL picks the first ICD it finds, which on a host with a real GPU + drivers will be hardware-accelerated.
+4. **Required** prod env (no measurable tradeoffs):
+   ```
+   EGL_PLATFORM=surfaceless          # OpenGL builds only
+   ```
+5. **Optional** env vars — A/B test in *your* prod env before shipping; none of these reproduced as wins under replication on the dev stack, but workloads differ. See "What we tried that didn't help" above for context.
+   ```
+   # If you want to experiment, do it one at a time with N ≥ 5 replicates,
+   # measuring p50 + p99 + frame max separately.
+   MLN_FFI_RESOURCE_LOADER=bypass    # synchronous MainResourceLoader
+   ```
+
+**Do not** set:
+- `MESA_VK_VERSION_OVERRIDE=1.3` — frame max ballooned 6× in our test.
+- `LIBGL_ALWAYS_SOFTWARE=true` in prod unless forcing the software path.
+- `MESA_NO_ERROR=1` — small consistent regression.
+- `mesa_glthread=true` — adds 5–7× tail-latency jitter.
 
 Pre-flight check on the prod machine before rolling out:
 
