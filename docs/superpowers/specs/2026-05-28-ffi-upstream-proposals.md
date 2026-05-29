@@ -19,12 +19,19 @@ rampardos's per-render-breakdown Prometheus histograms (see commit
 | 1 | Drop `context.finish()` in `OpenGLTextureRenderableResource::swap()` | ✅ landed in jfberry@8ea3345 | combined w/ #2: −2 ms p50, large p99 win | **HIGH** |
 | 2 | `ContextMode::Shared` → `Unique` in `OpenGLTextureBackend` | ✅ landed in jfberry@8ea3345 | combined w/ #1 | **HIGH** |
 | 3 | `AttachOpenGLOffscreen` — renderbuffer-backed FBO session variant | ✅ landed in jfberry@856d5ae | ~1-2 ms p50 scale=2; mostly API cleanliness | **MEDIUM** |
-| 4 | `mln_runtime_run_blocking` — `uv_run(UV_RUN_ONCE)` exposed | ⏳ requested, not built | expected ~6-10 ms p50 (closes remaining gap) | **HIGH (key)** |
+| 4 | `mln_runtime_run_blocking` → superseded by `mln_runtime_wait_for_event` (filtered, blocking) | ✅ landed in jfberry@7206a1a (run_blocking dfd7091 was worse, replaced) | partial — removed busy-poll, but per-frame crossings remain | **HIGH** |
 | 5 | File-source bypass / custom `ResourceLoader` provider | ❌ cancelled — instrumentation showed 0.09 ms/render | ~0 in our workload | **LOW** for us |
+| 6 | Render-update event coalescing in the runtime queue | ✅ landed in jfberry@9b349e1 | reduces raw event spam (cgo `PollEvent` crossings); no per-frame draw reduction | **MEDIUM** |
+| 7 | **Blocking render-to-completion primitive** (`mln_map_render_still_blocking`) | ⏳ proposed 2026-05-29 | expected: large p99 win, modest warm p50, removes scheduler-contention fragility | **HIGH (architectural)** |
 
 Cumulative spike progress: Go p50 scale=1 from **34 ms** (baseline)
-to **28 ms** (after #1+#2+#3). Node baseline is 20 ms. Expected
-after #4: **~16-18 ms**, closing the gap and likely beating Node.
+to **~26 ms** (after #1+#2+#3+#4). Node baseline is 20 ms. #6
+(coalescing) lands the raw-event-spam reduction but **does not**
+reduce the number of Go-driven progressive draws. #7 is the
+architectural fix: it moves the entire render loop back into C++
+(matching how Node's binding behaves), eliminating per-frame cgo
+crossings. Warm-load validation pending before pinning the
+rampardos switch-over.
 
 ## #1 — Drop `context.finish()` in texture-session `swap()`
 
@@ -265,6 +272,190 @@ cases with cold-cache or very-many-tile workloads (offline render
 farms, batch tile pre-rendering), where file-source work might
 actually be the bottleneck. **Not part of our spike's upstream pitch
 based on rampardos's measured workload.**
+
+## #6 — Render-update event coalescing in the runtime queue
+
+**Status:** Landed in `jfberry/maplibre-native-ffi@9b349e1`.
+
+**Change:** The FFI's frontend `update()` (`src/map/map.cpp:304-309`)
+pushed a `MLN_RUNTIME_EVENT_MAP_RENDER_UPDATE_AVAILABLE` event on
+**every** mbgl `update()` call. Now coalesces: one event per map per
+pump cycle until drained, matching mbgl's `HeadlessFrontend::update()`
+which coalesces implicitly via `uv_async_send` (idempotent across
+multiple sends-before-pump).
+
+**Measured impact (FFI bench, EGL):** byte-identical output;
+cold-frame raw events drop 12→5 (z3) / 14→5 (z5); warm frames stay
+at 1; `StillImageFinished` always fires.
+
+**Why it's only a partial fix:** This reduces the number of *events*
+sitting in the queue, which reduces Go-side `PollEvent` cgo
+crossings. It does **not** reduce the number of *draws*: each genuine
+progressive frame (tiles arriving) still requires Go to call back in
+via `mln_texture_render_update`. rampardos's pump already coalesced
+multiple events per drain into one `RenderUpdate()` call, so the
+observable rampardos metric (`pump_render_update_count`, which counts
+`RenderUpdate` *calls*, not raw events) is unchanged by this. The
+real per-frame-crossing cost is addressed by #7.
+
+**Upstream pitch:** Strict alignment with `HeadlessFrontend`'s
+coalescing semantics. Strictly additive — caller contract unchanged
+("render the latest" per event). Good hygiene regardless of #7.
+
+## #7 — Blocking render-to-completion primitive (KEY ARCHITECTURAL REQUEST)
+
+**Status:** Proposed 2026-05-29. Not yet implemented.
+
+**The architectural problem.** The FFI decomposed mbgl's internal
+render loop and lifted the per-frame draw orchestration across the
+language boundary into the caller. Stock mbgl drives the whole render
+to completion in C++:
+
+```cpp
+// platform/default/src/mbgl/gfx/headless_frontend.cpp
+void HeadlessFrontend::update(updateParameters_) {
+    updateParameters = updateParameters_;
+    if (invalidateOnUpdate) asyncInvalidate.send();   // → renderFrame() → renderer->render(), C++-side
+}
+
+HeadlessFrontend::RenderResult HeadlessFrontend::render(Map& map) {
+    map.renderStill([&](auto e){ result.image = backend->readStillImage(); });
+    while (!result.image.valid() && !error)
+        util::RunLoop::Get()->runOnce();   // ← every progressive redraw happens in here, C++
+    return result;                          // ← finished image, ONE call out
+}
+```
+
+The FFI's frontend instead does **not** self-draw — `update()`
+(`src/map/map.cpp:304-309`) stores the params and pushes an event to
+the caller, requiring the caller to call `mln_texture_render_update`
+to actually draw:
+
+```cpp
+void update(std::shared_ptr<mbgl::UpdateParameters> update) override {
+    const std::scoped_lock lock(latest_update_mutex_);
+    latest_update_ = std::move(update);
+    mln::core::push_runtime_map_event(runtime_, map_, MLN_RUNTIME_EVENT_MAP_RENDER_UPDATE_AVAILABLE);
+}
+```
+
+So a downstream caller must run the pump itself:
+`request_still_image` → loop { `run_once`/`wait_for_event` →
+`poll_event` → on `RENDER_UPDATE_AVAILABLE` call
+`texture_render_update` } until `STILL_IMAGE_FINISHED`. A cold render
+with ~18 progressive frames = ~18 round trips across the boundary,
+each with caller-side scheduler overhead (for Go: a goroutine
+park/unpark per `wait_for_event`). The Node binding pays **none** of
+this — `node_map.cpp:539-548` calls `map->renderStill(cb)` once and
+gets exactly one completion callback; the entire update→renderFrame
+loop stays in C++ on the libuv loop.
+
+This is the root cause of the whole pump-tuning saga (#4, RunBlocking,
+Gosched experiments, WaitForEvent filtering, #6 coalescing): all of it
+is overhead created by pulling mbgl's internal loop across the cgo
+boundary.
+
+**Proposed C ABI** (add alongside `mln_map_request_still_image`):
+
+```c
+/**
+ * Renders a still image to completion synchronously, returning only
+ * when the still is finished or the timeout expires. Internally runs
+ * the runtime's RunLoop to completion (mbgl HeadlessFrontend::render
+ * pattern): the frontend self-draws into the attached render target
+ * via its invalidate handler — NO per-frame MAP_RENDER_UPDATE_AVAILABLE
+ * events are emitted, and the caller does NOT call
+ * mln_texture_render_update during this call.
+ *
+ * On success the finished frame is left in the attached render target
+ * exactly as if the caller had driven the pump to STILL_IMAGE_FINISHED;
+ * the caller then reads it back with the existing readback API
+ * (mln_texture_session_read_premultiplied_rgba8_into etc.).
+ *
+ * timeout_ms == 0       : sentinel for "no timeout", block until done.
+ * timeout_ms  > 0       : return MLN_STATUS_TIMEOUT if not finished in time.
+ *
+ * Threading: must be called from the runtime owner thread (same
+ * constraint as mln_runtime_run_once). Blocks that thread for the
+ * full render — intended for a worker-pool-per-thread model where the
+ * caller already blocks the thread on the render anyway.
+ */
+MLN_API mln_status mln_map_render_still_blocking(
+    mln_map* map,
+    uint64_t timeout_ms
+) MLN_NOEXCEPT;
+```
+
+Go binding addition:
+
+```go
+// RenderStillBlocking renders to completion in C++ with no per-frame
+// cgo crossings. Replaces the request_still_image + WaitForEvent +
+// PollEvent + RenderUpdate pump loop with one call.
+func (m *Map) RenderStillBlocking(timeout time.Duration) error
+```
+
+**Implementation sketch.** Mirror `HeadlessFrontend::render`. The FFI
+frontend needs a mode flag so its `update()` calls
+`asyncInvalidate.send()` (self-draw into the owned texture/offscreen
+via the existing `renderFrame`/`texture_render_update` path) instead
+of pushing the event, for the duration of a blocking render. Then:
+
+```cpp
+auto render_still_blocking(mln_map* map, uint64_t timeout_ms) -> mln_status {
+    // enter blocking mode: update() self-draws, no events pushed
+    map->frontend->setInvalidateOnUpdate(true);   // or equivalent FFI mode flag
+    bool done = false; std::exception_ptr err;
+    map->map->renderStill([&](std::exception_ptr e){ if (e) err = e; done = true; });
+    const auto deadline = /* now + timeout_ms, or none */;
+    while (!done && !err) {
+        if (timed_out(deadline)) return MLN_STATUS_TIMEOUT;
+        runtime->run_loop->runOnce();   // drives asyncInvalidate → renderFrame internally
+    }
+    map->frontend->setInvalidateOnUpdate(false);   // restore event-push mode
+    if (err) { set_thread_error_from(err); return MLN_STATUS_RENDER_ERROR; }
+    return MLN_STATUS_OK;   // frame is in the render target; caller reads back
+}
+```
+
+The owned-texture / offscreen render target draw already happens in
+`renderFrame` for stock `HeadlessFrontend`; the FFI just needs its
+texture-session `renderFrame` equivalent invoked from the
+`asyncInvalidate` handler rather than from the caller. Estimated a
+modest C++ change (mode flag + the blocking entry point) plus the Go
+binding.
+
+**Expected impact (to be validated under warm load before rampardos
+switches over):**
+
+- *Cold / progressive renders (p99 tail):* large — ~18 boundary round
+  trips + ~18 goroutine wakes collapse to 1 call.
+- *Warm renders (the ~20 ms p50 target):* modest in absolute terms —
+  `pump_render_update_count ≈ 1` warm, so only ~1-2 crossings saved.
+  The warm render is dominated by the llvmpipe `renderer->render()`
+  draw + readback, which Node pays identically. Any residual warm
+  p50 gap to Node after this is **not** the pump — it's GL draw cost
+  or caller-side per-request overhead, and must be localized
+  separately.
+- *Robustness:* removes the scheduler-contention sensitivity that
+  made Gosched/RunBlocking pumps fragile under multi-tenant load
+  (~18 µs/wake under contention). Fewer goroutine wakes per render →
+  less load-dependent jitter even warm.
+
+**Relationship to #6:** Coalescing becomes a no-op *inside* a
+blocking render (no events cross to the caller) but stays correct and
+useful for the event-driven path. #7 doesn't obsolete #6; it offers a
+second, lower-overhead render mode.
+
+**Upstream pitch:** This is the natural "give me a render and wait"
+primitive every non-libuv-native binding (Go, Rust, Zig, Swift, C#)
+wants, and it already exists inside mbgl as
+`HeadlessFrontend::render`. The FFI currently only exposes the
+decomposed event-driven pump, which is the right tool when the caller
+integrates the runtime as a guest in its own event loop, but forces
+per-frame boundary crossings on the common synchronous case. Strictly
+additive — no API break; existing `request_still_image` + pump users
+are unaffected.
 
 ## Suggested PR ordering for upstream
 
