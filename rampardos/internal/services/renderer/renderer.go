@@ -87,7 +87,13 @@ type Config struct {
 	WorkerLifetime int           // max renders per worker before recycling (default: 500)
 	StartupTimeout time.Duration // max time to wait for a worker handshake (default: 10s)
 
-	// BlockingRender selects the go-pool render path (default: true).
+	// BlockingRender selects the go-pool render path (default: false).
+	// Default is false because FFI a5b5816's mln_map_render_still_blocking
+	// adds a fixed ~1-2s/render post-completion wake stall (its blocking
+	// runOnce loop doesn't uv_async_send when the still finishes, so it
+	// parks until the next periodic timer). Prod measurement: scale=2 p50
+	// jumped from ~35ms (event pump) to ~1-2s. Re-enable once the FFI
+	// wakes the loop on completion (Node does this via uv_async_send).
 	// When true, renderOne calls the FFI's mln_map_render_still_blocking
 	// — the runtime RunLoop is driven to completion in C, the frontend
 	// self-draws each progressive frame, and no per-frame events cross
