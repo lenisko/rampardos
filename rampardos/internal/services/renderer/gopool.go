@@ -186,6 +186,7 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 		styleURL:        "file://" + preparedPath,
 		startupTimeout:  r.cfg.StartupTimeout,
 		renderTimeout:   r.cfg.RenderTimeout,
+		blockingRender:  r.cfg.BlockingRender,
 	}
 	return newGoStylePool(cfg)
 }
@@ -304,6 +305,7 @@ type goStylePoolConfig struct {
 	styleURL        string // "file://<preparedPath>"
 	startupTimeout  time.Duration
 	renderTimeout   time.Duration
+	blockingRender  bool
 }
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
@@ -632,12 +634,26 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		return nil, fmt.Errorf("renderer: camera: %w", err)
 	}
 
-	if err := w.m.RequestStillImage(); err != nil {
-		return nil, fmt.Errorf("renderer: request still image: %w", err)
-	}
-
-	if err := w.pumpUntilStillFinished(ctx, w.pool.cfg.renderTimeout); err != nil {
-		return nil, err
+	if w.pool.cfg.blockingRender {
+		// Single cgo call: the FFI drives the runtime RunLoop to
+		// completion and self-draws each progressive frame into the
+		// session — no WaitForEvent/PollEvent/RenderUpdate round trips.
+		// timeoutMs==0 would block forever, so floor at 1ms; renderTimeout
+		// is always >0 (defaulted in newGoStylePool).
+		timeoutMs := uint64(w.pool.cfg.renderTimeout.Milliseconds())
+		if timeoutMs == 0 {
+			timeoutMs = 1
+		}
+		if err := w.m.RenderStillBlocking(timeoutMs); err != nil {
+			return nil, fmt.Errorf("renderer: render still blocking: %w", err)
+		}
+	} else {
+		if err := w.m.RequestStillImage(); err != nil {
+			return nil, fmt.Errorf("renderer: request still image: %w", err)
+		}
+		if err := w.pumpUntilStillFinished(ctx, w.pool.cfg.renderTimeout); err != nil {
+			return nil, err
+		}
 	}
 
 	physW := vp.Width * scale

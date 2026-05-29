@@ -87,6 +87,17 @@ type Config struct {
 	WorkerLifetime int           // max renders per worker before recycling (default: 500)
 	StartupTimeout time.Duration // max time to wait for a worker handshake (default: 10s)
 
+	// BlockingRender selects the go-pool render path (default: true).
+	// When true, renderOne calls the FFI's mln_map_render_still_blocking
+	// — the runtime RunLoop is driven to completion in C, the frontend
+	// self-draws each progressive frame, and no per-frame events cross
+	// back to Go (matches the Node binding's architecture). When false,
+	// renderOne uses the event-driven pump (RequestStillImage +
+	// WaitForEvent/PollEvent/RenderUpdate). Kept as a fallback so the
+	// two paths can be A/B compared without a rebuild. Ignored by
+	// non-go-pool backends.
+	BlockingRender bool
+
 	// Asset paths resolved to absolute paths at load time.
 	StylesDir   string // e.g. "TileServer/Styles"
 	FontsDir    string // e.g. "TileServer/Fonts"

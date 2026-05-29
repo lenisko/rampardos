@@ -60,7 +60,7 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
 ARG MLN_FFI_REPO=https://github.com/jfberry/maplibre-native-ffi
-ARG MLN_FFI_REV=9b349e12beeb732575b1227f09e0f866b67b13f0
+ARG MLN_FFI_REV=a5b58168c0fce7d580efdc7fa52bc3d6d67972d5
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
