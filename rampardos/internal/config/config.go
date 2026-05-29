@@ -23,7 +23,7 @@ type Config struct {
 	RendererRenderTimeout  time.Duration // per-render deadline
 	RendererWorkerLifetime int           // renders per worker before recycle
 	RendererStartupTimeout time.Duration // max handshake wait
-	RendererBlockingRender bool          // go-pool: use FFI blocking render-to-completion. Default false — FFI a5b5816's blocking loop adds a fixed ~1-2s/render post-completion wake stall (does not uv_async_send on done). Re-enable once the FFI wakes the loop on completion.
+	RendererBlockingRender bool          // go-pool: use FFI blocking render-to-completion (default true; FFI 2209a5c fixed the ~1-2s wake stall — warm render ~9ms). Set false to fall back to the event-driven pump.
 
 	// HTTP client settings
 	HTTPMaxConns int
@@ -93,7 +93,7 @@ func Load() *Config {
 		RendererRenderTimeout:  getEnvSeconds("RENDERER_TIMEOUT_SECONDS", 15),
 		RendererWorkerLifetime: getEnvInt("RENDERER_WORKER_LIFETIME", 500),
 		RendererStartupTimeout: getEnvSeconds("RENDERER_STARTUP_TIMEOUT_SECONDS", 10),
-		RendererBlockingRender: getEnvBool("RENDERER_BLOCKING_RENDER", false),
+		RendererBlockingRender: getEnvBool("RENDERER_BLOCKING_RENDER", true),
 
 		HTTPMaxConns: getEnvInt("HTTP_MAX_CONNS", 100),
 		HTTPTimeout:  getEnvSeconds("HTTP_TIMEOUT_SECONDS", 15), // 0 = unlimited
