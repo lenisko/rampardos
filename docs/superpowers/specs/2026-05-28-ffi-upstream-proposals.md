@@ -25,13 +25,35 @@ rampardos's per-render-breakdown Prometheus histograms (see commit
 | 7 | **Blocking render-to-completion primitive** (`mln_map_render_still_blocking`) | ⏳ proposed 2026-05-29 | expected: large p99 win, modest warm p50, removes scheduler-contention fragility | **HIGH (architectural)** |
 
 Cumulative spike progress: Go p50 scale=1 from **34 ms** (baseline)
-to **~26 ms** (after #1+#2+#3+#4). Node baseline is 20 ms. #6
-(coalescing) lands the raw-event-spam reduction but **does not**
-reduce the number of Go-driven progressive draws. #7 is the
-architectural fix: it moves the entire render loop back into C++
-(matching how Node's binding behaves), eliminating per-frame cgo
-crossings. Warm-load validation pending before pinning the
-rampardos switch-over.
+→ **~31 ms** (event pump, #1+#2+#3+#4+#6) → **~24 ms** (#7 blocking
+render, FFI `2209a5c`). Node baseline is ~20 ms. **Effective parity
+reached** on a different machine (Intel VPS) under real load.
+
+**Final warm prod measurement (N=479 scale=1, N=1050 scale=2,
+RENDERER_BLOCKING_RENDER=true, MLN_FFI_RESOURCE_LOADER=bypass):**
+
+| metric | event pump | blocking (#7) | Node |
+|---|---|---|---|
+| scale=1 p50 | ~31 ms | **~24 ms** | ~20 ms |
+| scale=1 p99 | ~242 ms | **~136 ms** | — |
+| scale=2 p50 | ~35 ms | **~31 ms** | — |
+| scale=2 p99 | ~175 ms | **~148 ms** | — |
+
+#7 improved p50 **and** p99 on both scales (no tail regression).
+7.5% of scale=1 renders came in ≤10 ms (the warm single-draw path);
+an isolated warm `RenderStillBlocking` measured ~9 ms FFI-side.
+
+**Residual ~4 ms to Node:** the floor is mbgl tile-IO + parse/layout
+wait (~23 ms cumulative `pump_sleep` on the event path), which #7
+does not touch. `MLN_FFI_RESOURCE_LOADER=bypass` is already enabled,
+so the ResourceLoader actor hop is already gone — but bypass still
+delegates to mbgl's `MBTilesFileSource`, which keeps its own worker
+thread **and** non-prepared SQL per query. Node sidesteps both via
+`NodeFileSource` → `better-sqlite3` (prepared statements). Closing
+this would require an upstream mbgl prepared-statement change or a
+Go-side direct-mbtiles reader; not pursued — unconfirmed gain
+(SQLite may be only 2-3 ms of the 23 ms), deep work, parity already
+met.
 
 ## #1 — Drop `context.finish()` in texture-session `swap()`
 
