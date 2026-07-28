@@ -252,7 +252,11 @@ RUN apt-get update \
     # maplibre-native (Go binding via FFI) runtime deps — Mesa EGL with
     # the llvmpipe software DRI driver for fully headless render. EGL
     # surfaceless platform is selected via EGL_PLATFORM=surfaceless below.
-    libegl-mesa0 libgl1-mesa-dri \
+    # libgles2 provides libGLESv2.so.2: upstream's EGL build links it
+    # directly (DT_NEEDED on libmaplibre-native-c.so), where the previous
+    # fork build did not — without it the binary fails at load with
+    # "libGLESv2.so.2: cannot open shared object file".
+    libegl-mesa0 libgl1-mesa-dri libgles2 \
     # maplibre-native common deps
     libcurl4 libjpeg8 libwebp7 libpng16-16 libicu74 \
     libuv1 \
