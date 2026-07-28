@@ -150,12 +150,14 @@ func newEGLContext() (*eglContext, error) {
 // alive. Caller must keep the *eglContext referenced for the lifetime
 // of the RenderSession that uses it.
 func (c *eglContext) descriptor() maplibre.OpenGLContextDescriptor {
-	return maplibre.NewOpenGLContextEGL(maplibre.EglContextDescriptor{
-		Display:        maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.display))),
-		Config:         maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.config))),
-		ShareContext:   maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.share_context))),
-		GetProcAddress: maplibre.NativePointer(uintptr(C.mln_go_egl_get_proc_address())),
-	})
+	return maplibre.OpenGLContextDescriptor{
+		EGL: &maplibre.EGLContextDescriptor{
+			Display:        maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.display))),
+			Config:         maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.config))),
+			ShareContext:   maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.share_context))),
+			GetProcAddress: maplibre.NativePointer(uintptr(C.mln_go_egl_get_proc_address())),
+		},
+	}
 }
 
 func (c *eglContext) close() {

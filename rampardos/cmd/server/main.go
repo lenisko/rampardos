@@ -102,7 +102,6 @@ func main() {
 		RenderTimeout:  cfg.RendererRenderTimeout,
 		WorkerLifetime: cfg.RendererWorkerLifetime,
 		StartupTimeout: cfg.RendererStartupTimeout,
-		BlockingRender: cfg.RendererBlockingRender,
 		StylesDir:      absPath("TileServer/Styles"),
 		FontsDir:       absPath("TileServer/Fonts"),
 		MbtilesFile:    absPath("TileServer/Datasets/Combined.mbtiles"),

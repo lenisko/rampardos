@@ -186,7 +186,6 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 		styleURL:        "file://" + preparedPath,
 		startupTimeout:  r.cfg.StartupTimeout,
 		renderTimeout:   r.cfg.RenderTimeout,
-		blockingRender:  r.cfg.BlockingRender,
 	}
 	return newGoStylePool(cfg)
 }
@@ -305,7 +304,6 @@ type goStylePoolConfig struct {
 	styleURL        string // "file://<preparedPath>"
 	startupTimeout  time.Duration
 	renderTimeout   time.Duration
-	blockingRender  bool
 }
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
@@ -560,14 +558,16 @@ func (w *goWorker) init() error {
 		return fmt.Errorf("renderer: new map: %w", err)
 	}
 
-	// AttachOpenGLOffscreen: framebuffer with a renderbuffer color
-	// attachment (no exposed texture handle). Matches mbgl's
-	// HeadlessBackend layout, which the Node binding uses — avoids the
-	// texture-attached FBO's per-render sync overhead on Mesa software
-	// stacks. We only need CPU readback via
-	// RenderSessionHandle.ReadPremultipliedRGBA8Into, so the texture
-	// handle the owned-texture path exposed was never used anyway.
-	w.sess, err = w.m.AttachOpenGLOffscreen(maplibre.OpenGLOffscreenDescriptor{
+	// Session-owned texture. We never call AcquireOpenGLTextureFrame —
+	// output leaves via CPU readback (ReadPremultipliedRGBA8Into) — and
+	// that is exactly the path upstream optimised in FFI #398: the
+	// texture session's swap() only issues glFinish() for *caller-owned*
+	// (borrowed) textures, which are handed back every frame. A
+	// session-owned texture defers its GPU completion to acquire-frame,
+	// and CPU readback fences on glReadPixels instead. So this attach
+	// gets the per-frame glFinish removed without the cross-context
+	// hazard that made removing it outright unsafe (see FFI #281).
+	w.sess, err = w.m.AttachOpenGLOwnedTexture(maplibre.OpenGLOwnedTextureDescriptor{
 		Extent: maplibre.RenderTargetExtent{
 			Width:       w.curW,
 			Height:      w.curH,
@@ -576,7 +576,7 @@ func (w *goWorker) init() error {
 		Context: w.egl.descriptor(),
 	})
 	if err != nil {
-		return fmt.Errorf("renderer: attach OpenGL offscreen render target: %w", err)
+		return fmt.Errorf("renderer: attach OpenGL owned texture render target: %w", err)
 	}
 
 	// Set style URL but don't wait for the style-loaded event in init.
@@ -634,26 +634,11 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		return nil, fmt.Errorf("renderer: camera: %w", err)
 	}
 
-	if w.pool.cfg.blockingRender {
-		// Single cgo call: the FFI drives the runtime RunLoop to
-		// completion and self-draws each progressive frame into the
-		// session — no WaitForEvent/PollEvent/RenderUpdate round trips.
-		// timeoutMs==0 would block forever, so floor at 1ms; renderTimeout
-		// is always >0 (defaulted in newGoStylePool).
-		timeoutMs := uint64(w.pool.cfg.renderTimeout.Milliseconds())
-		if timeoutMs == 0 {
-			timeoutMs = 1
-		}
-		if err := w.m.RenderStillBlocking(timeoutMs); err != nil {
-			return nil, fmt.Errorf("renderer: render still blocking: %w", err)
-		}
-	} else {
-		if err := w.m.RequestStillImage(); err != nil {
-			return nil, fmt.Errorf("renderer: request still image: %w", err)
-		}
-		if err := w.pumpUntilStillFinished(ctx, w.pool.cfg.renderTimeout); err != nil {
-			return nil, err
-		}
+	if err := w.m.RequestStillImage(); err != nil {
+		return nil, fmt.Errorf("renderer: request still image: %w", err)
+	}
+	if err := w.pumpUntilStillFinished(ctx, w.pool.cfg.renderTimeout); err != nil {
+		return nil, err
 	}
 
 	physW := vp.Width * scale
@@ -686,22 +671,23 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // pumpUntilStillFinished drives the runtime event loop until the
 // current still-image render completes (or the budget expires).
 //
-// Uses WaitForEvent: the FFI internally loops uv_run(UV_RUN_ONCE)
-// until a runtime event is queued (drainable by PollEvent), or
-// until timeout. All libuv-internal wake-ups are absorbed in C
-// without crossing back to Go, so each WaitForEvent return
-// corresponds to actual runtime-event work for us to do.
+// Pump parks the OS thread until the runtime has work — a wake flag
+// latched by style/tile/offline/resource responses and by queued
+// runtime events — then drains the owner-thread task queues. It
+// returns without parking while unread events are already queued, so
+// the loop never sleeps on work it could be doing.
 //
-// The earlier RunBlocking variant wakes on every libuv tick (not
-// just runtime-event-producing ones); prod measurement showed
-// ~968 wake-ups per render of which ~15 (1.5%) actually had a
-// runtime event. Each spurious wake paid a cgo round-trip + Go
-// scheduler hop. WaitForEvent removes those by filtering in C.
+// This replaced a sleep-backoff pump, which was the real cost in the
+// pre-upstream design: mbgl's frontend update() queues to the
+// runtime's event queue, not libuv's, so a non-blocking run_once
+// returned having advanced nothing and the caller had to sleep. At
+// ~15 iterations per cold render a ~0.5-1 ms sleep each, that was
+// most of the measured per-render gap — three orders of magnitude
+// more than the cgo crossings themselves (~50-100 ns each).
 //
-// pumpSleep metric below measures cumulative time spent inside
-// WaitForEvent — this is real mbgl I/O wait (worker threads
-// parsing tiles, file source SQLite queries, etc.), not userspace
-// scheduling overhead.
+// pumpSleep below measures cumulative time inside Pump, which is now
+// genuine mbgl I/O wait (worker threads parsing tiles, file-source
+// queries) rather than scheduler backoff.
 func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Duration) error {
 	rendered := false
 	deadline := time.Now().Add(budget)
@@ -731,34 +717,24 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		}
 		iterations++
 
-		// Block in C-side loop driving libuv until a runtime event is
-		// queued (drainable by PollEvent) or budget expires. cgo
-		// returns once per runtime event, not once per libuv tick —
-		// spurious-wake filter is in C (FFI runtime->events.empty()
-		// under the same lock as the producer).
+		// Park until the runtime has work, bounded by the remaining
+		// budget so the outer deadline check stays authoritative.
 		blockStart := time.Now()
-		hadEvent, err := w.rt.WaitForEvent(remaining)
+		err := w.rt.Pump(remaining)
 		totalSleep += time.Since(blockStart)
 		if err != nil {
-			return fmt.Errorf("renderer: WaitForEvent: %w", err)
-		}
-		if !hadEvent {
-			// timer fired with no work — outer check will return
-			// timeout on next loop iteration.
-			continue
+			return fmt.Errorf("renderer: pump: %w", err)
 		}
 
-		// Drain all events from this WaitForEvent return. Coalesce
-		// multiple RenderUpdateAvailable events into a SINGLE
-		// sess.RenderUpdate() call — mbgl's HeadlessFrontend
-		// (the path the Node binding uses) does this implicitly via
-		// libuv's uv_async_send coalescing: AsyncTask::send is
-		// idempotent across multiple sends-before-pump, firing the
-		// renderFrame callback once with the latest updateParameters.
-		// Each updateParameters_ supersedes the previous, so calling
-		// RenderUpdate per emitted event is doing N redundant draws
-		// where Node does 1. Prod measurement under WaitForEvent:
-		// ~18 events per render × ~0.6ms cgo+GL = ~11ms wasted.
+		// Drain everything this Pump made available, folding any
+		// render-updates into a SINGLE RenderUpdate() call. The runtime
+		// now coalesces render-update events against an unread one at
+		// the queue tail (matching the uv_async_send semantics mbgl's
+		// own HeadlessFrontend gets for free), so this rarely has more
+		// than one to fold — but a render draws the *latest* update, so
+		// collapsing them stays correct regardless and keeps us from
+		// re-drawing successively newer state N times for one frame of
+		// progress.
 		pendingRenderUpdate := false
 		for {
 			ev, err := w.rt.PollEvent()
@@ -779,12 +755,13 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 				// Flush any pending update before finishing.
 				if pendingRenderUpdate {
 					ruStart := time.Now()
-					if err := w.sess.RenderUpdate(); err != nil {
+					drew, err := w.sess.RenderUpdate()
+					if err != nil {
 						return fmt.Errorf("renderer: RenderUpdate: %w", err)
 					}
 					totalRenderUpdate += time.Since(ruStart)
 					renderUpdateCnt++
-					rendered = true
+					rendered = rendered || drew
 					pendingRenderUpdate = false
 				}
 				if !rendered {
@@ -811,15 +788,16 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		}
 		// Drain pass finished without StillImageFinished — flush any
 		// pending render-update so mbgl can make forward progress on
-		// the next WaitForEvent cycle.
+		// the next Pump cycle.
 		if pendingRenderUpdate {
 			ruStart := time.Now()
-			if err := w.sess.RenderUpdate(); err != nil {
+			drew, err := w.sess.RenderUpdate()
+			if err != nil {
 				return fmt.Errorf("renderer: RenderUpdate: %w", err)
 			}
 			totalRenderUpdate += time.Since(ruStart)
 			renderUpdateCnt++
-			rendered = true
+			rendered = rendered || drew
 		}
 	}
 }

@@ -22,7 +22,49 @@ rampardos's per-render-breakdown Prometheus histograms (see commit
 | 4 | `mln_runtime_run_blocking` → superseded by `mln_runtime_wait_for_event` (filtered, blocking) | ✅ landed in jfberry@7206a1a (run_blocking dfd7091 was worse, replaced) | partial — removed busy-poll, but per-frame crossings remain | **HIGH** |
 | 5 | File-source bypass / custom `ResourceLoader` provider | ❌ cancelled — instrumentation showed 0.09 ms/render | ~0 in our workload | **LOW** for us |
 | 6 | Render-update event coalescing in the runtime queue | ✅ landed in jfberry@9b349e1 | reduces raw event spam (cgo `PollEvent` crossings); no per-frame draw reduction | **MEDIUM** |
-| 7 | **Blocking render-to-completion primitive** (`mln_map_render_still_blocking`) | ⏳ proposed 2026-05-29 | expected: large p99 win, modest warm p50, removes scheduler-contention fragility | **HIGH (architectural)** |
+| 7 | **Blocking render-to-completion primitive** (`mln_map_render_still_blocking`) | ❌ closed — superseded by upstream #392 | see "Upstream outcome" below | — |
+
+## Upstream outcome (2026-07-28)
+
+All of this was taken to upstream as issue
+[maplibre/maplibre-native-ffi#280](https://github.com/maplibre/maplibre-native-ffi/issues/280).
+Result:
+
+- **#1/#2 (GL defaults)** — our PR #281 merged the owned-texture
+  `ContextMode::Unique` change. Upstream then finished the job in #398:
+  the borrowed ctor is `Unique` too, and the `glFinish()` question was
+  resolved *properly* — `swap()` now syncs only for **caller-owned**
+  (borrowed) textures, while **session-owned** textures defer completion
+  to acquire-frame. rampardos reads back on the CPU and never acquires,
+  so it gets the per-frame `glFinish` removed safely. Our original
+  "just delete it" patch was **not** safe (it would have broken
+  GPU-interop consumers); the retraction was correct.
+- **#4/#6 (wait-for-event, coalescing)** — landed generically in
+  upstream #392 as `mln_runtime_pump(runtime, timeout_ms)` (parks the
+  owner thread, replaces `run_once`) plus render-update coalescing
+  against an unread event at the queue tail.
+- **#7 (blocking render)** — our PR #282 was **closed**: "closing for
+  #392 which I think solves for the same use case at a lower level".
+
+**Attribution correction.** The #282 pitch led with "~15 round trips
+across the language boundary". That over-attributed the win: a cgo call
+is ~50-100 ns, so ~60 crossings per render is ~6 µs against a measured
+~7 ms delta — three orders of magnitude out. The real mechanisms were
+(a) mbgl's frontend `update()` queues to the *runtime's* event queue,
+not libuv's, so a non-blocking `run_once` advanced nothing and the
+caller had to **sleep** (~15 × ~0.5-1 ms), and (b) rendering per event
+redrew successively newer state N times per frame of progress — real GPU
+work. Both are what #392 fixes. Our own instrumentation already said
+this (`pump_sleep` 22.9 ms, `pump_render_update` 17.9 ms over ~15 draws);
+the PR framing did not follow it.
+
+Upstream's open question, and the reason to re-measure: *"I don't think
+[the round trips are] resulting in a meaningful impact to performance,
+but if you have evidence to the contrary, we can still add the render to
+completion primitive."* rampardos is now ported to upstream `main`
+(`91ecc920`) so a warm prod grab of `viewport_duration` can answer it
+against the recorded baselines: **~24 ms** (blocking primitive),
+**~31 ms** (old event pump), **~20 ms** (Node).
 
 Cumulative spike progress: Go p50 scale=1 from **34 ms** (baseline)
 → **~31 ms** (event pump, #1+#2+#3+#4+#6) → **~24 ms** (#7 blocking

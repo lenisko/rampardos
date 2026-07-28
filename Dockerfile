@@ -59,8 +59,12 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # See scripts/build-mln-ffi.sh for the host-side equivalent.
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
-ARG MLN_FFI_REPO=https://github.com/jfberry/maplibre-native-ffi
-ARG MLN_FFI_REV=2209a5c0097f99dbfbc0feb74a5cfad32843ccd8
+ARG MLN_FFI_REPO=https://github.com/maplibre/maplibre-native-ffi
+ARG MLN_FFI_REV=91ecc920462420f977959d546d2735823d2f0092
+# Keep in sync with the FFI's mise.toml [vars] at MLN_FFI_REV.
+ARG MLN_CMAKE_VERSION=4.3.3
+ARG MLN_RUST_VERSION=1.95.0
+ARG MLN_CARGO_ABOUT_VERSION=0.9.1
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -72,61 +76,80 @@ WORKDIR /ffi
 RUN git clone "${MLN_FFI_REPO}" . \
  && git checkout ${MLN_FFI_REV}
 
-# Bypass mise entirely. The FFI's mise.toml lists tools for every
-# binding (dotnet, Java, Rust, Node, Zig, Python, ...) and mise's
-# auto-install fires during `mise activate` even when we only ask for
-# pixi explicitly — turning every missing tool into a build break
-# (dotnet@10.0.203 needs libicu, Java pulls in 200MB, etc.).
+# Bypass mise entirely. The FFI's root mise.toml pulls a tool per binding
+# (dotnet, Java, Rust, Node, Zig, Python, Swift, ...) and mise auto-installs
+# during activation even when only one is asked for, turning every missing
+# toolchain into a build break. We assemble the C-library toolchain by hand
+# instead — three sources:
 #
-# pixi is the only tool that does real work for the C library build:
-# it provides the C++ env (clang/cmake/ninja) plus the maplibre-native
-# source via submodules. Install it directly from the official script
-# and drive the build with pixi commands.
-RUN curl -fsSL https://pixi.sh/install.sh | bash
-ENV PATH=/root/.pixi/bin:$PATH
+#   * apt      — the project's own Linux bootstrap set, copied from
+#                mise.linux.toml [bootstrap.packages]: system compilers,
+#                EGL/GLES headers, ICU, ninja, pkg-config, glslang.
+#                Upstream dropped pixi (no pixi.toml as of 91ecc92), so the
+#                C/C++ toolchain is now the distro's, and libuv/zlib are
+#                FetchContent-built while ICU is vendored — no conda env
+#                and no library bundling needed downstream.
+#   * Kitware  — CMake, pinned to the version mise pins (vars.cmake_version).
+#                Ubuntu 24.04 ships 3.28; CMakeLists requires >= 4.0.
+#   * rustup   — cargo for the Rust platform layer (ureq HTTP, linked into
+#                the Linux build). Ubuntu's cargo 1.75 cannot parse the
+#                workspace manifest (`resolver = "3"` needs >= 1.84).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    build-essential clang glslang-tools libclang-dev \
+    libegl1-mesa-dev libgles2-mesa-dev libicu-dev \
+    libncurses6 libsqlite3-0 libvulkan-dev \
+    ninja-build pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/opt/cmake/bin:/root/.cargo/bin:$PATH
+
+RUN case "$TARGETARCH" in \
+        arm64) TOOL_ARCH=aarch64;; \
+        amd64) TOOL_ARCH=x86_64;; \
+        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
+    esac \
+ && curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${MLN_CMAKE_VERSION}/cmake-${MLN_CMAKE_VERSION}-linux-${TOOL_ARCH}.tar.gz" -o /tmp/cmake.tgz \
+ && mkdir -p /opt/cmake \
+ && tar -xzf /tmp/cmake.tgz -C /opt/cmake --strip-components=1 \
+ && rm /tmp/cmake.tgz \
+ && cmake --version \
+ && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${MLN_RUST_VERSION}" \
+ && cargo --version \
+ # cargo-about is find_program(... REQUIRED) in cmake/mln_rust.cmake — it
+ # generates the Rust dependency license notices linked into the library,
+ # with no opt-out. Take the pinned prebuilt (static musl) rather than
+ # `cargo install`, which would compile it from source on every build.
+ && curl -fsSL "https://github.com/EmbarkStudios/cargo-about/releases/download/${MLN_CARGO_ABOUT_VERSION}/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl.tar.gz" -o /tmp/cargo-about.tgz \
+ && tar -xzf /tmp/cargo-about.tgz -C /tmp \
+ && install -m 0755 "/tmp/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl/cargo-about" /usr/local/bin/cargo-about \
+ && rm -rf /tmp/cargo-about.tgz "/tmp/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl" \
+ && cargo-about --version
 
 # Fetch the maplibre-native submodule (normally done by mise's
 # postinstall hook).
 RUN git submodule sync --recursive third_party/maplibre-native \
  && git submodule update --init --recursive --depth 1 third_party/maplibre-native
 
-# Install the pixi-managed conda env (clang/cmake/ninja + upstream's
-# CXX deps including pinned libicu/libuv/libjpeg/libwebp/libpng).
-RUN pixi install --locked
-
-# Resolve TARGETARCH (amd64|arm64) → MapLibre variant arch suffix
-# (x64|arm64), select the EGL (OpenGL) variant, stash the variant name.
+# Configure + build + install via the upstream CMake preset. The preset
+# carries the backend/provider cache vars (opengl + egl) and installs into
+# build/<preset>/install, which is the layout the Go binding expects
+# (bindings/go/mise.toml points PKG_CONFIG_PATH at
+# <install>/share/pkgconfig). `cmake --workflow` runs configure+build; the
+# install step is explicit because the workflow preset does not include it.
 RUN case "$TARGETARCH" in \
         arm64) MLN_ARCH=arm64;; \
         amd64) MLN_ARCH=x64;; \
         *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
     esac \
- && MLN_VARIANT="linux-${MLN_ARCH}-egl" \
- && echo "$MLN_VARIANT" > /tmp/mln_variant \
- && cat /tmp/mln_variant
-
-# Configure + build via pixi directly. Replicates `mise run build`
-# from the FFI's [tasks.build] (which is just `cmake --build`
-# preceded by `cmake -S . -B ... -G Ninja -D...`). The env vars
-# (MLN_FFI_VARIANT, MLN_FFI_BUILD_DIR, etc.) are normally injected
-# by .mise/config.<variant>.toml; set them inline since we're not
-# using mise.
-RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
- && BUILD_DIR="build/${MLN_VARIANT}" \
- && pixi run --locked -- cmake -S . -B "$BUILD_DIR" -G Ninja \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DMLN_FFI_RENDER_BACKEND=opengl \
- && pixi run --locked -- cmake --build "$BUILD_DIR" --parallel
-
-# Stable downstream path: symlink build/<variant>/ to build/current/ so
-# later stages don't need to thread the variant name through. The new
-# FFI doesn't emit a pkg-config .pc file (the Go binding consumes the
-# library via CGO_CFLAGS/CGO_LDFLAGS env vars instead of pkg-config),
-# so only assert the .so.
-RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
- && test -f build/${MLN_VARIANT}/libmaplibre-native-c.so \
- && ln -sfn ${MLN_VARIANT} build/current \
- && ls -la build/current/
+ && MLN_PRESET="linux-${MLN_ARCH}-egl" \
+ && echo "$MLN_PRESET" > /tmp/mln_preset \
+ && cmake --workflow --preset "$MLN_PRESET" \
+ && cmake --install "build/${MLN_PRESET}" \
+ && ln -sfn "${MLN_PRESET}/install" build/current \
+ && test -f build/current/lib/libmaplibre-native-c.so \
+ && test -f build/current/share/pkgconfig/maplibre-native-c.pc \
+ && ls -la build/current/lib build/current/share/pkgconfig
 
 # Vendor the Go binding source so the rampardos-build stage can consume it
 # via a go.mod `replace` directive. Bound to the FFI commit → guarantees
@@ -134,44 +157,17 @@ RUN MLN_VARIANT=$(cat /tmp/mln_variant) \
 RUN cp -r bindings/go /vendor-maplibre-go \
  && ls /vendor-maplibre-go | head -20
 
-# The FFI's CMake links the .so against the pixi conda env's libs
-# (libicu 78, libuv 1, libjpeg 8, libwebp 7, libpng16) — versions that
-# don't match Debian Trixie / Ubuntu 24.04 system packages. Without
-# this bundling step, a downstream `ld` against libmaplibre-native-c.so
-# fails to resolve DT_NEEDED entries (libicuuc.so.78, etc.) and the
-# Go build errors out with "undefined reference" linker errors.
-#
-# Strategy: ldd recursively expands the dependency closure, awk filters
-# to entries living under /ffi/.pixi/, cp -L dereferences any symlinks
-# so the destination filename matches the DT_NEEDED soname directly.
-# Bundled libs land alongside libmaplibre-native-c.so in build/current/,
-# so both -L${libdir} from pkg-config and the dynamic linker's view of
-# the .so's transitive deps resolve in one place.
-RUN BUILD=build/current \
- && for lib in $(LD_LIBRARY_PATH=/ffi/.pixi/envs/default/lib ldd ${BUILD}/libmaplibre-native-c.so | awk '/=> .*pixi/ {print $3}'); do \
-        cp -L "$lib" ${BUILD}/; \
-    done \
- && ls -la ${BUILD}/*.so*
-
-# RPATH the bundled .so to find its transitive deps via $ORIGIN (its
-# own directory) at load time, regardless of where the runtime image
-# places the bundle. Without this, the runtime image had to register
-# /opt/rampardos/lib with ldconfig, which shadowed Ubuntu's system
-# libraries (libpng/libjpeg/libuv/libicu) for ALL processes — so the
-# Node binding's mbgl.node crashed on libpng version mismatch when
-# RENDERER_BACKEND=node-pool was selected. RPATH-on-the-.so keeps the
-# bundle invisible to anything that doesn't load libmaplibre-native-c.so.
+# Point the .so at its own directory so any transitive private deps resolve
+# without registering a global ldconfig path (which previously shadowed
+# system libpng/libjpeg for the Node binding when RENDERER_BACKEND=node-pool).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends patchelf binutils \
  && rm -rf /var/lib/apt/lists/* \
- && set -x \
- && for lib in build/current/*.so*; do \
-        patchelf --set-rpath '$ORIGIN' "$lib" \
-          || echo "WARN: patchelf failed on $lib"; \
+ && for lib in build/current/lib/*.so*; do \
+        patchelf --set-rpath '$ORIGIN' "$lib" || echo "WARN: patchelf failed on $lib"; \
     done \
- && set +x \
- && echo "--- libmaplibre-native-c.so DT_RUNPATH/DT_RPATH ---" \
- && readelf -d build/current/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
+ && echo "--- libmaplibre-native-c.so dynamic deps ---" \
+ && readelf -d build/current/lib/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
 # ================================
 # Render worker deps (maplibre-gl-native + better-sqlite3)
@@ -210,16 +206,18 @@ RUN npm install --omit=optional \
 # ================================
 FROM golang:1.26 AS rampardos-build
 ENV DEBIAN_FRONTEND=noninteractive
-# libegl1-mesa-dev provides egl.pc — required because egl_linux.go
-# declares `#cgo linux pkg-config: egl`. The maplibre binding itself
-# doesn't use pkg-config (consumes the library via the CGO_CFLAGS /
-# CGO_LDFLAGS env vars set below). Compile-time dep only; the runtime
-# libegl-mesa0 / libgl1-mesa-dri ship on the runtime image.
+# pkg-config is required by BOTH cgo consumers here: egl_linux.go declares
+# `#cgo linux pkg-config: egl` (from libegl1-mesa-dev), and the upstream Go
+# binding declares `#cgo pkg-config: maplibre-native-c` — the latter is why
+# PKG_CONFIG_PATH below points at the FFI's installed .pc. A cgo pkg-config
+# directive still runs even when CGO_CFLAGS/CGO_LDFLAGS are set, so the .pc
+# has to be findable; CGO_LDFLAGS only adds the runtime rpath on top.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libegl1-mesa-dev \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=mln-ffi-build /ffi/build/current /ffi/build/current
-COPY --from=mln-ffi-build /ffi/include /ffi/include
+# build/current is a symlink into the preset's install tree, so copy the
+# resolved directory (lib/, include/, share/pkgconfig/).
+COPY --from=mln-ffi-build /ffi/build/current/ /ffi/install/
 COPY --from=mln-ffi-build /vendor-maplibre-go /vendor-maplibre-go
 WORKDIR /src
 COPY --from=git-info /git-commit.txt /git-commit.txt
@@ -227,8 +225,8 @@ COPY rampardos/go.mod rampardos/go.sum ./
 RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
-    CGO_CFLAGS="-I/ffi/include" \
-    CGO_LDFLAGS="-L/ffi/build/current -lmaplibre-native-c -Wl,-rpath-link=/ffi/build/current -Wl,-rpath,/opt/rampardos/lib" \
+    PKG_CONFIG_PATH=/ffi/install/share/pkgconfig \
+    CGO_LDFLAGS="-Wl,-rpath,/opt/rampardos/lib" \
     CGO_ENABLED=1 \
     go build -trimpath -tags 'nodynamic mln_ffi' \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
@@ -277,21 +275,22 @@ RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
       ln -s /app/fontnik/node_modules/.bin/build-glyphs /usr/local/bin/build-glyphs; \
     fi
 
-# maplibre-native-ffi shared library + its pixi-conda-env transitive deps.
-# Bundle is reached only via the chain
+# maplibre-native-ffi shared library. Reached only via the chain
 #     rampardos (DT_RPATH=/opt/rampardos/lib)
 #       → libmaplibre-native-c.so (DT_RPATH=$ORIGIN, set in mln-ffi-build)
-#         → its bundled deps (also DT_RPATH=$ORIGIN)
-# so the Node binding's mbgl.node and any other process that doesn't
-# load libmaplibre-native-c.so resolves libpng / libjpeg / libuv / libicu
-# from /usr/lib/x86_64-linux-gnu/ as Ubuntu intended. Earlier revisions
-# of this Dockerfile registered /opt/rampardos/lib with ldconfig globally,
-# which shadowed Ubuntu's libpng for the Node renderer and caused a
-# version-mismatch abort on RENDERER_BACKEND=node-pool selection.
-COPY --from=mln-ffi-build /ffi/build/current /tmp/ffi-build
+# so the Node binding's mbgl.node and any other process that doesn't load
+# libmaplibre-native-c.so resolves libpng / libjpeg / libicu from
+# /usr/lib/<triple>/ as Ubuntu intended. Earlier revisions registered
+# /opt/rampardos/lib with ldconfig globally, which shadowed Ubuntu's libpng
+# for the Node renderer and aborted on RENDERER_BACKEND=node-pool.
+#
+# Upstream 91ecc92 dropped pixi: libuv/zlib are FetchContent-built and ICU
+# is vendored into the .so, so there is no conda-env bundle to carry — only
+# the library itself, plus the system libs Ubuntu already provides.
+COPY --from=mln-ffi-build /ffi/build/current/lib /tmp/ffi-lib
 RUN mkdir -p /opt/rampardos/lib \
- && cp -L /tmp/ffi-build/*.so* /opt/rampardos/lib/ \
- && rm -rf /tmp/ffi-build
+ && cp -L /tmp/ffi-lib/*.so* /opt/rampardos/lib/ \
+ && rm -rf /tmp/ffi-lib
 
 # Go binary
 COPY --from=rampardos-build /out/rampardos /app/rampardos
