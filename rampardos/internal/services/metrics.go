@@ -119,6 +119,7 @@ type MetricsManager struct {
 	rendererFramesPartial *prometheus.HistogramVec // Partial-mode frames drawn per render (discarded work)
 	rendererFramesFull    *prometheus.HistogramVec // Full-mode frames drawn per render (should be ~1)
 	rendererFrameRenderT  *prometheus.HistogramVec // summed mbgl-reported rendering_time per render
+	rendererFrameEvents   *prometheus.HistogramVec // RenderFrameFinished events received per render (before payload decode)
 
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
@@ -357,6 +358,12 @@ func newMetricsManager() *MetricsManager {
 			Name:    "rampardos_renderer_frame_render_seconds_per_render",
 			Help:    "Sum of mbgl's own reported frame rendering_time across all frames of one render. Compare with pump_render_update_seconds (our wall-clock around the RenderUpdate cgo call): the difference is cgo plus readback-adjacent overhead rather than mbgl draw cost.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+		}, []string{"style", "scale"}),
+
+		rendererFrameEvents: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_frame_events_per_render",
+			Help:    "RuntimeEventMapRenderFrameFinished events received per render, counted before the payload is decoded. Disambiguates the frames_partial/frames_full pair: 0 here means the event never reaches the pump at all, whereas a non-zero value with partial+full both 0 means the payload failed to decode.",
+			Buckets: []float64{0, 1, 2, 3, 5, 10, 20, 50},
 		}, []string{"style", "scale"}),
 
 		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
@@ -677,11 +684,13 @@ func (m *MetricsManager) RecordRendererFrameBreakdown(
 	style, scale string,
 	partialFrames int,
 	fullFrames int,
+	frameEvents int,
 	renderSeconds float64,
 ) {
 	m.rendererFramesPartial.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(partialFrames))
 	m.rendererFramesFull.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(fullFrames))
 	m.rendererFrameRenderT.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(renderSeconds)
+	m.rendererFrameEvents.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(frameEvents))
 }
 
 // RecordRendererReadback emits the per-render readback histogram.

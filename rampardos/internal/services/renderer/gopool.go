@@ -32,6 +32,12 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// maxBatchSweeps bounds the non-blocking Pump(0) sweeps performed before
+// each draw when draw batching is enabled. Each sweep is a cheap cgo call
+// that absorbs work already completed; the bound stops a steady tile
+// arrival rate from deferring the draw indefinitely.
+const maxBatchSweeps = 4
+
 // Ensure GoPoolRenderer satisfies the Renderer interface.
 var _ Renderer = (*GoPoolRenderer)(nil)
 
@@ -186,6 +192,7 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 		styleURL:        "file://" + preparedPath,
 		startupTimeout:  r.cfg.StartupTimeout,
 		renderTimeout:   r.cfg.RenderTimeout,
+		drawBatching:    r.cfg.DrawBatching,
 	}
 	return newGoStylePool(cfg)
 }
@@ -304,6 +311,7 @@ type goStylePoolConfig struct {
 	styleURL        string // "file://<preparedPath>"
 	startupTimeout  time.Duration
 	renderTimeout   time.Duration
+	drawBatching    bool
 }
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
@@ -715,7 +723,80 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 	// arriving tile" from "the draws were all necessary".
 	partialFrames := 0
 	fullFrames := 0
+	frameEvents := 0
 	var mbglRenderSeconds float64
+
+	// drain polls every queued event, folding render-updates into a single
+	// pending flag. Returns whether it saw any event, and whether the still
+	// image completed. Extracted so the batching sweep below can re-drain
+	// without duplicating the event switch.
+	var pendingRenderUpdate bool
+	drain := func() (sawEvent bool, finished bool, err error) {
+		for {
+			ev, err := w.rt.PollEvent()
+			if err != nil {
+				return sawEvent, false, fmt.Errorf("renderer: PollEvent: %w", err)
+			}
+			if ev == nil {
+				return sawEvent, false, nil
+			}
+			sawEvent = true
+			if !firstEventSeen {
+				timeToFirstEvent = time.Since(pumpStart)
+				firstEventSeen = true
+			}
+			switch ev.Type {
+			case maplibre.RuntimeEventMapRenderUpdateAvailable:
+				pendingRenderUpdate = true
+			case maplibre.RuntimeEventMapRenderFrameFinished:
+				// Diagnostic only — does not drive the loop. Mode reports
+				// whether the frame we just drew was complete.
+				//
+				// frameEvents counts arrivals *before* the payload assertion
+				// so the two failure modes stay distinguishable:
+				// frameEvents==0 means the event never reaches us (the FFI
+				// sets the session renderer's observer once, only when the
+				// renderer is first created), whereas frameEvents>0 with
+				// partial+full==0 means the payload failed to decode. The
+				// first cut of this metric conflated them and read zero
+				// either way.
+				frameEvents++
+				if p, ok := ev.Payload.(maplibre.RuntimeEventRenderFramePayload); ok {
+					if p.Mode == maplibre.RenderModeFull {
+						fullFrames++
+					} else {
+						partialFrames++
+					}
+					mbglRenderSeconds += p.Stats.RenderingTime
+				}
+			case maplibre.RuntimeEventMapStillImageFinished:
+				return sawEvent, true, nil
+			case maplibre.RuntimeEventMapLoadingFailed:
+				return sawEvent, false, fmt.Errorf("renderer: map loading failed: %s", ev.Message)
+			case maplibre.RuntimeEventMapRenderError:
+				return sawEvent, false, fmt.Errorf("renderer: map render error: %s", ev.Message)
+			case maplibre.RuntimeEventMapStillImageFailed:
+				return sawEvent, false, fmt.Errorf("renderer: still image failed: %s", ev.Message)
+			}
+		}
+	}
+
+	// flush draws the latest update, if one is pending.
+	flush := func() error {
+		if !pendingRenderUpdate {
+			return nil
+		}
+		ruStart := time.Now()
+		drew, err := w.sess.RenderUpdate()
+		if err != nil {
+			return fmt.Errorf("renderer: RenderUpdate: %w", err)
+		}
+		totalRenderUpdate += time.Since(ruStart)
+		renderUpdateCnt++
+		rendered = rendered || drew
+		pendingRenderUpdate = false
+		return nil
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -730,100 +811,74 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		// Park until the runtime has work, bounded by the remaining
 		// budget so the outer deadline check stays authoritative.
 		blockStart := time.Now()
-		err := w.rt.Pump(remaining)
-		totalSleep += time.Since(blockStart)
-		if err != nil {
+		if err := w.rt.Pump(remaining); err != nil {
+			totalSleep += time.Since(blockStart)
 			return fmt.Errorf("renderer: pump: %w", err)
 		}
+		totalSleep += time.Since(blockStart)
 
-		// Drain everything this Pump made available, folding any
-		// render-updates into a SINGLE RenderUpdate() call. The runtime
-		// now coalesces render-update events against an unread one at
-		// the queue tail (matching the uv_async_send semantics mbgl's
-		// own HeadlessFrontend gets for free), so this rarely has more
-		// than one to fold — but a render draws the *latest* update, so
-		// collapsing them stays correct regardless and keeps us from
-		// re-drawing successively newer state N times for one frame of
-		// progress.
-		pendingRenderUpdate := false
-		for {
-			ev, err := w.rt.PollEvent()
-			if err != nil {
-				return fmt.Errorf("renderer: PollEvent: %w", err)
-			}
-			if ev == nil {
-				break
-			}
-			if !firstEventSeen {
-				timeToFirstEvent = time.Since(pumpStart)
-				firstEventSeen = true
-			}
-			switch ev.Type {
-			case maplibre.RuntimeEventMapRenderUpdateAvailable:
-				pendingRenderUpdate = true
-			case maplibre.RuntimeEventMapRenderFrameFinished:
-				// Diagnostic only — does not drive the loop. Mode reports
-				// whether the frame we just drew was complete; NeedsRepaint
-				// is mbgl telling us another frame is still required.
-				if p, ok := ev.Payload.(maplibre.RuntimeEventRenderFramePayload); ok {
-					if p.Mode == maplibre.RenderModeFull {
-						fullFrames++
-					} else {
-						partialFrames++
-					}
-					mbglRenderSeconds += p.Stats.RenderingTime
+		_, finished, err := drain()
+		if err != nil {
+			return err
+		}
+
+		// Batching sweep. Pump returns as soon as ONE piece of work is
+		// latched, so under progressive tile arrival we drain-and-draw once
+		// per tile: prod measured ~14 draws per render, and the runtime's
+		// tail coalescing cannot help because we are back at PollEvent
+		// before a second event can queue behind the first. Every draw
+		// renders the whole viewport, but only the frame that completes the
+		// still is served — the rest is discarded work.
+		//
+		// Pump(0) is documented as "drains and returns"; it never parks, so
+		// this cannot add latency. It only sweeps up work that already
+		// completed while we were drawing the previous frame. Each sweep
+		// that catches another update removes one whole draw.
+		//
+		// Bounded so a steady arrival rate cannot starve the draw, which
+		// would delay the render that ultimately completes the still.
+		if w.pool.cfg.drawBatching && pendingRenderUpdate && !finished {
+			for sweep := 0; sweep < maxBatchSweeps; sweep++ {
+				if err := w.rt.Pump(0); err != nil {
+					return fmt.Errorf("renderer: pump(0): %w", err)
 				}
-			case maplibre.RuntimeEventMapStillImageFinished:
-				// Flush any pending update before finishing.
-				if pendingRenderUpdate {
-					ruStart := time.Now()
-					drew, err := w.sess.RenderUpdate()
-					if err != nil {
-						return fmt.Errorf("renderer: RenderUpdate: %w", err)
-					}
-					totalRenderUpdate += time.Since(ruStart)
-					renderUpdateCnt++
-					rendered = rendered || drew
-					pendingRenderUpdate = false
+				saw, done, err := drain()
+				if err != nil {
+					return err
 				}
-				if !rendered {
-					return fmt.Errorf("renderer: still image finished without a render frame")
+				if done {
+					finished = true
+					break
 				}
-				if services.GlobalMetrics != nil {
-					services.GlobalMetrics.RecordRendererPumpBreakdown(
-						w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
-						iterations,
-						totalSleep.Seconds(),
-						timeToFirstEvent.Seconds(),
-						totalRenderUpdate.Seconds(),
-						renderUpdateCnt,
-					)
-					services.GlobalMetrics.RecordRendererFrameBreakdown(
-						w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
-						partialFrames, fullFrames, mbglRenderSeconds,
-					)
+				if !saw {
+					break
 				}
-				return nil
-			case maplibre.RuntimeEventMapLoadingFailed:
-				return fmt.Errorf("renderer: map loading failed: %s", ev.Message)
-			case maplibre.RuntimeEventMapRenderError:
-				return fmt.Errorf("renderer: map render error: %s", ev.Message)
-			case maplibre.RuntimeEventMapStillImageFailed:
-				return fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
-		// Drain pass finished without StillImageFinished — flush any
-		// pending render-update so mbgl can make forward progress on
-		// the next Pump cycle.
-		if pendingRenderUpdate {
-			ruStart := time.Now()
-			drew, err := w.sess.RenderUpdate()
-			if err != nil {
-				return fmt.Errorf("renderer: RenderUpdate: %w", err)
+
+		if err := flush(); err != nil {
+			return err
+		}
+
+		if finished {
+			if !rendered {
+				return fmt.Errorf("renderer: still image finished without a render frame")
 			}
-			totalRenderUpdate += time.Since(ruStart)
-			renderUpdateCnt++
-			rendered = rendered || drew
+			if services.GlobalMetrics != nil {
+				services.GlobalMetrics.RecordRendererPumpBreakdown(
+					w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
+					iterations,
+					totalSleep.Seconds(),
+					timeToFirstEvent.Seconds(),
+					totalRenderUpdate.Seconds(),
+					renderUpdateCnt,
+				)
+				services.GlobalMetrics.RecordRendererFrameBreakdown(
+					w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
+					partialFrames, fullFrames, frameEvents, mbglRenderSeconds,
+				)
+			}
+			return nil
 		}
 	}
 }
