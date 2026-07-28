@@ -707,6 +707,16 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 	var timeToFirstEvent time.Duration
 	firstEventSeen := false
 
+	// mbgl's own accounting, from RenderFrameFinished. Every draw we make
+	// reports back whether mbgl considered the frame Partial (drawn before
+	// all tiles were present) or Full. Only the Full frame's pixels reach
+	// the client, so partialFrames is a direct measure of discarded GPU
+	// work — the thing that distinguishes "the pump is drawing once per
+	// arriving tile" from "the draws were all necessary".
+	partialFrames := 0
+	fullFrames := 0
+	var mbglRenderSeconds float64
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -751,6 +761,18 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			switch ev.Type {
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
 				pendingRenderUpdate = true
+			case maplibre.RuntimeEventMapRenderFrameFinished:
+				// Diagnostic only — does not drive the loop. Mode reports
+				// whether the frame we just drew was complete; NeedsRepaint
+				// is mbgl telling us another frame is still required.
+				if p, ok := ev.Payload.(maplibre.RuntimeEventRenderFramePayload); ok {
+					if p.Mode == maplibre.RenderModeFull {
+						fullFrames++
+					} else {
+						partialFrames++
+					}
+					mbglRenderSeconds += p.Stats.RenderingTime
+				}
 			case maplibre.RuntimeEventMapStillImageFinished:
 				// Flush any pending update before finishing.
 				if pendingRenderUpdate {
@@ -775,6 +797,10 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 						timeToFirstEvent.Seconds(),
 						totalRenderUpdate.Seconds(),
 						renderUpdateCnt,
+					)
+					services.GlobalMetrics.RecordRendererFrameBreakdown(
+						w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
+						partialFrames, fullFrames, mbglRenderSeconds,
 					)
 				}
 				return nil
