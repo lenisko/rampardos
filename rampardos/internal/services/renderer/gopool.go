@@ -58,6 +58,12 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	if cfg.StylePoolSize <= 0 {
 		cfg.StylePoolSize = cfg.PoolSize
 	}
+	if cfg.StylePoolMin <= 0 || cfg.StylePoolMin > cfg.StylePoolSize {
+		cfg.StylePoolMin = 1
+	}
+	if cfg.StylePoolIdleTTL <= 0 {
+		cfg.StylePoolIdleTTL = 2 * time.Minute
+	}
 	if cfg.RenderTimeout <= 0 {
 		cfg.RenderTimeout = 15 * time.Second
 	}
@@ -182,6 +188,8 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 		scaleLabel:      strconv.Itoa(ratio),
 		viewportZoomAdj: zoomAdj,
 		poolSize:        r.cfg.StylePoolSize,
+		minPoolSize:     r.cfg.StylePoolMin,
+		idleTTL:         r.cfg.StylePoolIdleTTL,
 		ratio:           ratio,
 		styleURL:        "file://" + preparedPath,
 		startupTimeout:  r.cfg.StartupTimeout,
@@ -299,7 +307,9 @@ type goStylePoolConfig struct {
 	styleID         string
 	scaleLabel      string
 	viewportZoomAdj float64
-	poolSize        int
+	poolSize        int // ceiling: most workers this pool may hold
+	minPoolSize     int // floor: workers held even when idle
+	idleTTL         time.Duration
 	ratio           int
 	styleURL        string // "file://<preparedPath>"
 	startupTimeout  time.Duration
@@ -318,6 +328,18 @@ type goStylePool struct {
 	mu      sync.Mutex
 	closed  bool
 	workers []*goWorker // guarded by mu; addressed by broadcast operations
+
+	// saturated records whether any dispatch since the last reaper tick
+	// found every worker busy. Growth is immediate on demand; shrink only
+	// happens after a whole tick with no saturation, so a pool ramps up
+	// fast and decays slowly rather than thrashing around the boundary.
+	saturated  bool
+	reaperDone chan struct{}
+
+	// startWorker is the worker constructor, swappable in tests so the
+	// grow/shrink policy can be exercised without standing up real EGL
+	// contexts. Nil means use the real one.
+	startWorker func(startupErrs chan error) *goWorker
 }
 
 type goWorkerCmdKind int
@@ -325,6 +347,7 @@ type goWorkerCmdKind int
 const (
 	goWorkerCmdRender goWorkerCmdKind = iota
 	goWorkerCmdReload
+	goWorkerCmdShutdown
 )
 
 type goWorkerCommand struct {
@@ -361,23 +384,29 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 	if cfg.renderTimeout <= 0 {
 		cfg.renderTimeout = 15 * time.Second
 	}
-
-	p := &goStylePool{
-		cfg:  cfg,
-		cmds: make(chan goWorkerCommand),
+	if cfg.minPoolSize <= 0 || cfg.minPoolSize > cfg.poolSize {
+		cfg.minPoolSize = 1
+	}
+	if cfg.idleTTL <= 0 {
+		cfg.idleTTL = 2 * time.Minute
 	}
 
-	startupErrs := make(chan error, cfg.poolSize)
+	p := &goStylePool{
+		cfg:        cfg,
+		cmds:       make(chan goWorkerCommand),
+		reaperDone: make(chan struct{}),
+	}
+
+	// Spawn the floor only. Pools are created per (style, scale), so with
+	// several styles a static count over-provisions every cold pool while
+	// still capping the hot one; starting small and growing on demand lets
+	// a busy combination reach the ceiling without charging idle ones for
+	// it. Matters most on small hosts, where each worker is a full mbgl
+	// map, runtime and EGL context.
+	startupErrs := make(chan error, cfg.minPoolSize)
 	p.workers = make([]*goWorker, 0, cfg.poolSize)
-	for i := 0; i < cfg.poolSize; i++ {
-		w := &goWorker{
-			pool:        p,
-			startupErrs: startupErrs,
-			broadcast:   make(chan goWorkerCommand, 1),
-		}
-		p.workers = append(p.workers, w)
-		p.wg.Add(1)
-		go w.loop()
+	for i := 0; i < cfg.minPoolSize; i++ {
+		p.startWorkerLocked(startupErrs)
 	}
 
 	// Wait for all workers to report startup status. First failure
@@ -386,7 +415,7 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 	defer deadline.Stop()
 	var firstErr error
 	collected := 0
-	for collected < cfg.poolSize {
+	for collected < cfg.minPoolSize {
 		select {
 		case err := <-startupErrs:
 			collected++
@@ -394,8 +423,8 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 				firstErr = err
 			}
 		case <-deadline.C:
-			firstErr = fmt.Errorf("renderer: pool startup timeout after %s (workers ready %d/%d)", cfg.startupTimeout, collected, cfg.poolSize)
-			collected = cfg.poolSize // break the loop
+			firstErr = fmt.Errorf("renderer: pool startup timeout after %s (workers ready %d/%d)", cfg.startupTimeout, collected, cfg.minPoolSize)
+			collected = cfg.minPoolSize // break the loop
 		}
 	}
 	if firstErr != nil {
@@ -406,7 +435,117 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 		return nil, fmt.Errorf("renderer: build pool for style %q ratio=%d: %w", cfg.styleID, cfg.ratio, firstErr)
 	}
 
+	go p.reap()
+	p.reportSize()
 	return p, nil
+}
+
+// startWorkerLocked constructs, registers and starts one worker. Callers
+// hold p.mu (or are in construction, before the pool is published).
+// startupErrs may be nil for workers grown after construction: nobody is
+// collecting, so failures are logged by the caller of grow() instead.
+func (p *goStylePool) startWorkerLocked(startupErrs chan error) *goWorker {
+	if p.startWorker != nil {
+		w := p.startWorker(startupErrs)
+		p.workers = append(p.workers, w)
+		return w
+	}
+	w := &goWorker{
+		pool:        p,
+		startupErrs: startupErrs,
+		broadcast:   make(chan goWorkerCommand, 1),
+	}
+	p.workers = append(p.workers, w)
+	p.wg.Add(1)
+	go w.loop()
+	return w
+}
+
+// grow adds one worker if the pool is below its ceiling. Called when a
+// dispatch found every worker busy. The new worker's init (EGL context,
+// runtime, map, style load) happens on its own goroutine, so the request
+// that triggered growth is not made to wait for it — it queues on the
+// shared channel as usual and whichever worker frees up first serves it.
+func (p *goStylePool) grow() {
+	p.mu.Lock()
+	p.saturated = true
+	if p.closed || len(p.workers) >= p.cfg.poolSize {
+		p.mu.Unlock()
+		return
+	}
+	errs := make(chan error, 1)
+	p.startWorkerLocked(errs)
+	size := len(p.workers)
+	p.mu.Unlock()
+
+	slog.Debug("renderer pool growing", "style", p.cfg.styleID, "scale", p.cfg.scaleLabel, "workers", size, "max", p.cfg.poolSize)
+	p.reportSize()
+
+	go func() {
+		if err := <-errs; err != nil {
+			// The worker has already torn itself down and exited; drop it
+			// from the roster so the count stays honest and a later
+			// dispatch can retry growth.
+			p.mu.Lock()
+			for i, w := range p.workers {
+				if w.startupErrs == errs {
+					p.workers = append(p.workers[:i], p.workers[i+1:]...)
+					break
+				}
+			}
+			p.mu.Unlock()
+			p.reportSize()
+			slog.Warn("renderer pool growth failed", "style", p.cfg.styleID, "scale", p.cfg.scaleLabel, "error", err)
+		}
+	}()
+}
+
+// reap retires one worker per idle interval, down to the floor. One at a
+// time so a pool that just went quiet keeps some capacity for a while
+// rather than collapsing to the floor the moment traffic pauses.
+func (p *goStylePool) reap() {
+	ticker := time.NewTicker(p.cfg.idleTTL)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.reaperDone:
+			return
+		case <-ticker.C:
+			p.reapOnce()
+		}
+	}
+}
+
+// reapOnce retires at most one worker. Returns true if it did.
+func (p *goStylePool) reapOnce() bool {
+	p.mu.Lock()
+	busy := p.saturated
+	p.saturated = false
+	if p.closed || busy || len(p.workers) <= p.cfg.minPoolSize {
+		p.mu.Unlock()
+		return false
+	}
+	victim := p.workers[len(p.workers)-1]
+	p.workers = p.workers[:len(p.workers)-1]
+	size := len(p.workers)
+	p.mu.Unlock()
+
+	// Buffered channel, so this never blocks on a worker that is mid-render;
+	// it picks the shutdown up when it returns to the loop.
+	victim.broadcast <- goWorkerCommand{kind: goWorkerCmdShutdown}
+	slog.Debug("renderer pool shrinking", "style", p.cfg.styleID, "scale", p.cfg.scaleLabel, "workers", size, "min", p.cfg.minPoolSize)
+	p.reportSize()
+	return true
+}
+
+func (p *goStylePool) reportSize() {
+	if services.GlobalMetrics == nil {
+		return
+	}
+	p.mu.Lock()
+	n := len(p.workers)
+	p.mu.Unlock()
+	services.GlobalMetrics.SetRendererPoolWorkers(p.cfg.styleID, p.cfg.scaleLabel, n)
 }
 
 // dispatch sends a render command to whichever worker is ready (or
@@ -423,11 +562,20 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 		reply:  reply,
 	}
 
+	// Try to hand the work to an already-idle worker. A failed non-blocking
+	// send means every worker is busy, which is the only signal available
+	// for demand: the shared channel is unbuffered, so a successful send is
+	// exactly "someone was waiting for work".
 	select {
 	case p.cmds <- cmd:
-		// fall through to wait for reply
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		// picked up immediately
+	default:
+		p.grow()
+		select {
+		case p.cmds <- cmd:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	if services.GlobalMetrics != nil {
@@ -496,6 +644,7 @@ func (p *goStylePool) close() {
 	}
 	p.closed = true
 	p.mu.Unlock()
+	close(p.reaperDone)
 	close(p.cmds)
 	p.wg.Wait()
 }
@@ -553,6 +702,14 @@ func (w *goWorker) loop() {
 		}
 
 		switch cmd.kind {
+		case goWorkerCmdShutdown:
+			// Retired by the reaper. Deferred cleanup releases the EGL
+			// context, map, runtime and their mbgl caches — the whole
+			// point of shrinking.
+			if cmd.reply != nil {
+				cmd.reply <- goWorkerResult{}
+			}
+			return
 		case goWorkerCmdRender:
 			img, err := w.renderOne(cmd.ctx, cmd.render.vp, cmd.render.scale)
 			cmd.reply <- goWorkerResult{img: img, err: err}

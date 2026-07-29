@@ -158,8 +158,9 @@ RUN cp -r bindings/go /vendor-maplibre-go \
  && ls /vendor-maplibre-go | head -20
 
 # Point the .so at its own directory so any transitive private deps resolve
-# without registering a global ldconfig path (which previously shadowed
-# system libpng/libjpeg for the Node binding when RENDERER_BACKEND=node-pool).
+# without registering a global ldconfig path. A global path previously
+# shadowed Ubuntu's libpng/libjpeg for other consumers in the image
+# (fontnik's node addon still links its own copies).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends patchelf binutils \
  && rm -rf /var/lib/apt/lists/* \
@@ -170,29 +171,11 @@ RUN apt-get update \
  && readelf -d build/current/lib/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
 # ================================
-# Render worker deps (maplibre-gl-native + better-sqlite3)
-# ================================
-# Must use the same base as the runtime (Ubuntu 24.04) so npm downloads
-# prebuilt binaries compatible with the runtime's glibc.
-FROM --platform=$TARGETPLATFORM ubuntu:24.04 AS render-deps
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    ca-certificates curl python3 make g++ \
- && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
- && rm -rf /var/lib/apt/lists/*
-WORKDIR /build
-COPY rampardos-render-worker/package.json ./
-RUN npm install --omit=optional \
- && rm -f /build/package-lock.json
-
-# ================================
 # Build Go binary
 #
 # Builds with -tags 'nodynamic mln_ffi' so the in-process Go renderer
-# (gopool.go) is compiled in alongside the Node-subprocess renderer.
-# The RENDERER_BACKEND env var selects which one runs at process start;
-# default remains node-pool, so existing deployments are unchanged.
+# (gopool.go) is compiled in. It is the only renderer backend; without the
+# tag the stub errors at startup rather than degrading silently.
 #
 # Switched from golang:1.26-alpine (musl, CGO_ENABLED=0) to glibc-based
 # golang:1.26 because libmaplibre-native-c.so is built on Ubuntu 24.04
@@ -257,12 +240,11 @@ RUN apt-get update \
     # fork build did not — without it the binary fails at load with
     # "libGLESv2.so.2: cannot open shared object file".
     libegl-mesa0 libgl1-mesa-dri libgles2 \
-    # maplibre-native common deps
+    # fontnik / build-glyphs (admin font processing) runs on Node and
+    # needs these; libmaplibre-native-c.so itself links only EGL/GLES/libc
+    # because upstream vendors ICU and static-links libuv and zlib.
     libcurl4 libjpeg8 libwebp7 libpng16-16 libicu74 \
-    libuv1 \
-    # Xvfb for headless GL rendering (Node binding needs an X display)
-    xvfb \
-    # SQLite for better-sqlite3
+    # SQLite — mbgl's mbtiles file source reads the dataset directly
     libsqlite3-0 \
  && apt-get purge -y curl \
  && apt-get autoremove -y \
@@ -283,10 +265,10 @@ RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
 #     rampardos (DT_RPATH=/opt/rampardos/lib)
 #       → libmaplibre-native-c.so (DT_RPATH=$ORIGIN, set in mln-ffi-build)
 # so the Node binding's mbgl.node and any other process that doesn't load
-# libmaplibre-native-c.so resolves libpng / libjpeg / libicu from
-# /usr/lib/<triple>/ as Ubuntu intended. Earlier revisions registered
-# /opt/rampardos/lib with ldconfig globally, which shadowed Ubuntu's libpng
-# for the Node renderer and aborted on RENDERER_BACKEND=node-pool.
+# libmaplibre-native-c.so resolves its deps from /usr/lib/<triple>/ as
+# Ubuntu intended. Earlier revisions registered /opt/rampardos/lib with
+# ldconfig globally, which shadowed Ubuntu's libpng for everything else in
+# the image — fontnik's node addon aborted on a version mismatch.
 #
 # Upstream 91ecc92 dropped pixi: libuv/zlib are FetchContent-built and ICU
 # is vendored into the .so, so there is no conda-env bundle to carry — only
@@ -299,50 +281,18 @@ RUN mkdir -p /opt/rampardos/lib \
 # Go binary
 COPY --from=rampardos-build /out/rampardos /app/rampardos
 
-# Render worker: runtime-essential npm packages.
-# better-sqlite3 needs the `bindings` package at runtime to locate its
-# native .node addon. file-uri-to-path is a transitive dep of bindings.
-COPY --from=render-deps \
-     /build/node_modules/@maplibre/maplibre-gl-native \
-     /app/render-worker/node_modules/@maplibre/maplibre-gl-native
-COPY --from=render-deps \
-     /build/node_modules/better-sqlite3 \
-     /app/render-worker/node_modules/better-sqlite3
-COPY --from=render-deps \
-     /build/node_modules/bindings \
-     /app/render-worker/node_modules/bindings
-COPY --from=render-deps \
-     /build/node_modules/file-uri-to-path \
-     /app/render-worker/node_modules/file-uri-to-path
-
-# Worker script
-COPY rampardos-render-worker/render-worker.js /app/render-worker/render-worker.js
-COPY rampardos-render-worker/package.json /app/render-worker/package.json
-
 # Create directories
 RUN mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable \
     TileServer/Fonts TileServer/Styles TileServer/Datasets Templates Markers
 
-# Force EGL backend for headless rendering (no X11 display in Docker).
-# Without this, maplibre-native tries GLX and loops on "Failed to open X display".
-ENV DISPLAY=:0
+# Software rasterisation via Mesa llvmpipe — there is no GPU on the host.
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV MESA_GL_VERSION_OVERRIDE=3.3
-ENV RENDERER_WORKER_SCRIPT=/app/render-worker/render-worker.js
-# EGL surfaceless platform — selects Mesa's headless EGL implementation
-# so the Go renderer's EGL context creation (egl_linux.go) works without
-# an X display. Node renderer continues to use Xvfb (started below).
+# EGL surfaceless platform selects Mesa's headless EGL implementation, so
+# egl_linux.go creates its context with no display server at all. This is
+# why the image no longer needs Xvfb or DISPLAY: those existed only for
+# the Node binding, which required an X display for its GL context.
 ENV EGL_PLATFORM=surfaceless
 EXPOSE 9000
 
-# Start Xvfb (virtual framebuffer) then rampardos. maplibre-native
-# requires a GL context; Xvfb provides one without a physical display.
-COPY <<'EOF' /app/entrypoint.sh
-#!/bin/sh
-rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
-Xvfb :0 -screen 0 1024x768x24 -nolisten tcp >/dev/null 2>&1 &
-sleep 0.5
-exec /app/rampardos "$@"
-EOF
-RUN chmod +x /app/entrypoint.sh
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/app/rampardos"]

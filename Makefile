@@ -1,12 +1,11 @@
 .PHONY: build run test test-integration test-coverage clean tidy fmt lint \
-       npm-install docker-build docker-push docker-compose-up docker-compose-down \
+       docker-build docker-push docker-compose-up docker-compose-down \
        docker-compose-logs setup-dirs help build-ffi build-go-renderer clean-ffi
 
 # Binary name
 BINARY_NAME=rampardos
 BUILD_DIR=bin
 GO_DIR=rampardos
-WORKER_DIR=rampardos-render-worker
 
 # Go parameters
 GOCMD=go
@@ -38,36 +37,29 @@ MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi-linux
 all: build
 
 ## build: Build the Go binary and install Node worker deps
-build: npm-install
+build:
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
 	cd $(GO_DIR) && $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
 	@echo "Binary: $(BUILD_DIR)/$(BINARY_NAME)"
 
-## build-fast: Build Go binary only (skip npm install if already done)
+## build-fast: Build Go binary only (no FFI; go-pool needs build-go-renderer)
 build-fast:
 	@mkdir -p $(BUILD_DIR)
 	cd $(GO_DIR) && $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
 
 ## build-linux: Cross-compile for Linux amd64
-build-linux: npm-install
+build-linux:
 	@mkdir -p $(BUILD_DIR)
 	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/server
 
 ## build-all: Build for multiple platforms
-build-all: npm-install
+build-all:
 	@mkdir -p $(BUILD_DIR)
 	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/server
 	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/server
 	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/server
 	cd $(GO_DIR) && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) -trimpath $(LDFLAGS) -o ../$(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/server
-
-## npm-install: Install Node render worker dependencies
-npm-install:
-	@if [ ! -d "$(WORKER_DIR)/node_modules/@maplibre/maplibre-gl-native" ]; then \
-		echo "Installing render worker deps..."; \
-		cd $(WORKER_DIR) && npm install; \
-	fi
 
 ## run: Build and run locally with sensible defaults
 run: build
@@ -77,9 +69,9 @@ run: build
 test:
 	cd $(GO_DIR) && $(GOTEST) ./...
 
-## test-integration: Run integration tests (requires npm install)
-test-integration: npm-install
-	cd $(GO_DIR) && $(GOTEST) -tags renderer_integration ./internal/services/renderer/ -v -timeout 60s
+## test-integration: Run integration tests (needs the FFI; see build-ffi)
+test-integration:
+	cd $(GO_DIR) && $(GOTEST) -tags 'renderer_integration mln_ffi' ./internal/services/renderer/ -v -timeout 60s
 
 ## test-coverage: Run tests with coverage report
 test-coverage:

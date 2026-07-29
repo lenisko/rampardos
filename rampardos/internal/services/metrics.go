@@ -93,18 +93,18 @@ type MetricsManager struct {
 
 	// Renderer pool saturation tripwires. Every local staticmap base
 	// is a live renderer call — there is no disk-cache buffer — so
-	// visibility into whether the Node workers are the bottleneck
-	// matters.
+	// visibility into whether the render pool is the bottleneck matters.
 	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker in (style, scale) pool
 	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
+	rendererPoolWorkers        *prometheus.GaugeVec     // resident workers per (style, scale); varies as pools grow/shrink
 	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
 
 	// Go-renderer per-render breakdown. Decomposes the total per-render
 	// wall time (rendererViewportDuration) so we can see where the time
 	// actually goes: pump iteration count, sleep time, mbgl warm-up
 	// time-to-first-event, and total RenderUpdate cgo time. These were
-	// added to isolate a structural Go-vs-Node gap; only emitted from
-	// the GoPoolRenderer's pump (no equivalent for nodepool).
+	// added to isolate a structural gap against the legacy Node
+	// renderer during the port; retained as the per-render breakdown.
 	rendererPumpIterations      *prometheus.HistogramVec // iterations per render
 	rendererPumpSleep           *prometheus.HistogramVec // total sleep seconds per render
 	rendererPumpTimeToFirstEv   *prometheus.HistogramVec // seconds from pump start to first non-nil event
@@ -118,12 +118,6 @@ type MetricsManager struct {
 	rendererGlobalCapacity    prometheus.Gauge
 	rendererGlobalInFlight    prometheus.Gauge
 	rendererGlobalAcquireWait prometheus.Histogram
-
-	// Renderer child-process resource usage. Node workers are outside
-	// Go's heap, so rampardos_memory_rss_bytes alone can't reveal a
-	// Node-side leak. Sum and count are sampled from /proc on Linux.
-	nodeWorkersTotal    prometheus.Gauge
-	nodeWorkersRSSBytes prometheus.Gauge
 
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
@@ -292,6 +286,11 @@ func newMetricsManager() *MetricsManager {
 			Help: "Idle workers snapshotted at the moment a dispatch acquires one from the (style, scale) pool. 0 means the pool was fully busy when this dispatch entered.",
 		}, []string{"style", "scale"}),
 
+		rendererPoolWorkers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_pool_workers",
+			Help: "Resident workers in each (style, scale) pool. Pools start at STYLE_POOL_MIN, grow towards STYLE_POOL_SIZE when a dispatch finds every worker busy, and retire one worker per idle interval back down to the floor. Each worker is a full mbgl map + runtime + EGL context, so this gauge tracks the renderer's memory footprint.",
+		}, []string{"style", "scale"}),
+
 		rendererWorkerReplacements: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_worker_replacements_total",
 			Help: "Worker processes killed and respawned. reason=error counts abnormal dispatch failures; reason=lifetime counts routine recycling after workerLifetime renders.",
@@ -349,16 +348,6 @@ func newMetricsManager() *MetricsManager {
 			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
 		}),
 
-		nodeWorkersTotal: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "rampardos_renderer_node_workers_total",
-			Help: "Count of child Node render-worker processes (ppid == rampardos && comm == node). A climbing count with stable traffic means worker rotation is broken.",
-		}),
-
-		nodeWorkersRSSBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "rampardos_renderer_node_workers_rss_bytes",
-			Help: "Summed Resident Set Size of child Node render-worker processes, in bytes. Outside Go's heap — complements rampardos_memory_rss_bytes. Sampled from /proc on Linux.",
-		}),
-
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "rampardos_dataset_size_bytes",
 			Help: "Size of dataset files in bytes",
@@ -392,10 +381,6 @@ func (m *MetricsManager) updateRuntimeMetrics() {
 			m.memoryVSSBytes.Set(float64(memStats.Sys))
 		}
 
-		if sample, ok := sampleNodeWorkers(); ok {
-			m.nodeWorkersTotal.Set(float64(sample.count))
-			m.nodeWorkersRSSBytes.Set(float64(sample.rssBytes))
-		}
 	}
 }
 
@@ -466,83 +451,6 @@ func readVSSFromStatus() uint64 {
 		}
 	}
 	return 0
-}
-
-// nodeWorkerSample aggregates the render-worker subprocess footprint.
-type nodeWorkerSample struct {
-	count    int
-	rssBytes uint64
-}
-
-// sampleNodeWorkers walks /proc and sums RSS / counts child Node render
-// workers (ppid == our pid, comm == "node"). Linux-only; returns ok=false
-// when /proc isn't available. Sampling cost is proportional to the total
-// process count in the container — trivial for our single-service image.
-func sampleNodeWorkers() (nodeWorkerSample, bool) {
-	selfPID := os.Getpid()
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nodeWorkerSample{}, false
-	}
-	var out nodeWorkerSample
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if _, err := strconv.Atoi(entry.Name()); err != nil {
-			continue
-		}
-		if addNodeWorkerIfMatch(&out, entry.Name(), selfPID) {
-			continue
-		}
-	}
-	return out, true
-}
-
-// addNodeWorkerIfMatch parses /proc/<pid>/status once; if the process is a
-// child node worker of ours, its RSS is added to out. Returns true when the
-// entry was our worker (caller uses this only as a "counted" hint).
-func addNodeWorkerIfMatch(out *nodeWorkerSample, pidDir string, selfPID int) bool {
-	f, err := os.Open("/proc/" + pidDir + "/status")
-	if err != nil {
-		// Process exited between ReadDir and Open — benign.
-		return false
-	}
-	defer f.Close()
-
-	var (
-		name    string
-		ppid    int
-		vmRSS   uint64
-		haveRSS bool
-	)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, "Name:"):
-			if fields := strings.Fields(line); len(fields) >= 2 {
-				name = fields[1]
-			}
-		case strings.HasPrefix(line, "PPid:"):
-			if fields := strings.Fields(line); len(fields) >= 2 {
-				ppid, _ = strconv.Atoi(fields[1])
-			}
-		case strings.HasPrefix(line, "VmRSS:"):
-			if fields := strings.Fields(line); len(fields) >= 2 {
-				if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-					vmRSS = v * 1024
-					haveRSS = true
-				}
-			}
-		}
-	}
-	if name != "node" || ppid != selfPID || !haveRSS {
-		return false
-	}
-	out.count++
-	out.rssBytes += vmRSS
-	return true
 }
 
 // RecordRequest records a request with type, cache status, and duration
@@ -616,6 +524,11 @@ func (m *MetricsManager) RecordRendererViewport(style, scale string, duration fl
 func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeconds float64, idleAfter int) {
 	m.rendererPoolAcquireWait.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(waitSeconds)
 	m.rendererPoolIdleWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(idleAfter))
+}
+
+// SetRendererPoolWorkers publishes a pool's current worker count.
+func (m *MetricsManager) SetRendererPoolWorkers(style, scale string, workers int) {
+	m.rendererPoolWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(workers))
 }
 
 func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {

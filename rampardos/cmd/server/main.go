@@ -92,19 +92,18 @@ func main() {
 	fontsController := services.NewFontsController("TileServer/Fonts")
 	stylesController := services.NewStylesController(externalStyles, "TileServer/Styles", fontsController)
 
-	// Initialize the renderer (spawns Node worker pools).
+	// Initialize the renderer (lazily creates in-process worker pools).
 	rendererCfg := renderer.Config{
-		Backend:        cfg.RendererBackend,
-		NodeBinary:     cfg.RendererNodeBinary,
-		WorkerScript:   cfg.RendererWorkerScript,
-		PoolSize:       cfg.RendererPoolSize,
-		StylePoolSize:  cfg.RendererStylePoolSize,
-		RenderTimeout:  cfg.RendererRenderTimeout,
-		WorkerLifetime: cfg.RendererWorkerLifetime,
-		StartupTimeout: cfg.RendererStartupTimeout,
-		StylesDir:      absPath("TileServer/Styles"),
-		FontsDir:       absPath("TileServer/Fonts"),
-		MbtilesFile:    absPath("TileServer/Datasets/Combined.mbtiles"),
+		Backend:          cfg.RendererBackend,
+		PoolSize:         cfg.RendererPoolSize,
+		StylePoolSize:    cfg.RendererStylePoolSize,
+		StylePoolMin:     cfg.RendererStylePoolMin,
+		StylePoolIdleTTL: cfg.RendererStylePoolIdle,
+		RenderTimeout:    cfg.RendererRenderTimeout,
+		StartupTimeout:   cfg.RendererStartupTimeout,
+		StylesDir:        absPath("TileServer/Styles"),
+		FontsDir:         absPath("TileServer/Fonts"),
+		MbtilesFile:      absPath("TileServer/Datasets/Combined.mbtiles"),
 		// DiscoverStyles re-scans the disk each time it's called, so
 		// new style directories added after startup are picked up on
 		// ReloadStyles (admin "Reload Styles" button or dataset change).
@@ -114,24 +113,18 @@ func main() {
 	}
 	localStyleIDs, _ := rendererCfg.DiscoverStyles()
 
-	// Backend selection. "node-pool" is the production default and runs
-	// the existing Node subprocess workers. "go-pool" is the in-process
-	// path on top of maplibre-native-go (see
-	// docs/superpowers/plans/2026-05-01-in-process-go-renderer.md);
-	// requires building with -tags mln_ffi and the libmln_ffi.so present
-	// at runtime. Without the tag, NewGoPoolRenderer returns a clear
-	// error from the stub and we exit rather than silently falling back.
+	// The in-process Go renderer is the only backend. It requires the
+	// mln_ffi build tag and libmaplibre-native-c.so; without the tag the
+	// stub returns a clear error rather than silently degrading.
 	var (
 		renderEngine renderer.Renderer
 		err          error
 	)
 	switch cfg.RendererBackend {
-	case "go-pool":
+	case "go-pool", "":
 		renderEngine, err = renderer.NewGoPoolRenderer(rendererCfg)
-	case "node-pool", "":
-		renderEngine, err = renderer.NewNodePoolRenderer(rendererCfg, renderer.DefaultSpawnFactory(rendererCfg))
 	default:
-		slog.Error("Unknown RENDERER_BACKEND; expected 'node-pool' or 'go-pool'", "backend", cfg.RendererBackend)
+		slog.Error("Unknown RENDERER_BACKEND; only 'go-pool' is supported on this build", "backend", cfg.RendererBackend)
 		os.Exit(1)
 	}
 	if err != nil {
@@ -508,9 +501,8 @@ func initCacheCleaners(cfg *config.Config) {
 }
 
 // absPath converts a relative path to absolute based on the process's
-// working directory. The renderer passes these paths to Node worker
-// subprocesses via CLI args and style.json rewriting, so they must be
-// absolute — relative paths would break if the worker's cwd differs.
+// working directory. These paths are baked into the prepared style.json
+// that maplibre-native loads, so they must be absolute.
 func absPath(rel string) string {
 	abs, err := filepath.Abs(rel)
 	if err != nil {

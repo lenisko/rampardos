@@ -14,50 +14,18 @@ import (
 	"github.com/lenisko/rampardos/internal/models"
 )
 
-// Integration tests for the renderer, parameterised over the backend.
+// Shared fixtures and assertions for the renderer integration tests.
+// The only backend is the in-process Go renderer; TestIntegrationGo lives
+// in integration_mln_ffi_test.go because it additionally needs the
+// mln_ffi build tag and libmaplibre-native-c.so.
 //
-// TestIntegrationNode exercises NodePoolRenderer against a real Node
-// worker spawned with @maplibre/maplibre-gl-native. TestIntegrationGo
-// (in integration_mln_ffi_test.go, gated by the mln_ffi build tag)
-// exercises GoPoolRenderer against the maplibre-native-go binding.
-// Both share the fixtures and assertions defined here so the two paths
-// stay observably equivalent at the Renderer interface boundary.
-//
-// Run Node only:
-//   go test -tags renderer_integration ./internal/services/renderer/ -v
-//
-// Run both Node and Go (requires libmaplibre-native-c.so available
-// via pkg-config; see scripts/build-mln-ffi.sh):
+// Run (requires libmaplibre-native-c.so via pkg-config; see
+// scripts/build-mln-ffi.sh):
 //   go test -tags 'renderer_integration mln_ffi' ./internal/services/renderer/ -v
-
-// TestIntegrationNode exercises NodePoolRenderer against a real
-// `node render-worker.js` spawned with @maplibre/maplibre-gl-native.
-//
-// Prerequisites:
-//   - rampardos-render-worker/node_modules populated via `npm install`
-//   - Node on PATH
-func TestIntegrationNode(t *testing.T) {
-	workerDir := findWorkerDir(t)
-
-	cfg := setupIntegrationFixtures(t)
-	cfg.Backend = "node-pool"
-	cfg.NodeBinary = "node"
-	cfg.WorkerScript = filepath.Join(workerDir, "render-worker.js")
-	cfg.WorkerLifetime = 100
-
-	r, err := NewNodePoolRenderer(cfg, DefaultSpawnFactory(cfg))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-
-	runRenderAssertions(t, r)
-}
 
 // setupIntegrationFixtures creates a temp dir with a minimal background-
 // only style and an empty-but-valid mbtiles file, returning a Config
-// that points at them. The caller adds backend-specific fields
-// (NodeBinary/WorkerScript for Node, none for Go) and constructs the
+// that points at them. The caller sets Backend and constructs the
 // renderer.
 func setupIntegrationFixtures(t *testing.T) Config {
 	t.Helper()
@@ -128,19 +96,6 @@ func runRenderAssertions(t *testing.T, r Renderer) {
 		t.Errorf("PNG suspiciously small: %d bytes", len(out))
 	}
 	t.Logf("render produced %d-byte PNG", len(out))
-}
-
-func findWorkerDir(t *testing.T) string {
-	t.Helper()
-	root := findRepoRoot(t)
-	candidate := filepath.Join(root, "rampardos-render-worker")
-	if _, err := os.Stat(filepath.Join(candidate, "render-worker.js")); err != nil {
-		t.Skipf("rampardos-render-worker not found at %s: %v", candidate, err)
-	}
-	if _, err := os.Stat(filepath.Join(candidate, "node_modules", "@maplibre", "maplibre-gl-native")); err != nil {
-		t.Skipf("@maplibre/maplibre-gl-native not installed — run `npm install` in %s", candidate)
-	}
-	return candidate
 }
 
 func findRepoRoot(t *testing.T) string {
