@@ -707,17 +707,6 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 	var timeToFirstEvent time.Duration
 	firstEventSeen := false
 
-	// mbgl's own accounting, from RenderFrameFinished. Every draw we make
-	// reports back whether mbgl considered the frame Partial (drawn before
-	// all tiles were present) or Full. Only the Full frame's pixels reach
-	// the client, so partialFrames is a direct measure of discarded GPU
-	// work — the thing that distinguishes "the pump is drawing once per
-	// arriving tile" from "the draws were all necessary".
-	partialFrames := 0
-	fullFrames := 0
-	frameEvents := 0
-	var mbglRenderSeconds float64
-
 	// drain polls every queued event, folding render-updates into a single
 	// pending flag. Returns whether it saw any event, and whether the still
 	// image completed. Extracted so the batching sweep below can re-drain
@@ -740,27 +729,6 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			switch ev.Type {
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
 				pendingRenderUpdate = true
-			case maplibre.RuntimeEventMapRenderFrameFinished:
-				// Diagnostic only — does not drive the loop. Mode reports
-				// whether the frame we just drew was complete.
-				//
-				// frameEvents counts arrivals *before* the payload assertion
-				// so the two failure modes stay distinguishable:
-				// frameEvents==0 means the event never reaches us (the FFI
-				// sets the session renderer's observer once, only when the
-				// renderer is first created), whereas frameEvents>0 with
-				// partial+full==0 means the payload failed to decode. The
-				// first cut of this metric conflated them and read zero
-				// either way.
-				frameEvents++
-				if p, ok := ev.Payload.(maplibre.RuntimeEventRenderFramePayload); ok {
-					if p.Mode == maplibre.RenderModeFull {
-						fullFrames++
-					} else {
-						partialFrames++
-					}
-					mbglRenderSeconds += p.Stats.RenderingTime
-				}
 			case maplibre.RuntimeEventMapStillImageFinished:
 				return sawEvent, true, nil
 			case maplibre.RuntimeEventMapLoadingFailed:
@@ -830,10 +798,6 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 					timeToFirstEvent.Seconds(),
 					totalRenderUpdate.Seconds(),
 					renderUpdateCnt,
-				)
-				services.GlobalMetrics.RecordRendererFrameBreakdown(
-					w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
-					partialFrames, fullFrames, frameEvents, mbglRenderSeconds,
 				)
 			}
 			return nil
