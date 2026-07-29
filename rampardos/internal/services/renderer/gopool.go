@@ -315,8 +315,9 @@ type goStylePool struct {
 	cmds chan goWorkerCommand
 	wg   sync.WaitGroup
 
-	mu     sync.Mutex
-	closed bool
+	mu      sync.Mutex
+	closed  bool
+	workers []*goWorker // guarded by mu; addressed by broadcast operations
 }
 
 type goWorkerCmdKind int
@@ -367,12 +368,16 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 	}
 
 	startupErrs := make(chan error, cfg.poolSize)
+	p.workers = make([]*goWorker, 0, cfg.poolSize)
 	for i := 0; i < cfg.poolSize; i++ {
-		p.wg.Add(1)
-		go (&goWorker{
+		w := &goWorker{
 			pool:        p,
 			startupErrs: startupErrs,
-		}).loop()
+			broadcast:   make(chan goWorkerCommand, 1),
+		}
+		p.workers = append(p.workers, w)
+		p.wg.Add(1)
+		go w.loop()
 	}
 
 	// Wait for all workers to report startup status. First failure
@@ -441,8 +446,17 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 // process commands serially so reload queues behind in-flight renders.
 // Returns the first error from any worker.
 func (p *goStylePool) setStyleAll(ctx context.Context, styleURL string) error {
-	replies := make([]chan goWorkerResult, p.cfg.poolSize)
-	for i := 0; i < p.cfg.poolSize; i++ {
+	p.mu.Lock()
+	workers := make([]*goWorker, len(p.workers))
+	copy(workers, p.workers)
+	p.mu.Unlock()
+
+	// Address each worker's own channel rather than the shared queue, so
+	// every worker reloads exactly once. Post to all of them first, then
+	// collect: the channels are buffered, so a worker busy rendering picks
+	// its reload up when it returns to the loop instead of blocking us.
+	replies := make([]chan goWorkerResult, len(workers))
+	for i, w := range workers {
 		replies[i] = make(chan goWorkerResult, 1)
 		cmd := goWorkerCommand{
 			kind:   goWorkerCmdReload,
@@ -451,14 +465,14 @@ func (p *goStylePool) setStyleAll(ctx context.Context, styleURL string) error {
 			reply:  replies[i],
 		}
 		select {
-		case p.cmds <- cmd:
+		case w.broadcast <- cmd:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 
 	var firstErr error
-	for i := 0; i < p.cfg.poolSize; i++ {
+	for i := range workers {
 		select {
 		case res := <-replies[i]:
 			if res.err != nil && firstErr == nil {
@@ -468,6 +482,7 @@ func (p *goStylePool) setStyleAll(ctx context.Context, styleURL string) error {
 			if firstErr == nil {
 				firstErr = ctx.Err()
 			}
+			return firstErr
 		}
 	}
 	return firstErr
@@ -491,6 +506,15 @@ func (p *goStylePool) close() {
 type goWorker struct {
 	pool        *goStylePool
 	startupErrs chan<- error
+
+	// broadcast receives commands addressed to THIS worker specifically,
+	// as opposed to pool.cmds which is a shared work-stealing queue. Style
+	// reloads must reach every worker exactly once, which a shared channel
+	// cannot guarantee: a worker that finishes one reload returns to the
+	// queue and can take a second, leaving a worker that was mid-render at
+	// broadcast time with a stale style. Buffered so setStyleAll can post
+	// to every worker without deadlocking against workers that are busy.
+	broadcast chan goWorkerCommand
 
 	rt   *maplibre.RuntimeHandle
 	m    *maplibre.MapHandle
@@ -516,7 +540,18 @@ func (w *goWorker) loop() {
 	w.startupErrs <- nil
 	defer w.cleanup()
 
-	for cmd := range w.pool.cmds {
+	for {
+		var cmd goWorkerCommand
+		select {
+		case c, ok := <-w.pool.cmds:
+			if !ok {
+				return // pool closed
+			}
+			cmd = c
+		case c := <-w.broadcast:
+			cmd = c
+		}
+
 		switch cmd.kind {
 		case goWorkerCmdRender:
 			img, err := w.renderOne(cmd.ctx, cmd.render.vp, cmd.render.scale)
