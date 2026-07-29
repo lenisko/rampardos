@@ -110,6 +110,40 @@ func TestRetiredWorkerReceivesShutdown(t *testing.T) {
 	}
 }
 
+// The high-water mark is the whole point of pool_workers_max: the plain
+// gauge is sampled at scrape time, so a pool that grew during a burst and
+// decayed before the next scrape would leave no evidence of the peak.
+func TestPoolHighWaterSurvivesShrink(t *testing.T) {
+	p := newTestPool(1, 4)
+	p.grow()
+	p.grow()
+	p.grow()
+	p.reportSize()
+
+	p.mu.Lock()
+	peak := p.highWater
+	p.mu.Unlock()
+	if peak != 4 {
+		t.Fatalf("high water after growth = %d, want 4", peak)
+	}
+
+	// Decay all the way back to the floor.
+	p.saturated = false
+	for p.reapOnce() {
+		p.saturated = false
+	}
+	if got := p.size(); got != 1 {
+		t.Fatalf("size after full decay = %d, want floor 1", got)
+	}
+
+	p.mu.Lock()
+	peak = p.highWater
+	p.mu.Unlock()
+	if peak != 4 {
+		t.Errorf("high water after shrink = %d, want it to stay at the peak 4", peak)
+	}
+}
+
 func TestPoolAtCeilingDoesNotGrowButRecordsSaturation(t *testing.T) {
 	p := newTestPool(2, 2)
 	p.grow()

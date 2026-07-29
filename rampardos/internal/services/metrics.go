@@ -97,6 +97,9 @@ type MetricsManager struct {
 	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker in (style, scale) pool
 	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
 	rendererPoolWorkers        *prometheus.GaugeVec     // resident workers per (style, scale); varies as pools grow/shrink
+	rendererPoolWorkersMax     *prometheus.GaugeVec     // high-water resident workers per pool since start
+	rendererPoolGrow           *prometheus.CounterVec   // workers added on demand
+	rendererPoolShrink         *prometheus.CounterVec   // workers retired when idle
 	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
 
 	// Go-renderer per-render breakdown. Decomposes the total per-render
@@ -117,6 +120,13 @@ type MetricsManager struct {
 	// saturation metrics above.
 	rendererGlobalCapacity    prometheus.Gauge
 	rendererGlobalInFlight    prometheus.Gauge
+	rendererGlobalInFlightMax prometheus.Gauge // high-water concurrent renders since start
+
+	// inFlight mirrors rendererGlobalInFlight so the high-water mark can be
+	// computed without reading back from Prometheus.
+	inFlight                  int
+	peakInFlight              float64
+	inFlightMu                sync.Mutex
 	rendererGlobalAcquireWait prometheus.Histogram
 
 	// Dataset size metrics
@@ -291,6 +301,21 @@ func newMetricsManager() *MetricsManager {
 			Help: "Resident workers in each (style, scale) pool. Pools start at STYLE_POOL_MIN, grow towards STYLE_POOL_SIZE when a dispatch finds every worker busy, and retire one worker per idle interval back down to the floor. Each worker is a full mbgl map + runtime + EGL context, so this gauge tracks the renderer's memory footprint.",
 		}, []string{"style", "scale"}),
 
+		rendererPoolWorkersMax: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_pool_workers_max",
+			Help: "Highest resident worker count each (style, scale) pool has reached since process start. The pool_workers gauge only shows the value at scrape time, so a pool that grew during a burst and decayed before the next scrape leaves no trace there; this is the number to size STYLE_POOL_SIZE against.",
+		}, []string{"style", "scale"}),
+
+		rendererPoolGrow: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_pool_grow_total",
+			Help: "Workers added because a dispatch found every worker in the pool busy. Compare with pool_shrink_total: comparable rates on a short interval mean the pool is oscillating and STYLE_POOL_IDLE_SECONDS is too low.",
+		}, []string{"style", "scale"}),
+
+		rendererPoolShrink: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_pool_shrink_total",
+			Help: "Workers retired after an idle interval, each releasing an mbgl map, runtime and EGL context.",
+		}, []string{"style", "scale"}),
+
 		rendererWorkerReplacements: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_worker_replacements_total",
 			Help: "Worker processes killed and respawned. reason=error counts abnormal dispatch failures; reason=lifetime counts routine recycling after workerLifetime renders.",
@@ -335,6 +360,11 @@ func newMetricsManager() *MetricsManager {
 		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "rampardos_renderer_global_capacity",
 			Help: "Maximum concurrent renders across all (style, scale) pools (RENDERER_POOL_SIZE). Static; set once at renderer init.",
+		}),
+
+		rendererGlobalInFlightMax: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_global_in_flight_max",
+			Help: "Highest number of concurrent renders observed since process start. Compare with rampardos_renderer_global_capacity: if this stays well below the cap, the configured concurrency (and the worker pools sized for it) is never needed.",
 		}),
 
 		rendererGlobalInFlight: promauto.NewGauge(prometheus.GaugeOpts{
@@ -526,9 +556,21 @@ func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeco
 	m.rendererPoolIdleWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(idleAfter))
 }
 
-// SetRendererPoolWorkers publishes a pool's current worker count.
-func (m *MetricsManager) SetRendererPoolWorkers(style, scale string, workers int) {
+// SetRendererPoolWorkers publishes a pool's current worker count and
+// advances its high-water mark. highWater is tracked by the caller (the
+// pool owns the lock that makes it consistent with the count).
+func (m *MetricsManager) SetRendererPoolWorkers(style, scale string, workers, highWater int) {
 	m.rendererPoolWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(workers))
+	m.rendererPoolWorkersMax.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(highWater))
+}
+
+// RecordRendererPoolGrow / Shrink count elasticity events.
+func (m *MetricsManager) RecordRendererPoolGrow(style, scale string) {
+	m.rendererPoolGrow.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
+}
+
+func (m *MetricsManager) RecordRendererPoolShrink(style, scale string) {
+	m.rendererPoolShrink.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
 }
 
 func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
@@ -573,10 +615,23 @@ func (m *MetricsManager) SetRendererGlobalCapacity(capacity int) {
 func (m *MetricsManager) RecordRendererGlobalAcquire(waitSeconds float64) {
 	m.rendererGlobalAcquireWait.Observe(waitSeconds)
 	m.rendererGlobalInFlight.Inc()
+
+	m.inFlightMu.Lock()
+	m.inFlight++
+	if n := m.inFlight; float64(n) > m.peakInFlight {
+		m.peakInFlight = float64(n)
+		m.rendererGlobalInFlightMax.Set(m.peakInFlight)
+	}
+	m.inFlightMu.Unlock()
 }
 
 func (m *MetricsManager) DecRendererGlobalInFlight() {
 	m.rendererGlobalInFlight.Dec()
+	m.inFlightMu.Lock()
+	if m.inFlight > 0 {
+		m.inFlight--
+	}
+	m.inFlightMu.Unlock()
 }
 
 func (m *MetricsManager) RecordImageCacheHit(name string) {

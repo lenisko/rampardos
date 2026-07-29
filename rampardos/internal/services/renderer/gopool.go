@@ -334,6 +334,7 @@ type goStylePool struct {
 	// happens after a whole tick with no saturation, so a pool ramps up
 	// fast and decays slowly rather than thrashing around the boundary.
 	saturated  bool
+	highWater  int // most workers this pool has held; guarded by mu
 	reaperDone chan struct{}
 
 	// startWorker is the worker constructor, swappable in tests so the
@@ -479,6 +480,9 @@ func (p *goStylePool) grow() {
 	p.mu.Unlock()
 
 	slog.Debug("renderer pool growing", "style", p.cfg.styleID, "scale", p.cfg.scaleLabel, "workers", size, "max", p.cfg.poolSize)
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.RecordRendererPoolGrow(p.cfg.styleID, p.cfg.scaleLabel)
+	}
 	p.reportSize()
 
 	go func() {
@@ -534,18 +538,28 @@ func (p *goStylePool) reapOnce() bool {
 	// it picks the shutdown up when it returns to the loop.
 	victim.broadcast <- goWorkerCommand{kind: goWorkerCmdShutdown}
 	slog.Debug("renderer pool shrinking", "style", p.cfg.styleID, "scale", p.cfg.scaleLabel, "workers", size, "min", p.cfg.minPoolSize)
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.RecordRendererPoolShrink(p.cfg.styleID, p.cfg.scaleLabel)
+	}
 	p.reportSize()
 	return true
 }
 
+// reportSize publishes the pool's current size and its high-water mark.
+// Both are read under the same lock so the peak can never lag behind a
+// size it was derived from.
 func (p *goStylePool) reportSize() {
-	if services.GlobalMetrics == nil {
-		return
-	}
 	p.mu.Lock()
 	n := len(p.workers)
+	if n > p.highWater {
+		p.highWater = n
+	}
+	peak := p.highWater
 	p.mu.Unlock()
-	services.GlobalMetrics.SetRendererPoolWorkers(p.cfg.styleID, p.cfg.scaleLabel, n)
+
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.SetRendererPoolWorkers(p.cfg.styleID, p.cfg.scaleLabel, n, peak)
+	}
 }
 
 // dispatch sends a render command to whichever worker is ready (or
