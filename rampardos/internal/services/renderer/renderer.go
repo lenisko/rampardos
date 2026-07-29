@@ -74,7 +74,8 @@ type ViewportRequest struct {
 
 // Config selects and parameterises a Renderer backend.
 type Config struct {
-	// Backend selects the implementation. Currently only "node-pool".
+	// Backend selects the implementation: "go-pool" (in-process, the
+	// default) or "node-pool" (Node subprocess workers, the fallback).
 	Backend string
 
 	// Node worker pool configuration (ignored by other backends).
@@ -86,16 +87,6 @@ type Config struct {
 	RenderTimeout  time.Duration // per-request deadline (default: 15s)
 	WorkerLifetime int           // max renders per worker before recycling (default: 500)
 	StartupTimeout time.Duration // max time to wait for a worker handshake (default: 10s)
-
-	// DrawBatching enables the go-pool pump's non-blocking sweep before
-	// each draw (default: true). Pump returns as soon as one event is
-	// latched, so without it the loop draws once per arriving tile —
-	// prod measured ~14 draws per render where only the frame completing
-	// the still image is served. The sweep absorbs already-completed work
-	// via Pump(0), which never parks, so it cannot add latency. Set false
-	// to restore draw-per-event for comparison. Ignored by non-go-pool
-	// backends.
-	DrawBatching bool
 
 	// Asset paths resolved to absolute paths at load time.
 	StylesDir   string // e.g. "TileServer/Styles"

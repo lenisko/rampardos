@@ -32,12 +32,6 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// maxBatchSweeps bounds the non-blocking Pump(0) sweeps performed before
-// each draw when draw batching is enabled. Each sweep is a cheap cgo call
-// that absorbs work already completed; the bound stops a steady tile
-// arrival rate from deferring the draw indefinitely.
-const maxBatchSweeps = 4
-
 // Ensure GoPoolRenderer satisfies the Renderer interface.
 var _ Renderer = (*GoPoolRenderer)(nil)
 
@@ -192,7 +186,6 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 		styleURL:        "file://" + preparedPath,
 		startupTimeout:  r.cfg.StartupTimeout,
 		renderTimeout:   r.cfg.RenderTimeout,
-		drawBatching:    r.cfg.DrawBatching,
 	}
 	return newGoStylePool(cfg)
 }
@@ -311,7 +304,6 @@ type goStylePoolConfig struct {
 	styleURL        string // "file://<preparedPath>"
 	startupTimeout  time.Duration
 	renderTimeout   time.Duration
-	drawBatching    bool
 }
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
@@ -820,40 +812,6 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 		_, finished, err := drain()
 		if err != nil {
 			return err
-		}
-
-		// Batching sweep. Pump returns as soon as ONE piece of work is
-		// latched, so under progressive tile arrival we drain-and-draw once
-		// per tile: prod measured ~14 draws per render, and the runtime's
-		// tail coalescing cannot help because we are back at PollEvent
-		// before a second event can queue behind the first. Every draw
-		// renders the whole viewport, but only the frame that completes the
-		// still is served — the rest is discarded work.
-		//
-		// Pump(0) is documented as "drains and returns"; it never parks, so
-		// this cannot add latency. It only sweeps up work that already
-		// completed while we were drawing the previous frame. Each sweep
-		// that catches another update removes one whole draw.
-		//
-		// Bounded so a steady arrival rate cannot starve the draw, which
-		// would delay the render that ultimately completes the still.
-		if w.pool.cfg.drawBatching && pendingRenderUpdate && !finished {
-			for sweep := 0; sweep < maxBatchSweeps; sweep++ {
-				if err := w.rt.Pump(0); err != nil {
-					return fmt.Errorf("renderer: pump(0): %w", err)
-				}
-				saw, done, err := drain()
-				if err != nil {
-					return err
-				}
-				if done {
-					finished = true
-					break
-				}
-				if !saw {
-					break
-				}
-			}
 		}
 
 		if err := flush(); err != nil {

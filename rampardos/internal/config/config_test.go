@@ -9,8 +9,8 @@ import (
 func TestLoadRendererDefaults(t *testing.T) {
 	clearRendererEnv(t)
 	cfg := Load()
-	if cfg.RendererBackend != "node-pool" {
-		t.Errorf("RendererBackend: got %q, want %q", cfg.RendererBackend, "node-pool")
+	if cfg.RendererBackend != "go-pool" {
+		t.Errorf("RendererBackend: got %q, want %q", cfg.RendererBackend, "go-pool")
 	}
 	if cfg.RendererNodeBinary != "node" {
 		t.Errorf("RendererNodeBinary: got %q, want %q", cfg.RendererNodeBinary, "node")
