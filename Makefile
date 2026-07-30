@@ -71,7 +71,7 @@ test:
 
 ## test-integration: Run integration tests (needs the FFI; see build-ffi)
 test-integration:
-	cd $(GO_DIR) && $(GOTEST) -tags 'renderer_integration mln_ffi' ./internal/services/renderer/ -v -timeout 60s
+	cd $(GO_DIR) && $(GOTEST) -tags renderer_integration ./internal/services/renderer/ -v -timeout 60s
 
 ## test-coverage: Run tests with coverage report
 test-coverage:
@@ -89,7 +89,7 @@ clean:
 build-ffi:
 	MLN_FFI_REV=$(MLN_FFI_REV) MLN_FFI_DIR_HOST=$(MLN_FFI_DIR_HOST) ./scripts/build-mln-ffi.sh
 
-## build-go-renderer: Build rampardos with the Go renderer compiled in (-tags mln_ffi). Run build-ffi first.
+## build-go-renderer: Build rampardos against a host-built FFI (Linux only). Run build-ffi first.
 build-go-renderer:
 	@test -f $(MLN_FFI_DIR_HOST)/build/libmaplibre-native-c.so || \
 	  (echo "FFI not built. Run 'make build-ffi' first." >&2 && exit 1)
@@ -98,7 +98,7 @@ build-go-renderer:
 	  PKG_CONFIG_PATH=$(MLN_FFI_DIR_HOST)/build/pkgconfig \
 	  CGO_LDFLAGS="-Wl,-rpath,$(MLN_FFI_DIR_HOST)/build" \
 	  CGO_ENABLED=1 \
-	  $(GOBUILD) -trimpath $(LDFLAGS) -tags 'nodynamic mln_ffi' -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
+	  $(GOBUILD) -trimpath $(LDFLAGS) -tags nodynamic -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
 
 ## clean-ffi: Remove the host FFI build directory ($MLN_FFI_DIR_HOST)
 clean-ffi:

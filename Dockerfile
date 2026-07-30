@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1
 
+# Global so both the FFI build and the Go build see the same value: the
+# native library and the Go binding pinned in go.mod must come from one
+# upstream commit, and the rampardos-build stage asserts that.
+ARG MLN_FFI_REV=91ecc920462420f977959d546d2735823d2f0092
+
 # ================================
 # Get Git commit SHA
 # ================================
@@ -60,7 +65,7 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
 ARG MLN_FFI_REPO=https://github.com/maplibre/maplibre-native-ffi
-ARG MLN_FFI_REV=91ecc920462420f977959d546d2735823d2f0092
+ARG MLN_FFI_REV
 # Keep in sync with the FFI's mise.toml [vars] at MLN_FFI_REV.
 ARG MLN_CMAKE_VERSION=4.3.3
 ARG MLN_RUST_VERSION=1.95.0
@@ -151,12 +156,6 @@ RUN case "$TARGETARCH" in \
  && test -f build/current/share/pkgconfig/maplibre-native-c.pc \
  && ls -la build/current/lib build/current/share/pkgconfig
 
-# Vendor the Go binding source so the rampardos-build stage can consume it
-# via a go.mod `replace` directive. Bound to the FFI commit → guarantees
-# binding version == C ABI version.
-RUN cp -r bindings/go /vendor-maplibre-go \
- && ls /vendor-maplibre-go | head -20
-
 # Point the .so at its own directory so any transitive private deps resolve
 # without registering a global ldconfig path. A global path previously
 # shadowed Ubuntu's libpng/libjpeg for other consumers in the image
@@ -173,9 +172,10 @@ RUN apt-get update \
 # ================================
 # Build Go binary
 #
-# Builds with -tags 'nodynamic mln_ffi' so the in-process Go renderer
-# (gopool.go) is compiled in. It is the only renderer backend; without the
-# tag the stub errors at startup rather than degrading silently.
+# The renderer is Linux-only by file suffix (gopool_linux.go), so a Linux
+# build always includes it — there is no build tag to forget. The binding
+# comes from the module proxy like any other dependency; only the native
+# library and its headers come from the mln-ffi-build stage.
 #
 # Switched from golang:1.26-alpine (musl, CGO_ENABLED=0) to glibc-based
 # golang:1.26 because libmaplibre-native-c.so is built on Ubuntu 24.04
@@ -201,17 +201,30 @@ RUN apt-get update \
 # build/current is a symlink into the preset's install tree, so copy the
 # resolved directory (lib/, include/, share/pkgconfig/).
 COPY --from=mln-ffi-build /ffi/build/current/ /ffi/install/
-COPY --from=mln-ffi-build /vendor-maplibre-go /vendor-maplibre-go
 WORKDIR /src
 COPY --from=git-info /git-commit.txt /git-commit.txt
 COPY rampardos/go.mod rampardos/go.sum ./
+# The Go binding and the C ABI it calls must come from the same commit.
+# go.mod pins a pseudo-version whose suffix is the upstream commit, so
+# compare it against the revision the native library was built from rather
+# than trusting the two to be updated together.
+ARG MLN_FFI_REV
+RUN set -eu; \
+    want="$(printf '%s' "${MLN_FFI_REV}" | cut -c1-12)"; \
+    got="$(go list -m -f '{{.Version}}' github.com/maplibre/maplibre-native-ffi/bindings/go | sed 's/.*-//')"; \
+    if [ "$want" != "$got" ]; then \
+      echo "binding/ABI mismatch: go.mod has $got, MLN_FFI_REV is $want" >&2; \
+      echo "run: cd rampardos && go get github.com/maplibre/maplibre-native-ffi/bindings/go@${MLN_FFI_REV}" >&2; \
+      exit 1; \
+    fi; \
+    echo "binding matches native library at $got"
 RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
     PKG_CONFIG_PATH=/ffi/install/share/pkgconfig \
     CGO_LDFLAGS="-Wl,-rpath,/opt/rampardos/lib" \
     CGO_ENABLED=1 \
-    go build -trimpath -tags 'nodynamic mln_ffi' \
+    go build -trimpath -tags nodynamic \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
     -o /out/rampardos ./cmd/server
 

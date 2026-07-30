@@ -16,9 +16,8 @@ import (
 )
 
 // Encoding and pool-keying helpers shared by every renderer entry point.
-// These live outside gopool.go because that file is behind the mln_ffi
-// build tag; keeping them untagged means the package still compiles (and
-// these stay testable) without the FFI toolchain.
+// Kept out of gopool_linux.go so they compile — and stay testable — on
+// every platform, not just the Linux build that carries the renderer.
 
 // rendererPNGBufferPool reuses png.EncoderBuffer across encodes so
 // the internal zlib writer and filter working buffers don't allocate

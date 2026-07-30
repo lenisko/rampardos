@@ -15,13 +15,12 @@ import (
 )
 
 // Shared fixtures and assertions for the renderer integration tests.
-// The only backend is the in-process Go renderer; TestIntegrationGo lives
-// in integration_mln_ffi_test.go because it additionally needs the
-// mln_ffi build tag and libmaplibre-native-c.so.
+// TestIntegrationGo lives in integration_go_linux_test.go because the
+// renderer is Linux-only.
 //
-// Run (requires libmaplibre-native-c.so via pkg-config; see
+// Run on Linux (requires libmaplibre-native-c.so via pkg-config; see
 // scripts/build-mln-ffi.sh):
-//   go test -tags 'renderer_integration mln_ffi' ./internal/services/renderer/ -v
+//   go test -tags renderer_integration ./internal/services/renderer/ -v
 
 // setupIntegrationFixtures creates a temp dir with a minimal background-
 // only style and an empty-but-valid mbtiles file, returning a Config

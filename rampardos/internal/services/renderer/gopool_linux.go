@@ -1,17 +1,11 @@
-//go:build mln_ffi
-
-// Package renderer's Go-binding-backed implementation. Compiled only
-// when -tags mln_ffi is set, because the import of
-// github.com/maplibre/maplibre-native-ffi/bindings/go pulls in CGO and
-// the libmaplibre-native-c.so shared library. Standard rampardos builds
-// (no tag) get the stub from gopool_stub.go.
+// Package renderer's in-process implementation, driving maplibre-native
+// through its C ABI. Linux-only: it needs EGL and links
+// libmaplibre-native-c.so. The _linux suffix is the whole constraint —
+// non-Linux builds get the stub in gopool_other.go.
 //
-// Spike scope (see docs/superpowers/specs/2026-05-27-go-renderer-opengl-spike-design.md):
-// upstream binding, EGL OpenGL backend only, single-variant link. The
-// outer renderer.Renderer interface is unchanged; the per-pool internals
-// are rewritten as runtime.LockOSThread-pinned worker goroutines because
-// the upstream binding requires every native call to originate on the
-// thread that created the Runtime.
+// Per-pool internals are runtime.LockOSThread-pinned worker goroutines
+// because the binding requires every native call for a Runtime to
+// originate on the thread that created it.
 package renderer
 
 import (

@@ -1,5 +1,3 @@
-//go:build mln_ffi && linux
-
 // Per-worker EGL context for the Go renderer's OpenGL backend.
 //
 // One EGL context per OS thread. EGL is thread-local — never share an

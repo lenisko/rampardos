@@ -1,5 +1,3 @@
-//go:build mln_ffi
-
 package renderer
 
 import (
