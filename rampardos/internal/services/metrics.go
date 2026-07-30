@@ -865,7 +865,7 @@ func (m *MetricsManager) GetTemplateRenderStats() []TemplateRenderStat {
 	}()
 
 	for metric := range ch {
-		var pm prometheus.Metric = metric
+		pm := metric
 		var dto prommodel.Metric
 		if err := pm.Write(&dto); err != nil {
 			continue

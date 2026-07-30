@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -81,10 +82,15 @@ func (tc *TemplatesController) SaveTemplate(name, oldName, content string) error
 	path := filepath.Join(tc.folder, sanitized+".json")
 
 	// Create backup of existing file before saving
+	// A failed backup must not fail the save — the user asked to write the
+	// template, not to keep a copy — but it does need to be visible, because
+	// silently skipping it leaves them believing a recovery point exists.
 	if existingContent, err := os.ReadFile(path); err == nil {
 		timestamp := time.Now().Unix()
 		backupPath := filepath.Join(tc.folder, fmt.Sprintf("%s.json.%d", sanitized, timestamp))
-		os.WriteFile(backupPath, existingContent, 0644)
+		if err := os.WriteFile(backupPath, existingContent, 0644); err != nil {
+			slog.Warn("Failed to back up template before overwrite", "template", sanitized, "backup", backupPath, "error", err)
+		}
 	}
 
 	return os.WriteFile(path, []byte(content), 0644)
@@ -149,8 +155,12 @@ func (tc *TemplatesController) DeleteTemplate(name string) error {
 	if err != nil {
 		return err
 	}
-	// Also remove test data if exists
-	tc.DeleteTestData(name)
+	// Also remove test data if exists. The template itself is already
+	// deleted, so a failure here leaves an orphaned test file rather than
+	// an inconsistent template — worth reporting, not worth failing on.
+	if err := tc.DeleteTestData(name); err != nil {
+		slog.Warn("Failed to delete template test data", "template", name, "error", err)
+	}
 	return nil
 }
 

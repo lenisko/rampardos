@@ -622,10 +622,24 @@ func parseColor(s string) color.Color {
 		if len(parts) == 4 {
 			var r, g, b int
 			var a float64
-			fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &r)
-			fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &g)
-			fmt.Sscanf(strings.TrimSpace(parts[2]), "%d", &b)
-			fmt.Sscanf(strings.TrimSpace(parts[3]), "%f", &a)
+			// Unchecked, a malformed component left its variable at zero and
+			// the colour came out silently wrong: "rgba(255,x,0,1)" rendered
+			// as black rather than being rejected. Treat an unparseable
+			// component the same as unparseable input elsewhere in this
+			// function — transparent — so a typo is visible rather than
+			// quietly painting the wrong colour.
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &r); err != nil {
+				return color.Transparent
+			}
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &g); err != nil {
+				return color.Transparent
+			}
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[2]), "%d", &b); err != nil {
+				return color.Transparent
+			}
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[3]), "%f", &a); err != nil {
+				return color.Transparent
+			}
 			// Use NRGBA (non-premultiplied alpha) for correct transparency
 			return color.NRGBA{uint8(r), uint8(g), uint8(b), uint8(a * 255)}
 		}
@@ -637,9 +651,17 @@ func parseColor(s string) color.Color {
 		parts := strings.Split(inner, ",")
 		if len(parts) == 3 {
 			var r, g, b int
-			fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &r)
-			fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &g)
-			fmt.Sscanf(strings.TrimSpace(parts[2]), "%d", &b)
+			// Same hazard as the rgba() branch above: an unparsed component
+			// stayed zero and silently shifted the colour.
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &r); err != nil {
+				return color.Transparent
+			}
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &g); err != nil {
+				return color.Transparent
+			}
+			if _, err := fmt.Sscanf(strings.TrimSpace(parts[2]), "%d", &b); err != nil {
+				return color.Transparent
+			}
 			return color.NRGBA{uint8(r), uint8(g), uint8(b), 255}
 		}
 	}
@@ -650,21 +672,32 @@ func parseColor(s string) color.Color {
 	var r, g, b, a uint8 = 0, 0, 0, 255
 
 	switch len(s) {
+	// A hex string of the right length can still contain non-hex digits.
+	// Unchecked, those components stayed zero and the colour came out
+	// wrong instead of being rejected, so "#ff00zz" rendered as "#ff0000".
 	case 3: // RGB
-		fmt.Sscanf(s, "%1x%1x%1x", &r, &g, &b)
+		if _, err := fmt.Sscanf(s, "%1x%1x%1x", &r, &g, &b); err != nil {
+			return color.Transparent
+		}
 		r *= 17
 		g *= 17
 		b *= 17
 	case 4: // RGBA
-		fmt.Sscanf(s, "%1x%1x%1x%1x", &r, &g, &b, &a)
+		if _, err := fmt.Sscanf(s, "%1x%1x%1x%1x", &r, &g, &b, &a); err != nil {
+			return color.Transparent
+		}
 		r *= 17
 		g *= 17
 		b *= 17
 		a *= 17
 	case 6: // RRGGBB
-		fmt.Sscanf(s, "%02x%02x%02x", &r, &g, &b)
+		if _, err := fmt.Sscanf(s, "%02x%02x%02x", &r, &g, &b); err != nil {
+			return color.Transparent
+		}
 	case 8: // RRGGBBAA
-		fmt.Sscanf(s, "%02x%02x%02x%02x", &r, &g, &b, &a)
+		if _, err := fmt.Sscanf(s, "%02x%02x%02x%02x", &r, &g, &b, &a); err != nil {
+			return color.Transparent
+		}
 	default:
 		// Try named colors
 		switch strings.ToLower(s) {

@@ -93,10 +93,11 @@ tidy:
 fmt:
 	$(GOFMT) -s -w $(GO_DIR)
 
-## lint: Run linter (requires golangci-lint)
+## lint: Run golangci-lint. Must run on Linux with CGO — see .golangci.yml.
 lint:
 	@which golangci-lint > /dev/null || (echo "Install: brew install golangci-lint" && exit 1)
-	cd $(GO_DIR) && golangci-lint run
+	@[ "$$(go env GOOS)" = "linux" ] || echo "WARNING: not Linux — GOOS-constrained files are not analysed, and helpers they use are reported as unused."
+	cd $(GO_DIR) && CGO_ENABLED=1 golangci-lint run
 
 ## docker-build: Build multi-arch Docker image locally
 docker-build:

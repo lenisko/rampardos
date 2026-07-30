@@ -52,7 +52,11 @@ func (s *HTTPService) getClient(_ string) *http.Client {
 }
 
 // DownloadFile downloads a file from a URL and saves it to the specified path.
-// timeout: timeout for initial response headers (0 = 30s default). Body read has no timeout for large files.
+// timeout is currently ignored: downloads use the shared client, which
+// sets no overall deadline so large dataset files are not cut off
+// mid-transfer. Cancellation is via ctx. The parameter is kept so callers
+// do not have to change, but passing a value has no effect — do not rely
+// on it to bound a download.
 func DownloadFile(ctx context.Context, fromURL, toPath, expectedType string, timeout time.Duration) error {
 	if globalHTTPService == nil {
 		return fmt.Errorf("HTTP service not initialized")
@@ -63,10 +67,6 @@ func DownloadFile(ctx context.Context, fromURL, toPath, expectedType string, tim
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 	host := parsedURL.Host
-
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
 
 	startTime := time.Now()
 	GlobalMetrics.RecordHTTPClientRequest(host)

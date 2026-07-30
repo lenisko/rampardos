@@ -39,12 +39,12 @@ type DatasetItem struct {
 // DatasetsContext is the template context for datasets page
 type DatasetsContext struct {
 	BaseContext
-	PageID         string
-	PageName       string
-	Datasets       []DatasetItem
-	HasUncombined  bool
-	IsCombined     bool   // true if multiple datasets are combined
-	ActiveDataset  string // name of active dataset (empty if combined)
+	PageID        string
+	PageName      string
+	Datasets      []DatasetItem
+	HasUncombined bool
+	IsCombined    bool   // true if multiple datasets are combined
+	ActiveDataset string // name of active dataset (empty if combined)
 }
 
 // DatasetsAddContext is the template context for add dataset page
@@ -125,13 +125,13 @@ func (v *DatasetsView) Render(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := DatasetsContext{
-		BaseContext:    NewBaseContext(),
-		PageID:         "datasets",
-		PageName:       "Datasets",
-		Datasets:       datasets,
-		HasUncombined:  v.datasetsController.HasUncombined(),
-		IsCombined:     isCombined,
-		ActiveDataset:  activeDataset,
+		BaseContext:   NewBaseContext(),
+		PageID:        "datasets",
+		PageName:      "Datasets",
+		Datasets:      datasets,
+		HasUncombined: v.datasetsController.HasUncombined(),
+		IsCombined:    isCombined,
+		ActiveDataset: activeDataset,
 	}
 
 	v.templates.Render(w, "datasets.html", ctx)

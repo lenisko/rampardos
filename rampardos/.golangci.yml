@@ -1,0 +1,75 @@
+version: "2"
+
+# Lint must run on Linux with CGO enabled, or it reports nonsense: the
+# renderer is Linux-only (gopool_linux.go, egl_linux.go), so on macOS the
+# helpers those files use look unused and the renderer itself is never
+# analysed at all. `make lint` and the CI test stage both satisfy this.
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+  settings:
+    errcheck:
+      # Deferred cleanup on a value we are finished with is the accepted Go
+      # idiom, and there is nothing useful to do with the error: the write
+      # path already checks the errors that decide correctness. Listing the
+      # functions explicitly keeps errcheck meaningful everywhere else
+      # rather than switching the linter off wholesale.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*net/http.Response).Body.Close
+        - (*archive/zip.Writer).Close
+        - (*compress/flate.Writer).Close
+        - os.Remove
+        - os.RemoveAll
+        - os.MkdirAll
+        # Writes to a client that has already gone. By the time these fail
+        # the handler has committed to its outcome and the connection is
+        # dead; there is no recovery and no second channel to report on.
+        - (net/http.ResponseWriter).Write
+        - (*encoding/json.Encoder).Encode
+        - (*github.com/gorilla/websocket.Conn).WriteMessage
+        - (*github.com/gorilla/websocket.Conn).Close
+        # Read side of a multipart request: closing after the body has been
+        # consumed reports nothing the handler can act on.
+        - (*mime/multipart.Part).Close
+
+    staticcheck:
+      # QF* are "quickfix" style suggestions, not correctness findings, and
+      # QF1001 (De Morgan's law) actively hurts the one place it fires: a
+      # character whitelist reads far more clearly as "not one of these
+      # allowed classes" than as a chain of negated comparisons.
+      # golangci-lint's default set, minus QF1001. Spelled out rather than
+      # written as ["all", "-QF1001"], because "all" also switches on the
+      # ST checks the default deliberately leaves off (package comments,
+      # naming) and would add unrelated noise across the tree.
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -QF1001
+
+  exclusions:
+    # Generated and adapted-from-upstream code. pngfast is a fork of the
+    # standard library's image/png tuned for our encode path; keeping it
+    # textually close to upstream matters more than local style, because
+    # divergence makes future syncs harder to review.
+    paths:
+      - internal/utils/pngfast
+
+    rules:
+      # Tests favour readability over defensive error handling on setup
+      # helpers; a failed helper fails the test anyway.
+      - path: _test\.go
+        linters:
+          - errcheck
