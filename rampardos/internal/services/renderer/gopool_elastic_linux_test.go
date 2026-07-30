@@ -142,6 +142,43 @@ func TestPoolHighWaterSurvivesShrink(t *testing.T) {
 	}
 }
 
+// A worker that abandons a still-image request and cannot settle it can
+// never render again: the FFI clears its pending flag only from the
+// completion callback, so every later RequestStillImage returns
+// INVALID_STATE. Such a worker deregisters itself, and the pool must drop
+// it from the roster so grow() can replace it — otherwise the pool would
+// believe it still had capacity it does not have.
+func TestDeregisterDropsWorkerAndAllowsRegrowth(t *testing.T) {
+	p := newTestPool(1, 2)
+	p.grow()
+	if got := p.size(); got != 2 {
+		t.Fatalf("size after growth = %d, want 2", got)
+	}
+
+	p.mu.Lock()
+	victim := p.workers[1]
+	p.mu.Unlock()
+
+	p.deregister(victim)
+	if got := p.size(); got != 1 {
+		t.Fatalf("size after deregister = %d, want 1", got)
+	}
+	p.mu.Lock()
+	for _, w := range p.workers {
+		if w == victim {
+			t.Error("deregistered worker is still on the roster")
+		}
+	}
+	p.mu.Unlock()
+
+	// The freed slot must be reusable, or a pool would shrink permanently
+	// each time a worker was retired this way.
+	p.grow()
+	if got := p.size(); got != 2 {
+		t.Errorf("size after regrowth = %d, want 2", got)
+	}
+}
+
 func TestPoolAtCeilingDoesNotGrowButRecordsSaturation(t *testing.T) {
 	p := newTestPool(2, 2)
 	p.grow()

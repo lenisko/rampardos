@@ -304,6 +304,7 @@ type goStylePoolConfig struct {
 	poolSize        int // ceiling: most workers this pool may hold
 	minPoolSize     int // floor: workers held even when idle
 	idleTTL         time.Duration
+	settleTimeout   time.Duration
 	ratio           int
 	styleURL        string // "file://<preparedPath>"
 	startupTimeout  time.Duration
@@ -384,6 +385,9 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 	}
 	if cfg.idleTTL <= 0 {
 		cfg.idleTTL = 2 * time.Minute
+	}
+	if cfg.settleTimeout <= 0 {
+		cfg.settleTimeout = 5 * time.Second
 	}
 
 	p := &goStylePool{
@@ -512,6 +516,23 @@ func (p *goStylePool) reap() {
 			p.reapOnce()
 		}
 	}
+}
+
+// deregister drops a worker that is exiting on its own (currently only a
+// poisoned one) so the roster stays honest and grow() can replace it.
+func (p *goStylePool) deregister(w *goWorker) {
+	p.mu.Lock()
+	for i, candidate := range p.workers {
+		if candidate == w {
+			p.workers = append(p.workers[:i], p.workers[i+1:]...)
+			break
+		}
+	}
+	p.mu.Unlock()
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.RecordRendererWorkerReplacement(p.cfg.styleID, p.cfg.scaleLabel, services.WorkerReplacementError)
+	}
+	p.reportSize()
 }
 
 // reapOnce retires at most one worker. Returns true if it did.
@@ -682,6 +703,19 @@ type goWorker struct {
 	curW     uint32
 	curH     uint32
 	curScale float64
+
+	// stillPending mirrors the FFI's own pending-still flag: set when
+	// RequestStillImage succeeds, cleared when a terminal still event is
+	// observed. Only an outstanding request needs settling — a render that
+	// failed *because* of StillImageFailed has already been cleared inside
+	// the FFI, and settling that would block for the whole budget and
+	// retire a perfectly healthy worker.
+	stillPending bool
+
+	// poisoned is set when an abandoned still-image request could not be
+	// settled. The map cannot start another render, so the worker exits
+	// after replying and the pool replaces it on the next demand.
+	poisoned bool
 }
 
 func (w *goWorker) loop() {
@@ -721,6 +755,10 @@ func (w *goWorker) loop() {
 		case goWorkerCmdRender:
 			img, err := w.renderOne(cmd.ctx, cmd.render.vp, cmd.render.scale)
 			cmd.reply <- goWorkerResult{img: img, err: err}
+			if w.poisoned {
+				w.pool.deregister(w)
+				return
+			}
 		case goWorkerCmdReload:
 			// SetStyleURL is async — the new style starts loading in
 			// the background and the next render's pump drives it
@@ -837,7 +875,20 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	if err := w.m.RequestStillImage(); err != nil {
 		return nil, fmt.Errorf("renderer: request still image: %w", err)
 	}
+	w.stillPending = true
 	if err := w.pumpUntilStillFinished(ctx, w.pool.cfg.renderTimeout); err != nil {
+		// The still request is still outstanding in mbgl: the FFI clears
+		// its pending flag only from the completion callback, which needs
+		// the runloop driven. Abandoning here without settling leaves the
+		// map permanently unable to start another render — every later
+		// RequestStillImage on this worker returns INVALID_STATE, so one
+		// cancelled request would poison the worker for the process
+		// lifetime. Drive it to completion (bounded, and deliberately not
+		// on the caller's context, which is typically already cancelled)
+		// and discard the frame.
+		if w.stillPending {
+			w.settleAbandonedStill()
+		}
 		return nil, err
 	}
 
@@ -866,6 +917,53 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	out := image.NewNRGBA(image.Rect(0, 0, physW, physH))
 	unpremultiplyRGBA(out.Pix, w.buf)
 	return out, nil
+}
+
+// settleAbandonedStill drives the runtime until an outstanding still
+// request completes, discarding whatever it produces. Marks the worker
+// unusable if it cannot be settled, so the pool retires it rather than
+// handing out a map that can never start another render.
+//
+// Bounded independently of the render deadline: the render is usually
+// nearly done (the common trigger is a client disconnect part-way), so
+// this normally returns in single-digit milliseconds.
+func (w *goWorker) settleAbandonedStill() {
+	deadline := time.Now().Add(w.pool.cfg.settleTimeout)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if err := w.rt.Pump(remaining); err != nil {
+			break
+		}
+		for {
+			ev, err := w.rt.PollEvent()
+			if err != nil || ev == nil {
+				break
+			}
+			switch ev.Type {
+			case maplibre.RuntimeEventMapRenderUpdateAvailable:
+				// mbgl only completes the still from inside a render, so
+				// the draws have to keep happening for the callback that
+				// clears the pending flag to ever run.
+				if _, err := w.sess.RenderUpdate(); err != nil {
+					w.poisoned = true
+					return
+				}
+			case maplibre.RuntimeEventMapStillImageFinished,
+				maplibre.RuntimeEventMapStillImageFailed:
+				w.stillPending = false
+				return
+			}
+		}
+	}
+
+	// Could not settle: the map still holds a pending request, so this
+	// worker can never render again. Retiring it lets the pool replace it.
+	w.poisoned = true
+	slog.Warn("renderer worker retired: could not settle abandoned still-image request",
+		"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout)
 }
 
 // pumpUntilStillFinished drives the runtime event loop until the
@@ -930,12 +1028,14 @@ func (w *goWorker) pumpUntilStillFinished(ctx context.Context, budget time.Durat
 			case maplibre.RuntimeEventMapRenderUpdateAvailable:
 				pendingRenderUpdate = true
 			case maplibre.RuntimeEventMapStillImageFinished:
+				w.stillPending = false
 				return sawEvent, true, nil
 			case maplibre.RuntimeEventMapLoadingFailed:
 				return sawEvent, false, fmt.Errorf("renderer: map loading failed: %s", ev.Message)
 			case maplibre.RuntimeEventMapRenderError:
 				return sawEvent, false, fmt.Errorf("renderer: map render error: %s", ev.Message)
 			case maplibre.RuntimeEventMapStillImageFailed:
+				w.stillPending = false
 				return sawEvent, false, fmt.Errorf("renderer: still image failed: %s", ev.Message)
 			}
 		}
