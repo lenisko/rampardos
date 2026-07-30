@@ -131,7 +131,9 @@ func (p *stylePool) replaceWorker() {
 		// now short one worker until next successful spawn; this is
 		// acceptable — dispatch still blocks waiting for any idle
 		// worker, and callers' context deadlines bound the wait.
-		fmt.Fprintf(osStderr, "renderer: failed to replace worker for style %q: %v\n", p.cfg.styleID, err)
+		// Best effort: this is the error path of the error path, and there
+		// is nowhere left to report to if stderr itself fails.
+		_, _ = fmt.Fprintf(osStderr, "renderer: failed to replace worker for style %q: %v\n", p.cfg.styleID, err)
 		return
 	}
 	// Re-check closed under lock before sending. close() may have run

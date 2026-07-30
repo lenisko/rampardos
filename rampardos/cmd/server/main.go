@@ -435,7 +435,9 @@ func main() {
 	signal.Stop(hupCh)
 	cancelHup()
 	<-hupDone
-	renderEngine.Close()
+	if err := renderEngine.Close(); err != nil {
+		slog.Error("Renderer shutdown", "error", err)
+	}
 
 	// Stop background services first to drain goroutines.
 	if pyroscopeProfiler != nil {

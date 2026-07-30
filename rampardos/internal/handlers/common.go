@@ -86,7 +86,13 @@ func handlePregenerateResponseBytes(
 		regeneratablePath := fmt.Sprintf("Cache/Regeneratable/%s.json", filepath.Base(path))
 		if _, err := os.Stat(regeneratablePath); os.IsNotExist(err) {
 			if jsonData, err := json.Marshal(data); err == nil {
-				fileutil.AtomicWriteFile(regeneratablePath, jsonData, 0644)
+				// Best effort: the response is already decided, so a failed
+				// marker must not fail the request — but it does mean this
+				// entry will not be treated as regeneratable later, which is
+				// worth knowing about.
+				if err := fileutil.AtomicWriteFile(regeneratablePath, jsonData, 0644); err != nil {
+					slog.Warn("Failed to write regeneratable marker", "path", regeneratablePath, "error", err)
+				}
 			}
 		}
 	}

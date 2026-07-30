@@ -1049,4 +1049,3 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 		Height:     d.height,
 	}, nil
 }
-
