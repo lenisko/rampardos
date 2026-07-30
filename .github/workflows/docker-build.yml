@@ -25,6 +25,44 @@ env:
 # Reference: https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
 
 jobs:
+  # Vet + unit tests with the native library present. This is the only
+  # place the renderer tests can run: they link libmaplibre-native-c.so
+  # and the renderer is Linux-only, so `go test ./...` on a developer Mac
+  # skips the whole package silently. Runs amd64 only — the code under
+  # test is architecture-independent and a second run would double the
+  # cost for no extra signal.
+  #
+  # Shares the amd64 build cache scope, so after the first run the FFI
+  # layer is a cache hit and this job is a couple of minutes.
+  #
+  # Deliberately NOT a dependency of `build`: gating would serialise the
+  # arm64 image behind an amd64 test run without sharing its cache. The
+  # check goes red on failure, which is the signal that matters.
+  test:
+    if: |
+      !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run go vet and unit tests
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          target: rampardos-test
+          push: false
+          # Same scope as the amd64 build job so the expensive FFI stage
+          # is shared rather than built twice.
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64
+
   build:
     # Skip sentinel uses bracketed form so commit messages and PR
     # titles can mention the feature in prose without inadvertently

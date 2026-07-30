@@ -229,6 +229,27 @@ RUN GIT_COMMIT=$(cat /git-commit.txt) && \
     -o /out/rampardos ./cmd/server
 
 # ================================
+# Test stage — vet + unit tests with the native library present.
+#
+# Built as its own target so CI can run it without producing an image, and
+# based on rampardos-build so it inherits the source, the module cache and
+# the FFI, making it a cheap layer on top of a cache hit rather than a
+# second FFI build.
+#
+# This is the only place the renderer tests can run: they need
+# libmaplibre-native-c.so at link time, and the renderer is Linux-only, so
+# `go test ./...` on a developer Mac silently skips the whole package.
+# ================================
+FROM rampardos-build AS rampardos-test
+# The test binaries link the .so but nothing has set an rpath for them, so
+# point the loader at the install tree.
+ENV LD_LIBRARY_PATH=/ffi/install/lib
+RUN PKG_CONFIG_PATH=/ffi/install/share/pkgconfig CGO_ENABLED=1 \
+    go vet ./...
+RUN PKG_CONFIG_PATH=/ffi/install/share/pkgconfig CGO_ENABLED=1 \
+    go test -count=1 -race ./...
+
+# ================================
 # Final runtime image
 # ================================
 # Ubuntu 24.04 (not Debian Bookworm) because maplibre-native's prebuilt
