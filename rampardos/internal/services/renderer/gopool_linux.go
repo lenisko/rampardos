@@ -128,10 +128,7 @@ func (r *GoPoolRenderer) RenderViewportImage(ctx context.Context, req ViewportRe
 }
 
 func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRequest, applyZoomAdj bool) (*image.NRGBA, error) {
-	scale := int(req.Scale)
-	if scale < 1 {
-		scale = 1
-	}
+	scale := max(int(req.Scale), 1)
 
 	pool, err := r.getOrCreatePool(req.StyleID, req.Scale)
 	if err != nil {

@@ -25,6 +25,7 @@ package renderer
 
 #include <EGL/egl.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -113,12 +114,33 @@ static void mln_go_egl_destroy(mln_go_egl_context *ctx) {
 static void *mln_go_egl_get_proc_address(void) {
     return (void *)eglGetProcAddress;
 }
+
+// The binding takes these handles as uintptr (maplibre.NativePointer) and
+// converts them back to pointers in C. Doing our half of that in C too
+// keeps the EGL handles out of Go's pointer rules entirely: they are
+// Mesa-owned, never Go-managed, so uintptr(unsafe.Pointer(...)) on them is
+// safe in practice but is exactly the pattern `go vet` flags as possible
+// misuse — and vet has no way to know the memory is not Go's.
+static uintptr_t mln_go_egl_display_handle(const mln_go_egl_context *ctx) {
+    return (uintptr_t)ctx->display;
+}
+
+static uintptr_t mln_go_egl_config_handle(const mln_go_egl_context *ctx) {
+    return (uintptr_t)ctx->config;
+}
+
+static uintptr_t mln_go_egl_share_context_handle(const mln_go_egl_context *ctx) {
+    return (uintptr_t)ctx->share_context;
+}
+
+static uintptr_t mln_go_egl_proc_address_handle(void) {
+    return (uintptr_t)eglGetProcAddress;
+}
 */
 import "C"
 
 import (
 	"fmt"
-	"unsafe"
 
 	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
 )
@@ -150,10 +172,10 @@ func newEGLContext() (*eglContext, error) {
 func (c *eglContext) descriptor() maplibre.OpenGLContextDescriptor {
 	return maplibre.OpenGLContextDescriptor{
 		EGL: &maplibre.EGLContextDescriptor{
-			Display:        maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.display))),
-			Config:         maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.config))),
-			ShareContext:   maplibre.NativePointer(uintptr(unsafe.Pointer(c.raw.share_context))),
-			GetProcAddress: maplibre.NativePointer(uintptr(C.mln_go_egl_get_proc_address())),
+			Display:        maplibre.NativePointer(C.mln_go_egl_display_handle(&c.raw)),
+			Config:         maplibre.NativePointer(C.mln_go_egl_config_handle(&c.raw)),
+			ShareContext:   maplibre.NativePointer(C.mln_go_egl_share_context_handle(&c.raw)),
+			GetProcAddress: maplibre.NativePointer(C.mln_go_egl_proc_address_handle()),
 		},
 	}
 }

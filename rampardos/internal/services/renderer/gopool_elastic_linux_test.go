@@ -26,7 +26,7 @@ func newTestPool(min, max int) *goStylePool {
 		}
 		return &goWorker{pool: p, startupErrs: startupErrs, broadcast: make(chan goWorkerCommand, 1)}
 	}
-	for i := 0; i < min; i++ {
+	for range min {
 		p.startWorkerLocked(nil)
 	}
 	return p
@@ -44,7 +44,7 @@ func TestPoolGrowsToCeilingThenStops(t *testing.T) {
 		t.Fatalf("initial size = %d, want floor 1", got)
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		p.grow()
 	}
 	if got := p.size(); got != 3 {

@@ -23,7 +23,7 @@ func TestSetStyleAllReachesEveryWorkerExactlyOnce(t *testing.T) {
 		cfg:  goStylePoolConfig{styleID: "s", scaleLabel: "1", poolSize: workers},
 		cmds: make(chan goWorkerCommand),
 	}
-	for i := 0; i < workers; i++ {
+	for range workers {
 		p.workers = append(p.workers, &goWorker{
 			pool:      p,
 			broadcast: make(chan goWorkerCommand, 1),
