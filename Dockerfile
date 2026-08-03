@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=91ecc920462420f977959d546d2735823d2f0092
+ARG MLN_FFI_REV=92e6736979d5ced7b17e867f22bc087ae6053dc0
 
 # ================================
 # Get Git commit SHA
@@ -51,123 +51,62 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
     && find /fontnik/node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" -o -name "example" -o -name "examples" \) -exec rm -rf {} + 2>/dev/null || true
 
 # ================================
-# Build maplibre-native-ffi (libmaplibre-native-c.so) — the C ABI shared
-# library the in-process Go renderer (RENDERER_BACKEND=go-pool) links
-# against via the maplibre-native-go binding.
+# maplibre-native-ffi — the C ABI shared library the in-process Go
+# renderer links against.
 #
-# Heavy: ~10-20 min cold. mise installs pixi, which brings clang +
-# cmake + ninja into a conda env; CMake then fetches maplibre-native
-# source at configure time. BuildKit's layer cache (cache-from/to=gha)
-# amortises this across PRs as long as MLN_FFI_REV is stable.
+# We consume upstream's published artifact rather than building from
+# source. Building it ourselves meant tracking their bootstrap, and that
+# bootstrap moved four times in as many months: pixi to system compilers,
+# then CMake presets plus a Rust platform layer, then a Zig cross
+# toolchain, then a submodule marked `update = none` with patches applied
+# by their own script. Each break cost a build cycle to diagnose, and none
+# of it was our concern — the artifact is the interface, not their build.
 #
-# Pin MUST track the maplibre-native-go binding's required FFI revision.
-# See scripts/build-mln-ffi.sh for the host-side equivalent.
+# The artifact is also better than what we produced: a glibc 2.17 floor
+# from their Zig toolchain rather than the build image's, no libstdc++ ABI
+# requirement, RUNPATH already $ORIGIN, and EGL resolved through their
+# dlopen dispatch so the library needs only libc, libm, libpthread and
+# libdl. That deletes the conda-lib bundling and the patchelf pass this
+# stage used to carry.
+#
+# The snapshot tag is rolling: assets are replaced in place as upstream
+# publishes. The gitSha check is what keeps that honest — a moved snapshot
+# fails the build naming the SHA to bump to, rather than silently linking
+# a library the Go binding in go.mod was not built against.
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
-ARG MLN_FFI_REPO=https://github.com/maplibre/maplibre-native-ffi
 ARG MLN_FFI_REV
-# Keep in sync with the FFI's mise.toml [vars] at MLN_FFI_REV.
-ARG MLN_CMAKE_VERSION=4.3.3
-ARG MLN_RUST_VERSION=1.95.0
-ARG MLN_CARGO_ABOUT_VERSION=0.9.1
+ARG MLN_FFI_SNAPSHOT_TAG=unstable-native-snapshot
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    ca-certificates curl git xz-utils \
- && rm -rf /var/lib/apt/lists/*
-SHELL ["/bin/bash", "-c"]
-WORKDIR /ffi
-RUN git clone "${MLN_FFI_REPO}" . \
- && git checkout ${MLN_FFI_REV}
-
-# Bypass mise entirely. The FFI's root mise.toml pulls a tool per binding
-# (dotnet, Java, Rust, Node, Zig, Python, Swift, ...) and mise auto-installs
-# during activation even when only one is asked for, turning every missing
-# toolchain into a build break. We assemble the C-library toolchain by hand
-# instead — three sources:
-#
-#   * apt      — the project's own Linux bootstrap set, copied from
-#                mise.linux.toml [bootstrap.packages]: system compilers,
-#                EGL/GLES headers, ICU, ninja, pkg-config, glslang.
-#                Upstream dropped pixi (no pixi.toml as of 91ecc92), so the
-#                C/C++ toolchain is now the distro's, and libuv/zlib are
-#                FetchContent-built while ICU is vendored — no conda env
-#                and no library bundling needed downstream.
-#   * Kitware  — CMake, pinned to the version mise pins (vars.cmake_version).
-#                Ubuntu 24.04 ships 3.28; CMakeLists requires >= 4.0.
-#   * rustup   — cargo for the Rust platform layer (ureq HTTP, linked into
-#                the Linux build). Ubuntu's cargo 1.75 cannot parse the
-#                workspace manifest (`resolver = "3"` needs >= 1.84).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    build-essential clang glslang-tools libclang-dev \
-    libegl1-mesa-dev libgles2-mesa-dev libicu-dev \
-    libncurses6 libsqlite3-0 libvulkan-dev \
-    ninja-build pkg-config \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-ENV PATH=/opt/cmake/bin:/root/.cargo/bin:$PATH
-
-RUN case "$TARGETARCH" in \
-        arm64) TOOL_ARCH=aarch64;; \
-        amd64) TOOL_ARCH=x86_64;; \
-        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
-    esac \
- && curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${MLN_CMAKE_VERSION}/cmake-${MLN_CMAKE_VERSION}-linux-${TOOL_ARCH}.tar.gz" -o /tmp/cmake.tgz \
- && mkdir -p /opt/cmake \
- && tar -xzf /tmp/cmake.tgz -C /opt/cmake --strip-components=1 \
- && rm /tmp/cmake.tgz \
- && cmake --version \
- && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${MLN_RUST_VERSION}" \
- && cargo --version \
- # cargo-about is find_program(... REQUIRED) in cmake/mln_rust.cmake — it
- # generates the Rust dependency license notices linked into the library,
- # with no opt-out. Take the pinned prebuilt (static musl) rather than
- # `cargo install`, which would compile it from source on every build.
- && curl -fsSL "https://github.com/EmbarkStudios/cargo-about/releases/download/${MLN_CARGO_ABOUT_VERSION}/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl.tar.gz" -o /tmp/cargo-about.tgz \
- && tar -xzf /tmp/cargo-about.tgz -C /tmp \
- && install -m 0755 "/tmp/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl/cargo-about" /usr/local/bin/cargo-about \
- && rm -rf /tmp/cargo-about.tgz "/tmp/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl" \
- && cargo-about --version
-
-# Fetch the maplibre-native submodule (normally done by mise's
-# postinstall hook).
-RUN git submodule sync --recursive third_party/maplibre-native \
- && git submodule update --init --recursive --depth 1 third_party/maplibre-native
-
-# Configure + build + install via the upstream CMake preset. The preset
-# carries the backend/provider cache vars (opengl + egl) and installs into
-# build/<preset>/install, which is the layout the Go binding expects
-# (bindings/go/mise.toml points PKG_CONFIG_PATH at
-# <install>/share/pkgconfig). `cmake --workflow` runs configure+build; the
-# install step is explicit because the workflow preset does not include it.
-RUN case "$TARGETARCH" in \
-        arm64) MLN_ARCH=arm64;; \
-        amd64) MLN_ARCH=x64;; \
-        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
-    esac \
- && MLN_PRESET="linux-${MLN_ARCH}-egl" \
- && echo "$MLN_PRESET" > /tmp/mln_preset \
- && cmake --workflow --preset "$MLN_PRESET" \
- && cmake --install "build/${MLN_PRESET}" \
- && ln -sfn "${MLN_PRESET}/install" build/current \
- && test -f build/current/lib/libmaplibre-native-c.so \
- && test -f build/current/share/pkgconfig/maplibre-native-c.pc \
- && ls -la build/current/lib build/current/share/pkgconfig
-
-# Point the .so at its own directory so any transitive private deps resolve
-# without registering a global ldconfig path. A global path previously
-# shadowed Ubuntu's libpng/libjpeg for other consumers in the image
-# (fontnik's node addon still links its own copies).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends patchelf binutils \
- && rm -rf /var/lib/apt/lists/* \
- && for lib in build/current/lib/*.so*; do \
-        patchelf --set-rpath '$ORIGIN' "$lib" || echo "WARN: patchelf failed on $lib"; \
-    done \
- && echo "--- libmaplibre-native-c.so dynamic deps ---" \
- && readelf -d build/current/lib/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
+WORKDIR /tmp/mln
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      arm64) MLN_ARCH=arm64;; \
+      amd64) MLN_ARCH=x64;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
+    esac; \
+    asset="maplibre-native-c-linux-${MLN_ARCH}-egl.tar.gz"; \
+    base="https://github.com/maplibre/maplibre-native-ffi/releases/download/${MLN_FFI_SNAPSHOT_TAG}"; \
+    curl -fsSL "${base}/${asset}" -o "$asset"; \
+    curl -fsSL "${base}/SHA256SUMS" -o SHA256SUMS; \
+    grep " ${asset}$" SHA256SUMS | sha256sum -c -; \
+    mkdir -p /ffi/install; \
+    tar -xzf "$asset" --strip-components=1 -C /ffi/install; \
+    test -f /ffi/install/lib/libmaplibre-native-c.so; \
+    test -f /ffi/install/share/pkgconfig/maplibre-native-c.pc; \
+    got="$(grep -o '[0-9a-f]\{40\}' /ffi/install/share/maplibre-native-c/artifact.json | head -1)"; \
+    if [ "$got" != "$MLN_FFI_REV" ]; then \
+      echo "snapshot moved: artifact is $got, MLN_FFI_REV is $MLN_FFI_REV" >&2; \
+      echo "bump MLN_FFI_REV, then: cd rampardos && go get github.com/maplibre/maplibre-native-ffi/bindings/go@$got" >&2; \
+      exit 1; \
+    fi; \
+    echo "native artifact at $got"; \
+    rm -rf /tmp/mln
 
 # ================================
 # Build Go binary
@@ -198,9 +137,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libegl1-mesa-dev \
  && rm -rf /var/lib/apt/lists/*
-# build/current is a symlink into the preset's install tree, so copy the
-# resolved directory (lib/, include/, share/pkgconfig/).
-COPY --from=mln-ffi-build /ffi/build/current/ /ffi/install/
+COPY --from=mln-ffi-build /ffi/install/ /ffi/install/
 WORKDIR /src
 COPY --from=git-info /git-commit.txt /git-commit.txt
 COPY rampardos/go.mod rampardos/go.sum ./
@@ -304,10 +241,10 @@ RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
 # ldconfig globally, which shadowed Ubuntu's libpng for everything else in
 # the image — fontnik's node addon aborted on a version mismatch.
 #
-# Upstream 91ecc92 dropped pixi: libuv/zlib are FetchContent-built and ICU
-# is vendored into the .so, so there is no conda-env bundle to carry — only
-# the library itself, plus the system libs Ubuntu already provides.
-COPY --from=mln-ffi-build /ffi/build/current/lib /tmp/ffi-lib
+# The published artifact carries RUNPATH=$ORIGIN already and needs only
+# libc, libm, libpthread and libdl — EGL is resolved through upstream's
+# dlopen dispatch — so there is nothing to bundle and no patchelf pass.
+COPY --from=mln-ffi-build /ffi/install/lib /tmp/ffi-lib
 RUN mkdir -p /opt/rampardos/lib \
  && cp -L /tmp/ffi-lib/*.so* /opt/rampardos/lib/ \
  && rm -rf /tmp/ffi-lib

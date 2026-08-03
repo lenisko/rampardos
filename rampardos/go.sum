@@ -38,6 +38,10 @@ github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20260728081959-91ecc9204624 h1:tWB/kuu8HnzD3q1WUMdd9xvVeydhjb5cWSHXauIXkxA=
 github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20260728081959-91ecc9204624/go.mod h1:TxnhFcjqBE+BGv/6X5ytQuClYRzuYpmIxt3ZaXwHeB8=
+github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20260803063936-92e6736979d5 h1:skTO20l8Br+g5YLoU4et3ufJ1fMxAiyVMCO8QFCm3Dc=
+github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20260803063936-92e6736979d5/go.mod h1:TxnhFcjqBE+BGv/6X5ytQuClYRzuYpmIxt3ZaXwHeB8=
+github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20260803192522-2c39759579ee h1:Gey8JstzzPb24UCucC58mDXYQ2ExUq5OF+3u+Qt9q4Y=
+github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20260803192522-2c39759579ee/go.mod h1:TxnhFcjqBE+BGv/6X5ytQuClYRzuYpmIxt3ZaXwHeB8=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

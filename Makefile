@@ -1,6 +1,6 @@
 .PHONY: build run test test-integration test-coverage clean tidy fmt lint \
        docker-build docker-push docker-compose-up docker-compose-down \
-       docker-compose-logs setup-dirs help build-ffi build-go-renderer clean-ffi
+       docker-compose-logs setup-dirs help fetch-ffi build-go-renderer clean-ffi
 
 # Binary name
 BINARY_NAME=rampardos
@@ -28,10 +28,13 @@ DOCKER_PLATFORMS=linux/amd64
 
 # In-process Go renderer (RENDERER_BACKEND=go-pool) — see plan in
 # docs/superpowers/plans/2026-05-01-in-process-go-renderer.md.
-# MLN_FFI_REV MUST stay in sync with the ARG in the Dockerfile's
-# mln-ffi-build stage; bump both together when the Go binding changes.
-MLN_FFI_REV ?= 91ecc920462420f977959d546d2735823d2f0092
-MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi-linux
+# MLN_FFI_REV is the upstream commit the published artifact was built
+# from. It MUST stay in sync with the ARG in the Dockerfile and with the
+# pseudo-version in rampardos/go.mod — both the artifact fetch and the Go
+# build assert it, so a drift fails the build rather than linking a
+# library the binding was not built against.
+MLN_FFI_REV ?= 92e6736979d5ced7b17e867f22bc087ae6053dc0
+MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi
 
 # Default target
 all: build
@@ -69,7 +72,7 @@ run: build
 test:
 	cd $(GO_DIR) && $(GOTEST) ./...
 
-## test-integration: Run integration tests (needs the FFI; see build-ffi)
+## test-integration: Run integration tests (needs the FFI; see fetch-ffi)
 test-integration:
 	cd $(GO_DIR) && $(GOTEST) -tags renderer_integration ./internal/services/renderer/ -v -timeout 60s
 
@@ -85,18 +88,17 @@ clean:
 	rm -rf $(BUILD_DIR)
 	rm -f $(GO_DIR)/coverage.out $(GO_DIR)/coverage.html
 
-## build-ffi: Build libmaplibre-native-c.so for the Go renderer (~10-20 min cold)
-build-ffi:
-	MLN_FFI_REV=$(MLN_FFI_REV) MLN_FFI_DIR_HOST=$(MLN_FFI_DIR_HOST) ./scripts/build-mln-ffi.sh
+## fetch-ffi: Download upstream's published libmaplibre-native-c.so (Linux only)
+fetch-ffi:
+	MLN_FFI_REV=$(MLN_FFI_REV) MLN_FFI_DIR_HOST=$(MLN_FFI_DIR_HOST) ./scripts/fetch-mln-ffi.sh
 
-## build-go-renderer: Build rampardos against a host-built FFI (Linux only). Run build-ffi first.
+## build-go-renderer: Build rampardos against the fetched FFI (Linux only). Run fetch-ffi first.
 build-go-renderer:
-	@test -f $(MLN_FFI_DIR_HOST)/build/libmaplibre-native-c.so || \
-	  (echo "FFI not built. Run 'make build-ffi' first." >&2 && exit 1)
+	@test -f $(MLN_FFI_DIR_HOST)/install/lib/libmaplibre-native-c.so || \
+	  (echo "FFI not present. Run 'make fetch-ffi' first." >&2 && exit 1)
 	@mkdir -p $(BUILD_DIR)
 	cd $(GO_DIR) && \
-	  PKG_CONFIG_PATH=$(MLN_FFI_DIR_HOST)/build/pkgconfig \
-	  CGO_LDFLAGS="-Wl,-rpath,$(MLN_FFI_DIR_HOST)/build" \
+	  PKG_CONFIG_PATH=$(MLN_FFI_DIR_HOST)/install/share/pkgconfig \
 	  CGO_ENABLED=1 \
 	  $(GOBUILD) -trimpath $(LDFLAGS) -tags nodynamic -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
 
