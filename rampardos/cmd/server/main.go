@@ -113,8 +113,8 @@ func main() {
 	}
 	localStyleIDs, _ := rendererCfg.DiscoverStyles()
 
-	// The in-process Go renderer is the only backend. It requires the
-	// mln_ffi build tag and libmaplibre-native-c.so; without the tag the
+	// The in-process Go renderer is the only backend. It requires a
+	// Linux build with CGO and libmaplibre-native-c.so; elsewhere the
 	// stub returns a clear error rather than silently degrading.
 	var (
 		renderEngine renderer.Renderer

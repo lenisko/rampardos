@@ -39,6 +39,15 @@ visible in the code.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
+- **Executor-binding service loop invariants** (`goWorker.service`):
+  a still needs frame demands re-issued on BOTH `RenderUpdateAvailable`
+  events AND `RenderFrameFinished` events with `needs_repaint` — the
+  renderer requests extra passes (placement etc.) via the latter only,
+  and a still typically takes several passes. A session `ResizeStart`
+  can never complete on its own in static mode (no map update publishes
+  without a pending still), so resize is started and the next still's
+  demand loop drives it; never await a bare resize with no demands.
+  `DrainFrameResults` returns `ErrNotReady` when empty — not an error.
 
 ## Cache intent: nocache, TTL, owned
 

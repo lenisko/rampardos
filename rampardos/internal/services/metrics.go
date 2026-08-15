@@ -104,16 +104,17 @@ type MetricsManager struct {
 
 	// Go-renderer per-render breakdown. Decomposes the total per-render
 	// wall time (rendererViewportDuration) so we can see where the time
-	// actually goes: pump iteration count, sleep time, mbgl warm-up
-	// time-to-first-event, and total RenderUpdate cgo time. These were
-	// added to isolate a structural gap against the legacy Node
-	// renderer during the port; retained as the per-render breakdown.
-	rendererPumpIterations      *prometheus.HistogramVec // iterations per render
-	rendererPumpSleep           *prometheus.HistogramVec // total sleep seconds per render
-	rendererPumpTimeToFirstEv   *prometheus.HistogramVec // seconds from pump start to first non-nil event
-	rendererPumpRenderUpdate    *prometheus.HistogramVec // total seconds in sess.RenderUpdate() cgo per render
-	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // number of RuntimeEventMapRenderUpdateAvailable events per render (>1 = mbgl multi-pass)
-	rendererReadback            *prometheus.HistogramVec // seconds in sess.ReadPremultipliedRGBA8Into() cgo per render
+	// actually goes: service-loop turns, notification-park time, time to
+	// the first event/frame result, and total ServiceDriverWork time.
+	// Metric names keep their historical pump_* prefix (from the
+	// pre-executor host-pumping binding) so dashboards survive; the
+	// semantics are the service-loop analogues.
+	rendererPumpIterations      *prometheus.HistogramVec // service-loop turns per render
+	rendererPumpSleep           *prometheus.HistogramVec // total seconds parked awaiting runtime notifications per render
+	rendererPumpTimeToFirstEv   *prometheus.HistogramVec // seconds from loop start to first event or frame result
+	rendererPumpRenderUpdate    *prometheus.HistogramVec // total seconds in sess.ServiceDriverWork() per render
+	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // driver work items serviced per render (>1 = incremental draws)
+	rendererReadback            *prometheus.HistogramVec // seconds for the full readback operation (start→service→take) per render
 
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
@@ -323,37 +324,37 @@ func newMetricsManager() *MetricsManager {
 
 		rendererPumpIterations: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_iterations_per_render",
-			Help:    "Number of RunOnce/PollEvent iterations the Go renderer's pump loop executed per render. High counts with low pump_sleep mean cgo-overhead-bound; high counts with high pump_sleep mean mbgl is slow to produce events.",
+			Help:    "Number of service-loop turns the Go renderer executed per render (ServiceDriverWork + event/frame drain + operation poll). High counts with low pump_sleep mean overhead-bound; high counts with high pump_sleep mean mbgl is slow to produce work.",
 			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000},
 		}, []string{"style", "scale"}),
 
 		rendererPumpSleep: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_sleep_seconds_per_render",
-			Help:    "Total seconds the Go renderer's pump spent in time.Sleep per render. The adaptive pump only sleeps when no events were drained; this metric quantifies how much of total render time is wasted in idle-poll backoff.",
+			Help:    "Total seconds the Go renderer spent parked awaiting runtime notifications per render. The service loop only parks when no driver work was serviced; this is genuine wait on mbgl progress (tile IO, parse/layout), bounded by a 100ms defensive cap per park.",
 			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
 		}, []string{"style", "scale"}),
 
 		rendererPumpTimeToFirstEv: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_time_to_first_event_seconds",
-			Help:    "Seconds from RequestStillImage to the first non-nil event drained by the pump. Measures mbgl's warm-up cost: how long mbgl takes to start producing render updates (driven by tile/glyph/sprite fetch latency through MainResourceLoader).",
+			Help:    "Seconds from the service loop's start to the first runtime event or frame result drained. Measures mbgl's warm-up cost: how long the executor takes to start producing render updates (driven by tile/glyph/sprite fetch latency).",
 			Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
 		}, []string{"style", "scale"}),
 
 		rendererPumpRenderUpdate: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_render_update_seconds_per_render",
-			Help:    "Total seconds spent inside sess.RenderUpdate() cgo calls per render. This is the actual mbgl render work (one cgo call per RuntimeEventMapRenderUpdateAvailable event); the remainder of total render time is mbgl warm-up + pump overhead + readback.",
+			Help:    "Total seconds spent inside sess.ServiceDriverWork() per render. This executes the queued graphics work (draws, readbacks) on the worker's EGL thread; the remainder of total render time is mbgl warm-up + loop overhead.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5},
 		}, []string{"style", "scale"}),
 
 		rendererPumpRenderUpdateCnt: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_render_update_count_per_render",
-			Help:    "Number of RuntimeEventMapRenderUpdateAvailable events drained per render. >1 means mbgl emitted multiple incremental draws before declaring the still image finished (e.g. as tiles arrived progressively).",
+			Help:    "Number of driver work items serviced per render. High values mean mbgl scheduled multiple incremental draws before the still image completed (e.g. as tiles arrived progressively).",
 			Buckets: []float64{1, 2, 3, 5, 10, 20, 50},
 		}, []string{"style", "scale"}),
 
 		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_readback_seconds_per_render",
-			Help:    "Seconds in sess.ReadPremultipliedRGBA8Into() cgo per render. This is the synchronous glReadPixels-equivalent. On Mesa llvmpipe with a renderbuffer FBO this should be sub-ms for 512×512×4; large values indicate driver-side stall or wrong attachment type.",
+			Help:    "Seconds for the full readback operation per render (ReadPremultipliedRGBA8Start, service to completion, Take). The glReadPixels-equivalent plus the binding's copy-out. On Mesa llvmpipe this should be low single-digit ms for 512×512×4; large values indicate driver-side stall or wrong attachment type.",
 			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
 		}, []string{"style", "scale"}),
 

@@ -152,3 +152,23 @@ inverse of this commit, which is why it's kept isolated).
   frames (it services with demands enabled), and the poison backstop
   catches the remainder. Watch `renderer_worker_replacement_total{reason=
   "error"}` in soak.
+
+## As-built amendments (2026-08-15, found on the real backend)
+
+- **D-resize (new):** a session `ResizeStart` cannot be awaited on its
+  own in static mode — nothing publishes a map update without a pending
+  still, so the ordered resize work parks forever (and, being ordered,
+  blocks detach behind it). As built, `renderOne` starts the resize and
+  lets the following still's demand loop drive it to completion,
+  verifying the resize operation's terminal status after the still.
+- **D4 amendment:** the demand loop re-demands on `RenderFrameFinished`
+  events whose payload sets `needs_repaint`, in addition to
+  `RenderUpdateAvailable` — the renderer requests further passes
+  (placement, transitions) via the former only. The map event mask
+  gained `RuntimeEventMaskMapRenderFrameFinished` accordingly.
+- **DrainFrameResults** reports `ErrNotReady` for an empty queue;
+  treated as an empty drain.
+- The Zig cross toolchain and the mise sync scripts
+  (`sync-submodules`, `sync-rustls-platform-verifier`) are required by
+  the PR-era FFI build — D9's "resurrect the pre-e5c7a00 stage" needed
+  those two updates.
