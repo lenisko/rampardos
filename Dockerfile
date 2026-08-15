@@ -12,7 +12,11 @@ FROM alpine:3.20 AS git-info
 RUN apk add --no-cache git
 WORKDIR /repo
 COPY .git/ .git/
-RUN git rev-parse HEAD > /git-commit.txt
+# In a git worktree the context's .git is a pointer file into a gitdir
+# outside the build context, so HEAD cannot be resolved; stamp "unknown"
+# there instead of failing the build. CI builds from a full clone and
+# still stamps the real SHA.
+RUN git rev-parse HEAD > /git-commit.txt 2>/dev/null || echo unknown > /git-commit.txt
 
 # ================================
 # Build tippecanoe (for mbtiles combine/tile-join in admin)
