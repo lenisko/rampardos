@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=92e6736979d5ced7b17e867f22bc087ae6053dc0
+ARG MLN_FFI_REV=422f853f6cf8adaa4d0a878597fbd48c15dd1c08
 
 # ================================
 # Get Git commit SHA
@@ -54,59 +54,118 @@ RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name 
 # maplibre-native-ffi — the C ABI shared library the in-process Go
 # renderer links against.
 #
-# We consume upstream's published artifact rather than building from
-# source. Building it ourselves meant tracking their bootstrap, and that
-# bootstrap moved four times in as many months: pixi to system compilers,
-# then CMake presets plus a Rust platform layer, then a Zig cross
-# toolchain, then a submodule marked `update = none` with patches applied
-# by their own script. Each break cost a build cycle to diagnose, and none
-# of it was our concern — the artifact is the interface, not their build.
+# TEMPORARILY building from source: MLN_FFI_REV points at the head of
+# upstream PR #631 (the native-executor rewrite), which has no published
+# artifact — the unstable-native-snapshot tag tracks main. Revert this
+# commit to return to artifact consumption once the PR merges and the
+# snapshot tag passes it. See
+# docs/superpowers/specs/2026-08-15-ffi-native-executor-conversion.md.
 #
-# The artifact is also better than what we produced: a glibc 2.17 floor
-# from their Zig toolchain rather than the build image's, no libstdc++ ABI
-# requirement, RUNPATH already $ORIGIN, and EGL resolved through their
-# dlopen dispatch so the library needs only libc, libm, libpthread and
-# libdl. That deletes the conda-lib bundling and the patchelf pass this
-# stage used to carry.
+# The stage is the pre-artifact build resurrected against the PR-era
+# bootstrap: the FFI's own Linux bootstrap apt set, pinned
+# CMake/Zig/Rust/cargo-about matching its mise.toml [vars] (the Linux
+# presets compile with `zig cc` against glibc 2.17 — same portability
+# as the published artifact), and .mise/bin/sync-submodules (the
+# submodule is `update = none`; their script checks out the filtered
+# vendor paths and applies carried patches — a plain `git submodule
+# update` is a no-op by design).
 #
-# The snapshot tag is rolling: assets are replaced in place as upstream
-# publishes. The gitSha check is what keeps that honest — a moved snapshot
-# fails the build naming the SHA to bump to, rather than silently linking
-# a library the Go binding in go.mod was not built against.
+# Heavy: ~10-20 min cold. BuildKit's layer cache amortises this across
+# builds as long as MLN_FFI_REV is stable.
 # ================================
 FROM ubuntu:24.04 AS mln-ffi-build
+ARG MLN_FFI_REPO=https://github.com/maplibre/maplibre-native-ffi
 ARG MLN_FFI_REV
-ARG MLN_FFI_SNAPSHOT_TAG=unstable-native-snapshot
+# Keep in sync with the FFI's mise.toml [vars] at MLN_FFI_REV.
+ARG MLN_CMAKE_VERSION=4.3.3
+ARG MLN_RUST_VERSION=1.95.0
+ARG MLN_CARGO_ABOUT_VERSION=0.9.1
+ARG MLN_ZIG_VERSION=0.16.0
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-c"]
+
+# apt set copied from the FFI's mise.linux.toml [bootstrap.packages]
+# (apt entries), plus git/curl/xz for the fetches and ninja for the
+# CMake presets' generator.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
+ && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates clang curl git glslang-tools \
+    libclang-dev libegl1-mesa-dev libgles2-mesa-dev libicu-dev \
+    libncurses6 libsqlite3-0 libvulkan-dev \
+    ninja-build pkg-config xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /tmp/mln
-RUN set -eu; \
-    case "$TARGETARCH" in \
-      arm64) MLN_ARCH=arm64;; \
-      amd64) MLN_ARCH=x64;; \
-      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
-    esac; \
-    asset="maplibre-native-c-linux-${MLN_ARCH}-egl.tar.gz"; \
-    base="https://github.com/maplibre/maplibre-native-ffi/releases/download/${MLN_FFI_SNAPSHOT_TAG}"; \
-    curl -fsSL "${base}/${asset}" -o "$asset"; \
-    curl -fsSL "${base}/SHA256SUMS" -o SHA256SUMS; \
-    grep " ${asset}$" SHA256SUMS | sha256sum -c -; \
-    mkdir -p /ffi/install; \
-    tar -xzf "$asset" --strip-components=1 -C /ffi/install; \
-    test -f /ffi/install/lib/libmaplibre-native-c.so; \
-    test -f /ffi/install/share/pkgconfig/maplibre-native-c.pc; \
-    got="$(grep -o '[0-9a-f]\{40\}' /ffi/install/share/maplibre-native-c/artifact.json | head -1)"; \
-    if [ "$got" != "$MLN_FFI_REV" ]; then \
-      echo "snapshot moved: artifact is $got, MLN_FFI_REV is $MLN_FFI_REV" >&2; \
-      echo "bump MLN_FFI_REV, then: cd rampardos && go get github.com/maplibre/maplibre-native-ffi/bindings/go@$got" >&2; \
-      exit 1; \
-    fi; \
-    echo "native artifact at $got"; \
-    rm -rf /tmp/mln
+ENV PATH=/opt/cmake/bin:/opt/zig:/root/.cargo/bin:$PATH
+
+# CMake from Kitware (Ubuntu 24.04 ships 3.28; CMakeLists requires
+# >= 4.0), Zig for the Linux cross toolchain (the presets compile with
+# `zig cc` against glibc 2.17 via cmake/toolchains/zig-linux.cmake, so
+# the apt compilers only serve configure-time probes), cargo via rustup
+# (Ubuntu's 1.75 cannot parse the workspace manifest), cargo-about
+# prebuilt (find_program(... REQUIRED) in cmake/mln_ffi_rust.cmake
+# generates license notices with no opt-out).
+RUN case "$TARGETARCH" in \
+        arm64) TOOL_ARCH=aarch64;; \
+        amd64) TOOL_ARCH=x86_64;; \
+        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
+    esac \
+ && curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${MLN_CMAKE_VERSION}/cmake-${MLN_CMAKE_VERSION}-linux-${TOOL_ARCH}.tar.gz" -o /tmp/cmake.tgz \
+ && mkdir -p /opt/cmake \
+ && tar -xzf /tmp/cmake.tgz -C /opt/cmake --strip-components=1 \
+ && rm /tmp/cmake.tgz \
+ && cmake --version \
+ && curl -fsSL "https://ziglang.org/download/${MLN_ZIG_VERSION}/zig-${TOOL_ARCH}-linux-${MLN_ZIG_VERSION}.tar.xz" -o /tmp/zig.txz \
+ && mkdir -p /opt/zig \
+ && tar -xJf /tmp/zig.txz -C /opt/zig --strip-components=1 \
+ && rm /tmp/zig.txz \
+ && zig version \
+ && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${MLN_RUST_VERSION}" \
+ && cargo --version \
+ && curl -fsSL "https://github.com/EmbarkStudios/cargo-about/releases/download/${MLN_CARGO_ABOUT_VERSION}/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl.tar.gz" -o /tmp/cargo-about.tgz \
+ && tar -xzf /tmp/cargo-about.tgz -C /tmp \
+ && install -m 0755 "/tmp/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl/cargo-about" /usr/local/bin/cargo-about \
+ && rm -rf /tmp/cargo-about.tgz "/tmp/cargo-about-${MLN_CARGO_ABOUT_VERSION}-${TOOL_ARCH}-unknown-linux-musl" \
+ && cargo-about --version
+
+# sync-submodules checks out the filtered vendor trees and applies the
+# carried maplibre-native patches; sync-rustls-platform-verifier stages
+# the patched Cargo path-dependency the workspace manifest references
+# (cargo metadata fails at configure time without it). Both are the
+# scripts mise's [deps.*] providers run.
+WORKDIR /ffi/src
+RUN git clone "${MLN_FFI_REPO}" . \
+ && git checkout ${MLN_FFI_REV} \
+ && .mise/bin/sync-submodules \
+ && .mise/bin/sync-rustls-platform-verifier
+
+# Configure + build via the upstream workflow preset (backend/provider
+# cache vars: opengl + egl), then install. The generated .pc is
+# ${pcfiledir}-relative, so the install tree relocates to /ffi/install —
+# the path every downstream stage already consumes.
+RUN case "$TARGETARCH" in \
+        arm64) MLN_ARCH=arm64;; \
+        amd64) MLN_ARCH=x64;; \
+        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
+    esac \
+ && MLN_PRESET="linux-${MLN_ARCH}-egl" \
+ && cmake --workflow --preset "$MLN_PRESET" \
+ && cmake --install "build/${MLN_PRESET}" \
+ && mkdir -p /ffi/install \
+ && cp -a "build/${MLN_PRESET}/install/." /ffi/install/ \
+ && test -f /ffi/install/lib/libmaplibre-native-c.so \
+ && test -f /ffi/install/share/pkgconfig/maplibre-native-c.pc
+
+# Point the .so at its own directory so any transitive private deps
+# resolve without registering a global ldconfig path (which previously
+# shadowed Ubuntu's libpng/libjpeg for other consumers in the image).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends patchelf binutils \
+ && rm -rf /var/lib/apt/lists/* \
+ && for lib in /ffi/install/lib/*.so*; do \
+        patchelf --set-rpath '$ORIGIN' "$lib" || echo "WARN: patchelf failed on $lib"; \
+    done \
+ && readelf -d /ffi/install/lib/libmaplibre-native-c.so | grep -E 'RUNPATH|RPATH|NEEDED' || true
 
 # ================================
 # Build Go binary

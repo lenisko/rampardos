@@ -33,7 +33,7 @@ DOCKER_PLATFORMS=linux/amd64
 # pseudo-version in rampardos/go.mod — both the artifact fetch and the Go
 # build assert it, so a drift fails the build rather than linking a
 # library the binding was not built against.
-MLN_FFI_REV ?= 92e6736979d5ced7b17e867f22bc087ae6053dc0
+MLN_FFI_REV ?= 422f853f6cf8adaa4d0a878597fbd48c15dd1c08
 MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi
 
 # Default target

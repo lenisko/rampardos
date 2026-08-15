@@ -21,8 +21,12 @@
 
 set -euo pipefail
 
+# NOTE: while MLN_FFI_REV points at a PR branch (maplibre-native-ffi#631)
+# there is NO published artifact for it — this script will fail the rev
+# check by design. Build in Docker (mln-ffi-build stage) or copy
+# /ffi/install out of that stage for host development.
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi}"
-MLN_FFI_REV="${MLN_FFI_REV:-92e6736979d5ced7b17e867f22bc087ae6053dc0}"
+MLN_FFI_REV="${MLN_FFI_REV:-422f853f6cf8adaa4d0a878597fbd48c15dd1c08}"
 MLN_FFI_SNAPSHOT_TAG="${MLN_FFI_SNAPSHOT_TAG:-unstable-native-snapshot}"
 
 case "$(uname -s)-$(uname -m)" in
