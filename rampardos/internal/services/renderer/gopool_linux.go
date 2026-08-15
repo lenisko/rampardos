@@ -807,7 +807,6 @@ func (w *goWorker) init() error {
 		ScaleFactor: w.curScale,
 		Mode:        maplibre.MapModeStatic,
 		EventMask: maplibre.RuntimeEventMaskMapRenderUpdateAvailable |
-			maplibre.RuntimeEventMaskMapRenderFrameFinished |
 			maplibre.RuntimeEventMaskMapLoadingFailed |
 			maplibre.RuntimeEventMaskMapRenderError,
 	})
@@ -1114,15 +1113,6 @@ func (w *goWorker) service(ctx context.Context, op opPoller, budget time.Duratio
 				if frames != nil {
 					frames.needDemand = true
 				}
-			case maplibre.RuntimeEventMapRenderFrameFinished:
-				// The renderer can need further passes (placement,
-				// transitions) without any new map update — a still
-				// typically takes several. That request arrives as
-				// needs_repaint on the finished-frame payload, not as
-				// another render-update event.
-				if p, ok := ev.Payload.(maplibre.RuntimeEventRenderFramePayload); ok && p.NeedsRepaint && frames != nil {
-					frames.needDemand = true
-				}
 			case maplibre.RuntimeEventMapLoadingFailed:
 				return fmt.Errorf("renderer: map loading failed: %s", ev.Message)
 			case maplibre.RuntimeEventMapRenderError:
@@ -1158,11 +1148,11 @@ func (w *goWorker) service(ctx context.Context, op opPoller, budget time.Duratio
 				}
 				if res.Disposition == maplibre.RenderResultRendered {
 					frames.rendered = true
-				} else {
-					// No frame was presented for that demand; keep one
-					// outstanding so tile arrivals can complete the still.
-					frames.needDemand = true
 				}
+				// Non-rendered dispositions (NoUpdate, SizePending, ...)
+				// need no instant retry: the post-park keep-alive demand
+				// below re-attempts on the next wake, and an instant
+				// re-demand here would spin demand→NoUpdate→demand.
 			}
 		}
 
@@ -1203,26 +1193,46 @@ func (w *goWorker) service(ctx context.Context, op opPoller, budget time.Duratio
 
 		// Idle: nothing serviced and the operation is incomplete. Consume
 		// and re-arm the edge-triggered ready state, then park until the
-		// callback wakes us (or the defensive cap / deadline passes).
+		// callback wakes us (or the cap / deadline passes).
+		//
+		// While a still is in flight the cap is short: mbgl worker
+		// continuations (tile parses, placement results) are posted to
+		// the session scheduler with no notification hook installed
+		// upstream, and only an executed frame demand drains that
+		// scheduler ("or a frame with no update to render strands
+		// them" — render_session_common.cpp). Most arrivals also fire a
+		// map event and wake us instantly; the cap bounds the ones that
+		// don't.
 		if _, err := w.rt.DrainReady(); err != nil {
 			return fmt.Errorf("renderer: %s: drain ready: %w", what, err)
 		}
-		park := min(time.Until(deadline), 100*time.Millisecond)
-		if park <= 0 {
-			continue
+		parkCap := 100 * time.Millisecond
+		if frames != nil {
+			parkCap = 5 * time.Millisecond
 		}
-		parkStart := time.Now()
-		timer := time.NewTimer(park)
-		select {
-		case <-w.wake:
-			timer.Stop()
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
+		park := min(time.Until(deadline), parkCap)
+		if park > 0 {
+			parkStart := time.Now()
+			timer := time.NewTimer(park)
+			select {
+			case <-w.wake:
+				timer.Stop()
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				totalPark += time.Since(parkStart)
+				return ctx.Err()
+			}
 			totalPark += time.Since(parkStart)
-			return ctx.Err()
 		}
-		totalPark += time.Since(parkStart)
+		// Keep-alive: a demand after every park while the still is
+		// incomplete. Executing a demand — even one that reports
+		// NoUpdate — drains the session scheduler and runs render jobs,
+		// which is the only path that delivers stranded continuations
+		// and lets the still make progress.
+		if frames != nil {
+			frames.needDemand = true
+		}
 	}
 }
 

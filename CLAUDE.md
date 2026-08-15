@@ -40,13 +40,18 @@ visible in the code.
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
 - **Executor-binding service loop invariants** (`goWorker.service`):
-  a still needs frame demands re-issued on BOTH `RenderUpdateAvailable`
-  events AND `RenderFrameFinished` events with `needs_repaint` — the
-  renderer requests extra passes (placement etc.) via the latter only,
-  and a still typically takes several passes. A session `ResizeStart`
-  can never complete on its own in static mode (no map update publishes
-  without a pending still), so resize is started and the next still's
-  demand loop drives it; never await a bare resize with no demands.
+  while a still is in flight, a keep-alive frame demand must follow
+  every park — executing a demand (even one that reports NoUpdate)
+  drains the session scheduler and runs render jobs, and that is the
+  ONLY delivery path for mbgl worker continuations (tile parses,
+  placement): upstream installs no notification hook on that scheduler,
+  so a parked loop with no demand strands them and the still never
+  completes. Do not re-demand instantly on non-rendered dispositions
+  (that spins); pace retries through the park. `RenderFrameFinished`
+  events do not exist in static mode (mbgl gates them to Continuous) —
+  don't build logic on them. A session `ResizeStart` can never complete
+  on its own in static mode; resize is started and the next still's
+  demand loop drives it — never await a bare resize with no demands.
   `DrainFrameResults` returns `ErrNotReady` when empty — not an error.
 
 ## Cache intent: nocache, TTL, owned

@@ -161,11 +161,18 @@ inverse of this commit, which is why it's kept isolated).
   blocks detach behind it). As built, `renderOne` starts the resize and
   lets the following still's demand loop drive it to completion,
   verifying the resize operation's terminal status after the still.
-- **D4 amendment:** the demand loop re-demands on `RenderFrameFinished`
-  events whose payload sets `needs_repaint`, in addition to
-  `RenderUpdateAvailable` — the renderer requests further passes
-  (placement, transitions) via the former only. The map event mask
-  gained `RuntimeEventMaskMapRenderFrameFinished` accordingly.
+- **D4 amendment (supersedes an earlier needs_repaint theory):** in
+  static mode mbgl never emits frame-finished observer callbacks (they
+  are gated to Continuous), and the session scheduler that receives
+  mbgl worker continuations (tile parses, placement results) has no
+  notification hook installed upstream — only an executed frame demand
+  drains it (`render_session_common.cpp`: "or a frame with no update
+  to render strands them"). The loop therefore issues a keep-alive
+  demand after every park while a still is in flight (park cap 5 ms
+  during stills, 100 ms otherwise), and does NOT re-demand instantly
+  on non-rendered dispositions. This mirrors the keep-alive re-demand
+  in upstream's own still-image.c example, which is load-bearing, not
+  a poll.
 - **DrainFrameResults** reports `ErrNotReady` for an empty queue;
   treated as an empty drain.
 - The Zig cross toolchain and the mise sync scripts
