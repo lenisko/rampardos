@@ -39,20 +39,22 @@ visible in the code.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
-- **Executor-binding service loop invariants** (`goWorker.service`):
-  while a still is in flight, a keep-alive frame demand must follow
-  every park — executing a demand (even one that reports NoUpdate)
-  drains the session scheduler and runs render jobs, and that is the
-  ONLY delivery path for mbgl worker continuations (tile parses,
-  placement): upstream installs no notification hook on that scheduler,
-  so a parked loop with no demand strands them and the still never
-  completes. Do not re-demand instantly on non-rendered dispositions
-  (that spins); pace retries through the park. `RenderFrameFinished`
+- **Executor-binding still invariants** (`goWorker.awaitStill`, the
+  core-worker driver): a static-mode map renders only on demand, so the
+  await keeps exactly one frame demand outstanding and re-issues when
+  the previous one resolves without completing the still — executing a
+  demand (even one that reports NoUpdate) is what advances mbgl
+  (delivers tile/placement continuations). This mirrors upstream's
+  still-image.c and is load-bearing, not a poll. `RenderFrameFinished`
   events do not exist in static mode (mbgl gates them to Continuous) —
   don't build logic on them. A session `ResizeStart` can never complete
   on its own in static mode; resize is started and the next still's
-  demand loop drives it — never await a bare resize with no demands.
+  demand loop drives it — never await a bare resize before a still.
   `DrainFrameResults` returns `ErrNotReady` when empty — not an error.
+  Blocking `OperationHandle.Wait` is safe under the core-worker driver
+  (the native worker completes operations); it was a self-deadlock
+  under the caller-graphics-thread driver — do not reintroduce that
+  driver without restoring a host service loop.
 
 ## Cache intent: nocache, TTL, owned
 

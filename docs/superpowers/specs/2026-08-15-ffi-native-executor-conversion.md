@@ -179,3 +179,45 @@ inverse of this commit, which is why it's kept isolated).
   (`sync-submodules`, `sync-rustls-platform-verifier`) are required by
   the PR-era FFI build — D9's "resurrect the pre-e5c7a00 stage" needed
   those two updates.
+
+
+## Second revision (2026-08-17): core-worker driver
+
+Upstream landed `819cd372` ("Run private OpenGL textures on core
+workers") two days after our PR comment proposing exactly that shape:
+dedicated-ownership EGL owned-texture targets now REQUIRE the
+core-worker driver and grant readback only, ring depth one. Re-pinned
+to PR head `57237a83f98bfb51a90baedf04741c0fce46bbe1` and adopted it:
+
+- `egl_linux.go` shrank to display+config discovery — the native
+  session worker creates and owns its context (`ClientAPI: GL`
+  preserves the desktop-GL choice; the display stays initialized until
+  detach completes).
+- The caller-thread service loop, notification callback, wake channel,
+  park heuristics, and `runtime.LockOSThread` are gone. Blocking
+  `OperationHandle.Wait` is safe now; the still await is upstream's
+  still-image.c shape (drain results / bounded wait / re-demand when
+  the pending demand resolved without completing the still).
+- D1/D2/D4 above and the first as-built amendment describe the
+  caller-driver era and are superseded for the render path; the
+  keep-alive-demand insight carried over as the await's re-demand rule.
+- Binding drift absorbed: `DrainEvents()`/`DrainFrameResults()` lost
+  their max parameters; `FrameDemand` gained `TimeoutNS` (unused);
+  runtimes create synchronously.
+
+### Known upstream regression worked around (57237a8)
+
+The reworked demand path resolves IF_NEEDED demands as NoUpdate without
+draining the session scheduler, and that scheduler still has no wake
+hook (`set_repaint_request` is only ever cleared). It carries both mbgl
+worker continuations AND the renderer-observer mailbox that delivers
+still completion to the map — so a still can strand outright (observed:
+demands NoUpdate forever) or complete only when a later draining demand
+happens to run. The 422f853-era caller path kept its drain "ahead of
+the early returns ... or a frame with no update to render strands
+them"; the core-worker path lost it. Workaround in `awaitStill`: a
+keep-alive demand issued after a NoUpdate resolution goes out
+unconditional (no IF_NEEDED), taking the drain-carrying render path at
+the cost of one redundant redraw per progress gap. Worth reporting on
+PR 631; remove the escalation when upstream restores the drain or wires
+the scheduler wake.
