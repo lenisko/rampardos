@@ -1,9 +1,8 @@
 // Package renderer rasterises vector mbtiles into encoded image bytes.
-// The Renderer interface is intentionally backend-agnostic: production
-// uses a Node worker pool (see nodepool.go) loading
-// @maplibre/maplibre-gl-native, but the interface is shaped so that a
-// future source-built mbgl-render binary backend could replace it with
-// no changes to call sites.
+// The implementation is the in-process Go renderer (gopool.go), driving
+// maplibre-native through its C ABI. The Renderer interface is kept
+// backend-agnostic so an alternative implementation could replace it
+// without touching call sites.
 package renderer
 
 import (
@@ -74,23 +73,48 @@ type ViewportRequest struct {
 
 // Config selects and parameterises a Renderer backend.
 type Config struct {
-	// Backend selects the implementation. Currently only "node-pool".
+	// Backend selects the implementation. Only "go-pool" exists; retained
+	// so RENDERER_BACKEND stays a validated setting rather than silently
+	// ignored.
 	Backend string
 
-	// Node worker pool configuration (ignored by other backends).
-	NodeBinary     string        // "node" if on PATH; else absolute path
-	WorkerScript   string        // absolute path to render-worker.js
-	WorkerModules  string        // absolute path to node_modules dir the worker should load from. Typically separate from WorkerScript — e.g. the script lives in rampardos/ and node_modules is installed under /app/render-worker/ at Docker build time.
-	PoolSize       int           // global cap on concurrent renders across all pools (default: runtime.GOMAXPROCS(0)). Bounds CPU oversubscription when many (style, scale) pools exist.
-	StylePoolSize  int           // workers per (style, scale) pool (default: PoolSize). Controls memory footprint per pool, not concurrent renders — the global PoolSize semaphore gates that.
+	// Two-level concurrency. PoolSize is a process-global semaphore
+	// capping concurrent renders across every (style, scale) pool;
+	// StylePoolSize caps the workers within one pool. Raising StylePoolSize
+	// above PoolSize cannot buy throughput — the global semaphore forbids
+	// the extra concurrency — but it does raise the ceiling a single hot
+	// pool can reach while others stay at their floor.
+	PoolSize      int // global cap on concurrent renders (default: runtime.GOMAXPROCS(0))
+	StylePoolSize int // ceiling on workers per (style, scale) pool (default: PoolSize)
+
+	// StylePoolMin is the number of workers a pool keeps when idle
+	// (default: 1). Pools start here and grow towards StylePoolSize when a
+	// dispatch finds every worker busy, then retire one worker per
+	// StylePoolIdleTTL of quiet back down to the floor. This matters
+	// because pools are per (style, scale): a single static size
+	// over-provisions every rarely-used combination while still capping
+	// the busy one.
+	StylePoolMin int
+
+	// StylePoolIdleTTL is the quiet interval after which a pool retires
+	// one worker (default: 2m). Growth is immediate; shrink is one worker
+	// per interval so a brief lull doesn't collapse a hot pool.
+	StylePoolIdleTTL time.Duration
+
 	RenderTimeout  time.Duration // per-request deadline (default: 15s)
-	WorkerLifetime int           // max renders per worker before recycling (default: 500)
-	StartupTimeout time.Duration // max time to wait for a worker handshake (default: 10s)
+	StartupTimeout time.Duration // max time to wait for worker startup (default: 30s)
 
 	// Asset paths resolved to absolute paths at load time.
 	StylesDir   string // e.g. "TileServer/Styles"
 	FontsDir    string // e.g. "TileServer/Fonts"
 	MbtilesFile string // e.g. "TileServer/Datasets/Combined.mbtiles"
+
+	// TileJSON, when non-nil, is the inline vector-source object
+	// PrepareStyle embeds instead of the mbtiles:// URL — the tile
+	// provider's scheme plus the dataset's zoom range and bounds. Set
+	// by the Go renderer when its shared TileStore is active; nil keeps
+	// the native MBTilesFileSource path.
+	TileJSON map[string]any
 
 	// DiscoverStyles returns the current set of local style IDs by
 	// scanning the disk. Called at startup and on each ReloadStyles

@@ -93,24 +93,50 @@ type MetricsManager struct {
 
 	// Renderer pool saturation tripwires. Every local staticmap base
 	// is a live renderer call — there is no disk-cache buffer — so
-	// visibility into whether the Node workers are the bottleneck
-	// matters.
+	// visibility into whether the render pool is the bottleneck matters.
 	rendererPoolAcquireWait    *prometheus.HistogramVec // time callers waited for an idle worker in (style, scale) pool
 	rendererPoolIdleWorkers    *prometheus.GaugeVec     // snapshot of idle workers, updated per acquire
+	rendererPoolWorkers        *prometheus.GaugeVec     // resident workers per (style, scale); varies as pools grow/shrink
+	rendererPoolWorkersMax     *prometheus.GaugeVec     // high-water resident workers per pool since start
+	rendererPoolGrow           *prometheus.CounterVec   // workers added on demand
+	rendererPoolShrink         *prometheus.CounterVec   // workers retired when idle
 	rendererWorkerReplacements *prometheus.CounterVec   // reason=error|lifetime
+
+	// Go-renderer per-render breakdown. Decomposes the total per-render
+	// wall time (rendererViewportDuration) so we can see where the time
+	// actually goes: still-await turns, blocking-wait time, time to the
+	// first frame result, and frame demands issued. Metric names keep
+	// their historical pump_* prefix (from the pre-executor host-pumping
+	// binding) so dashboards survive; the semantics are the core-worker
+	// await analogues.
+	rendererPumpIterations      *prometheus.HistogramVec // still-await loop turns per render
+	rendererPumpSleep           *prometheus.HistogramVec // total seconds blocked in operation waits per render
+	rendererPumpTimeToFirstEv   *prometheus.HistogramVec // seconds from await start to first frame result
+	rendererPumpRenderUpdate    *prometheus.HistogramVec // always 0 under the core-worker driver (no host graphics work)
+	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // frame demands issued per render (>1 = multi-pass still)
+	rendererReadback            *prometheus.HistogramVec // seconds for the full readback operation (start→wait→take) per render
+
+	// Shared tile provider (renderer resource provider backed by SQLite
+	// + an in-process LRU of decompressed tile blobs). outcome: lru_hit,
+	// sqlite_hit, not_found, error, passthrough.
+	tileProviderRequests   *prometheus.CounterVec
+	tileProviderFetch      *prometheus.HistogramVec
+	tileProviderCacheBytes prometheus.Gauge
+	tileProviderEvictions  prometheus.Counter
 
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
 	// saturation metrics above.
 	rendererGlobalCapacity    prometheus.Gauge
 	rendererGlobalInFlight    prometheus.Gauge
-	rendererGlobalAcquireWait prometheus.Histogram
+	rendererGlobalInFlightMax prometheus.Gauge // high-water concurrent renders since start
 
-	// Renderer child-process resource usage. Node workers are outside
-	// Go's heap, so rampardos_memory_rss_bytes alone can't reveal a
-	// Node-side leak. Sum and count are sampled from /proc on Linux.
-	nodeWorkersTotal    prometheus.Gauge
-	nodeWorkersRSSBytes prometheus.Gauge
+	// inFlight mirrors rendererGlobalInFlight so the high-water mark can be
+	// computed without reading back from Prometheus.
+	inFlight                  int
+	peakInFlight              float64
+	inFlightMu                sync.Mutex
+	rendererGlobalAcquireWait prometheus.Histogram
 
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
@@ -279,14 +305,96 @@ func newMetricsManager() *MetricsManager {
 			Help: "Idle workers snapshotted at the moment a dispatch acquires one from the (style, scale) pool. 0 means the pool was fully busy when this dispatch entered.",
 		}, []string{"style", "scale"}),
 
+		rendererPoolWorkers: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_pool_workers",
+			Help: "Resident workers in each (style, scale) pool. Pools start at STYLE_POOL_MIN, grow towards STYLE_POOL_SIZE when a dispatch finds every worker busy, and retire one worker per idle interval back down to the floor. Each worker is a full mbgl map + runtime + EGL context, so this gauge tracks the renderer's memory footprint.",
+		}, []string{"style", "scale"}),
+
+		rendererPoolWorkersMax: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_pool_workers_max",
+			Help: "Highest resident worker count each (style, scale) pool has reached since process start. The pool_workers gauge only shows the value at scrape time, so a pool that grew during a burst and decayed before the next scrape leaves no trace there; this is the number to size STYLE_POOL_SIZE against.",
+		}, []string{"style", "scale"}),
+
+		rendererPoolGrow: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_pool_grow_total",
+			Help: "Workers added because a dispatch found every worker in the pool busy. Compare with pool_shrink_total: comparable rates on a short interval mean the pool is oscillating and STYLE_POOL_IDLE_SECONDS is too low.",
+		}, []string{"style", "scale"}),
+
+		rendererPoolShrink: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_pool_shrink_total",
+			Help: "Workers retired after an idle interval, each releasing an mbgl map, runtime and EGL context.",
+		}, []string{"style", "scale"}),
+
 		rendererWorkerReplacements: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_worker_replacements_total",
 			Help: "Worker processes killed and respawned. reason=error counts abnormal dispatch failures; reason=lifetime counts routine recycling after workerLifetime renders.",
 		}, []string{"style", "scale", "reason"}),
 
+		rendererPumpIterations: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_iterations_per_render",
+			Help:    "Number of still-await loop turns the Go renderer executed per render (frame/event drain + bounded operation wait). High counts mean the still needed many passes or waited on slow resource loads.",
+			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000},
+		}, []string{"style", "scale"}),
+
+		rendererPumpSleep: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_sleep_seconds_per_render",
+			Help:    "Total seconds the Go renderer spent parked in the still await per render (Done-channel select with a 1ms pacing tick) — genuine wait on the native core worker's progress (tile IO, parse/layout, draws).",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"style", "scale"}),
+
+		rendererPumpTimeToFirstEv: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_time_to_first_event_seconds",
+			Help:    "Seconds from the still await's start to the first frame result drained. Measures mbgl's warm-up cost: how long the core worker takes to produce the first frame (driven by tile/glyph/sprite fetch latency).",
+			Buckets: []float64{0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
+		}, []string{"style", "scale"}),
+
+		rendererPumpRenderUpdate: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_render_update_seconds_per_render",
+			Help:    "Always 0 under the core-worker driver: the native session worker performs all graphics work, so no host-side render time exists to measure. Retained so dashboards keep their panel.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5},
+		}, []string{"style", "scale"}),
+
+		rendererPumpRenderUpdateCnt: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_pump_render_update_count_per_render",
+			Help:    "Number of frame demands issued per render. High values mean the still needed multiple passes before completing (e.g. as tiles arrived progressively).",
+			Buckets: []float64{1, 2, 3, 5, 10, 20, 50},
+		}, []string{"style", "scale"}),
+
+		tileProviderRequests: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_tileprovider_requests_total",
+			Help: "Tile requests served by the shared renderer tile provider, by outcome: lru_hit (in-process cache), sqlite_hit (prepared-statement read), not_found (sparse dataset, served as empty), error, passthrough (non-tile URL declined to native networking).",
+		}, []string{"outcome"}),
+
+		tileProviderFetch: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_tileprovider_fetch_seconds",
+			Help:    "Time to serve one tile from SQLite (query + gunzip; lru_hit requests are not timed, they are sub-microsecond map lookups). This is the per-tile cost the native MBTilesFileSource path used to hide inside render wall time.",
+			Buckets: []float64{0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"outcome"}),
+
+		tileProviderCacheBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_tileprovider_cache_bytes",
+			Help: "Decompressed bytes currently held by the tile provider's LRU (bounded by RENDERER_TILE_CACHE_MB).",
+		}),
+
+		tileProviderEvictions: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "rampardos_tileprovider_cache_evictions_total",
+			Help: "Tiles evicted from the provider LRU to stay under the byte bound.",
+		}),
+
+		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_readback_seconds_per_render",
+			Help:    "Seconds for the full readback operation per render (ReadPremultipliedRGBA8Start, wait to completion, Take). The glReadPixels-equivalent plus the binding's copy-out. On Mesa llvmpipe this should be low single-digit ms for 512×512×4; large values indicate driver-side stall or wrong attachment type.",
+			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"style", "scale"}),
+
 		rendererGlobalCapacity: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "rampardos_renderer_global_capacity",
 			Help: "Maximum concurrent renders across all (style, scale) pools (RENDERER_POOL_SIZE). Static; set once at renderer init.",
+		}),
+
+		rendererGlobalInFlightMax: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_renderer_global_in_flight_max",
+			Help: "Highest number of concurrent renders observed since process start. Compare with rampardos_renderer_global_capacity: if this stays well below the cap, the configured concurrency (and the worker pools sized for it) is never needed.",
 		}),
 
 		rendererGlobalInFlight: promauto.NewGauge(prometheus.GaugeOpts{
@@ -298,16 +406,6 @@ func newMetricsManager() *MetricsManager {
 			Name:    "rampardos_renderer_global_acquire_wait_seconds",
 			Help:    "Time a dispatch spent waiting for the global concurrency semaphore before even attempting the per-pool acquire. Non-zero percentiles indicate the global cap is the limiting factor, not a specific pool.",
 			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
-		}),
-
-		nodeWorkersTotal: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "rampardos_renderer_node_workers_total",
-			Help: "Count of child Node render-worker processes (ppid == rampardos && comm == node). A climbing count with stable traffic means worker rotation is broken.",
-		}),
-
-		nodeWorkersRSSBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "rampardos_renderer_node_workers_rss_bytes",
-			Help: "Summed Resident Set Size of child Node render-worker processes, in bytes. Outside Go's heap — complements rampardos_memory_rss_bytes. Sampled from /proc on Linux.",
 		}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -343,10 +441,6 @@ func (m *MetricsManager) updateRuntimeMetrics() {
 			m.memoryVSSBytes.Set(float64(memStats.Sys))
 		}
 
-		if sample, ok := sampleNodeWorkers(); ok {
-			m.nodeWorkersTotal.Set(float64(sample.count))
-			m.nodeWorkersRSSBytes.Set(float64(sample.rssBytes))
-		}
 	}
 }
 
@@ -417,83 +511,6 @@ func readVSSFromStatus() uint64 {
 		}
 	}
 	return 0
-}
-
-// nodeWorkerSample aggregates the render-worker subprocess footprint.
-type nodeWorkerSample struct {
-	count    int
-	rssBytes uint64
-}
-
-// sampleNodeWorkers walks /proc and sums RSS / counts child Node render
-// workers (ppid == our pid, comm == "node"). Linux-only; returns ok=false
-// when /proc isn't available. Sampling cost is proportional to the total
-// process count in the container — trivial for our single-service image.
-func sampleNodeWorkers() (nodeWorkerSample, bool) {
-	selfPID := os.Getpid()
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nodeWorkerSample{}, false
-	}
-	var out nodeWorkerSample
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if _, err := strconv.Atoi(entry.Name()); err != nil {
-			continue
-		}
-		if addNodeWorkerIfMatch(&out, entry.Name(), selfPID) {
-			continue
-		}
-	}
-	return out, true
-}
-
-// addNodeWorkerIfMatch parses /proc/<pid>/status once; if the process is a
-// child node worker of ours, its RSS is added to out. Returns true when the
-// entry was our worker (caller uses this only as a "counted" hint).
-func addNodeWorkerIfMatch(out *nodeWorkerSample, pidDir string, selfPID int) bool {
-	f, err := os.Open("/proc/" + pidDir + "/status")
-	if err != nil {
-		// Process exited between ReadDir and Open — benign.
-		return false
-	}
-	defer f.Close()
-
-	var (
-		name    string
-		ppid    int
-		vmRSS   uint64
-		haveRSS bool
-	)
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case strings.HasPrefix(line, "Name:"):
-			if fields := strings.Fields(line); len(fields) >= 2 {
-				name = fields[1]
-			}
-		case strings.HasPrefix(line, "PPid:"):
-			if fields := strings.Fields(line); len(fields) >= 2 {
-				ppid, _ = strconv.Atoi(fields[1])
-			}
-		case strings.HasPrefix(line, "VmRSS:"):
-			if fields := strings.Fields(line); len(fields) >= 2 {
-				if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-					vmRSS = v * 1024
-					haveRSS = true
-				}
-			}
-		}
-	}
-	if name != "node" || ppid != selfPID || !haveRSS {
-		return false
-	}
-	out.count++
-	out.rssBytes += vmRSS
-	return true
 }
 
 // RecordRequest records a request with type, cache status, and duration
@@ -569,8 +586,70 @@ func (m *MetricsManager) RecordRendererPoolAcquire(style, scale string, waitSeco
 	m.rendererPoolIdleWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(idleAfter))
 }
 
+// SetRendererPoolWorkers publishes a pool's current worker count and
+// advances its high-water mark. highWater is tracked by the caller (the
+// pool owns the lock that makes it consistent with the count).
+func (m *MetricsManager) SetRendererPoolWorkers(style, scale string, workers, highWater int) {
+	m.rendererPoolWorkers.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(workers))
+	m.rendererPoolWorkersMax.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Set(float64(highWater))
+}
+
+// RecordRendererPoolGrow / Shrink count elasticity events.
+func (m *MetricsManager) RecordRendererPoolGrow(style, scale string) {
+	m.rendererPoolGrow.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
+}
+
+func (m *MetricsManager) RecordRendererPoolShrink(style, scale string) {
+	m.rendererPoolShrink.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
+}
+
 func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
 	m.rendererWorkerReplacements.WithLabelValues(bucketLabel(style), bucketLabel(scale), reason).Inc()
+}
+
+// RecordRendererPumpBreakdown emits the per-render diagnostic
+// histograms for the Go renderer's pump loop. Called once per render
+// from GoPoolRenderer's pumpUntilStillFinished. Decomposes total
+// render time so we can see what's actually contributing to it.
+func (m *MetricsManager) RecordRendererPumpBreakdown(
+	style, scale string,
+	iterations int,
+	sleepSeconds float64,
+	timeToFirstEventSeconds float64,
+	renderUpdateSeconds float64,
+	renderUpdateCount int,
+) {
+	m.rendererPumpIterations.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(iterations))
+	m.rendererPumpSleep.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(sleepSeconds)
+	m.rendererPumpTimeToFirstEv.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(timeToFirstEventSeconds)
+	m.rendererPumpRenderUpdate.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(renderUpdateSeconds)
+	m.rendererPumpRenderUpdateCnt.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(float64(renderUpdateCount))
+}
+
+// RecordRendererReadback emits the per-render readback histogram.
+// Called once per render from renderOne, right around the
+// sess.ReadPremultipliedRGBA8Into() call.
+func (m *MetricsManager) RecordRendererReadback(style, scale string, seconds float64) {
+	m.rendererReadback.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(seconds)
+}
+
+// RecordTileProviderRequest counts one provider request by outcome and,
+// for outcomes that touched SQLite, observes the fetch duration.
+func (m *MetricsManager) RecordTileProviderRequest(outcome string, seconds float64) {
+	m.tileProviderRequests.WithLabelValues(outcome).Inc()
+	if outcome == "sqlite_hit" || outcome == "not_found" {
+		m.tileProviderFetch.WithLabelValues(outcome).Observe(seconds)
+	}
+}
+
+// SetTileProviderCacheBytes publishes the LRU's current byte size.
+func (m *MetricsManager) SetTileProviderCacheBytes(n int64) {
+	m.tileProviderCacheBytes.Set(float64(n))
+}
+
+// IncTileProviderEvictions counts one LRU eviction.
+func (m *MetricsManager) IncTileProviderEvictions() {
+	m.tileProviderEvictions.Inc()
 }
 
 // SetRendererGlobalCapacity is called once at renderer init to expose
@@ -585,10 +664,23 @@ func (m *MetricsManager) SetRendererGlobalCapacity(capacity int) {
 func (m *MetricsManager) RecordRendererGlobalAcquire(waitSeconds float64) {
 	m.rendererGlobalAcquireWait.Observe(waitSeconds)
 	m.rendererGlobalInFlight.Inc()
+
+	m.inFlightMu.Lock()
+	m.inFlight++
+	if n := m.inFlight; float64(n) > m.peakInFlight {
+		m.peakInFlight = float64(n)
+		m.rendererGlobalInFlightMax.Set(m.peakInFlight)
+	}
+	m.inFlightMu.Unlock()
 }
 
 func (m *MetricsManager) DecRendererGlobalInFlight() {
 	m.rendererGlobalInFlight.Dec()
+	m.inFlightMu.Lock()
+	if m.inFlight > 0 {
+		m.inFlight--
+	}
+	m.inFlightMu.Unlock()
 }
 
 func (m *MetricsManager) RecordImageCacheHit(name string) {

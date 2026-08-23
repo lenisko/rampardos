@@ -39,6 +39,48 @@ visible in the code.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
+- **Executor-binding still invariants** (`goWorker.awaitStill`, the
+  core-worker driver): a static-mode map renders only on demand, so the
+  await keeps a two-deep pipeline of IF_NEEDED frame demands queued
+  (distinct CoalescingBoundary per demand — identical boundaries
+  supersede instead of queueing), topping it up as results drain. The
+  pipeline is load-bearing: frame results are poll-only in the binding,
+  so with a single demand every progressive pass pays up to a pacing
+  tick of host latency; with a spare queued, passes chain natively.
+  Leftover demands at completion cannot be cancelled and may draw the
+  next render's first pass — awaitStill flushes stale results upfront
+  and counts any post-flush rendered frame. The park must never sit
+  between a resolved demand and the top-up.
+  `RenderFrameFinished` events do not exist in static mode (mbgl gates
+  them to Continuous) — don't build logic on them. A session `Resize`
+  future can never complete on its own in static mode; resize is
+  started and the next still's demand loop drives it — never await a
+  bare resize before a still. `DrainFrameResults` returns `ErrNotReady`
+  when empty — not an error. There is no cancel for a pending still and
+  the map refuses a second one — an abandoned still must be settled by
+  driving the same await (bounded), else the worker is poisoned.
+  Blocking `Future.Await` is safe under the core-worker driver; the
+  caller-graphics-thread driver self-deadlocks on it — do not
+  reintroduce that driver without restoring a host service loop.
+
+## Tile provider (shared renderer resource provider)
+
+- One process-wide `TileStore` (SQLite pool + byte-bounded LRU of
+  decompressed tiles) serves every worker via the binding's resource
+  provider; `RENDERER_TILE_PROVIDER=off` is the kill switch back to the
+  native mbtiles source, and any store-open failure degrades the same
+  way. `RENDERER_TILE_CACHE_MB` bounds the LRU (default 64).
+- The custom `rampardos://tile/` scheme is what routes tiles to the
+  provider: mbgl only consults providers for network-path URLs, so
+  styleprep inlines a TileJSON with that scheme instead of an
+  `mbtiles://` url. file:// glyphs/sprites never reach the provider.
+- The provider must return DECOMPRESSED tile bytes (mbgl's network path
+  assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
+  rows for the mbtiles query. maxzoom in the inline TileJSON is what
+  makes overzoom work.
+- Dataset activate/combine retargets the mbtiles symlink; ReloadStyles
+  reopens the store, drops the tile LRU, and rebuilds the inline
+  TileJSON before re-preparing styles.
 
 ## Cache intent: nocache, TTL, owned
 

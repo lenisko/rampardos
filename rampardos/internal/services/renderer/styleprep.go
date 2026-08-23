@@ -151,7 +151,18 @@ func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 			// references, etc.
 			srcType, _ := src["type"].(string)
 			if srcType == "vector" || srcType == "" {
-				src["url"] = "mbtiles://" + cfg.MbtilesFile
+				if cfg.TileJSON != nil {
+					// Inline the provider-backed TileJSON: tiles on the
+					// provider scheme, zoom range and bounds from the
+					// dataset. No url means the native mbtiles source
+					// never engages.
+					delete(src, "url")
+					for k, v := range cfg.TileJSON {
+						src[k] = v
+					}
+				} else {
+					src["url"] = "mbtiles://" + cfg.MbtilesFile
+				}
 			}
 		}
 	}

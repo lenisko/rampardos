@@ -15,13 +15,12 @@ type Config struct {
 	RequestTimeout time.Duration
 
 	// Renderer settings
-	RendererBackend        string        // "node-pool"
-	RendererNodeBinary     string        // path to node
-	RendererWorkerScript   string        // path to render-worker.js
+	RendererBackend        string        // "go-pool" — the only backend
 	RendererPoolSize       int           // global cap on concurrent renders (semaphore size)
-	RendererStylePoolSize  int           // workers per (style, scale) pool (default: RendererPoolSize)
+	RendererStylePoolSize  int           // ceiling on workers per (style, scale) pool (default: RendererPoolSize)
+	RendererStylePoolMin   int           // workers a pool keeps when idle (default: 1)
+	RendererStylePoolIdle  time.Duration // quiet interval before retiring one worker (default: 2m)
 	RendererRenderTimeout  time.Duration // per-render deadline
-	RendererWorkerLifetime int           // renders per worker before recycle
 	RendererStartupTimeout time.Duration // max handshake wait
 
 	// HTTP client settings
@@ -84,13 +83,12 @@ func Load() *Config {
 		Hostname:       getEnv("HOSTNAME", "0.0.0.0"),
 		RequestTimeout: getEnvDuration("REQUEST_TIMEOUT", 10*time.Second),
 
-		RendererBackend:        getEnv("RENDERER_BACKEND", "node-pool"),
-		RendererNodeBinary:     getEnv("RENDERER_NODE_BINARY", "node"),
-		RendererWorkerScript:   getEnv("RENDERER_WORKER_SCRIPT", "/app/render-worker/render-worker.js"),
+		RendererBackend:        getEnv("RENDERER_BACKEND", "go-pool"),
 		RendererPoolSize:       getEnvInt("RENDERER_POOL_SIZE", 0),
 		RendererStylePoolSize:  getEnvInt("STYLE_POOL_SIZE", 0),
+		RendererStylePoolMin:   getEnvInt("STYLE_POOL_MIN", 1),
+		RendererStylePoolIdle:  getEnvSeconds("STYLE_POOL_IDLE_SECONDS", 120),
 		RendererRenderTimeout:  getEnvSeconds("RENDERER_TIMEOUT_SECONDS", 15),
-		RendererWorkerLifetime: getEnvInt("RENDERER_WORKER_LIFETIME", 500),
 		RendererStartupTimeout: getEnvSeconds("RENDERER_STARTUP_TIMEOUT_SECONDS", 10),
 
 		HTTPMaxConns: getEnvInt("HTTP_MAX_CONNS", 100),
