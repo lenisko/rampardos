@@ -221,3 +221,27 @@ unconditional (no IF_NEEDED), taking the drain-carrying render path at
 the cost of one redundant redraw per progress gap. Worth reporting on
 PR 631; remove the escalation when upstream restores the drain or wires
 the scheduler wake.
+
+## Third revision (2026-08-23): drain fix upstream, Future port
+
+Upstream fixed the drain regression at PR head `cf27aa58` exactly as
+the report's second suggestion: the session scheduler's repaint hook is
+now installed at attach, posting driver work that delivers queued
+results and re-evaluates a pending demand ("Without this, a session
+whose demands all resolve on the render-if-needed fast path never
+drains, stranding still-image completion and tile results"). Re-pinned
+and adopted:
+
+- The unconditional-demand escalation workaround is deleted — plain
+  IF_NEEDED keep-alives are correct again.
+- Ported to the native-completions API: every async call returns
+  `Future[T]` with ctx-aware `Await` and a `Done()` channel; the
+  `awaitOp`/`awaitOpCtx`/`terminalStatus` helpers are gone, native
+  failures arrive as errors carrying status+diagnostic, and map
+  creation / runtime close are futures too. The notification
+  callback/DrainReady machinery no longer exists in the binding; frame
+  results remain poll-only, so the still await keeps its 1ms pacing
+  tick with a Done()-channel park.
+- There is no cancel for a pending still (and the map refuses a second
+  one): the settle path drives the same await bounded by settleTimeout,
+  with the poison backstop unchanged.

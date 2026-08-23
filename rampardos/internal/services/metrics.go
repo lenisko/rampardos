@@ -330,7 +330,7 @@ func newMetricsManager() *MetricsManager {
 
 		rendererPumpSleep: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_sleep_seconds_per_render",
-			Help:    "Total seconds the Go renderer spent blocked in bounded operation waits per render — genuine wait on the native core worker's progress (tile IO, parse/layout, draws).",
+			Help:    "Total seconds the Go renderer spent parked in the still await per render (Done-channel select with a 1ms pacing tick) — genuine wait on the native core worker's progress (tile IO, parse/layout, draws).",
 			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
 		}, []string{"style", "scale"}),
 

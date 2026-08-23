@@ -41,20 +41,22 @@ visible in the code.
   whenever you touch viewport/tile math.
 - **Executor-binding still invariants** (`goWorker.awaitStill`, the
   core-worker driver): a static-mode map renders only on demand, so the
-  await keeps exactly one frame demand outstanding and re-issues when
-  the previous one resolves without completing the still — executing a
-  demand (even one that reports NoUpdate) is what advances mbgl
-  (delivers tile/placement continuations). This mirrors upstream's
-  still-image.c and is load-bearing, not a poll. `RenderFrameFinished`
-  events do not exist in static mode (mbgl gates them to Continuous) —
-  don't build logic on them. A session `ResizeStart` can never complete
-  on its own in static mode; resize is started and the next still's
-  demand loop drives it — never await a bare resize before a still.
-  `DrainFrameResults` returns `ErrNotReady` when empty — not an error.
-  Blocking `OperationHandle.Wait` is safe under the core-worker driver
-  (the native worker completes operations); it was a self-deadlock
-  under the caller-graphics-thread driver — do not reintroduce that
-  driver without restoring a host service loop.
+  await keeps exactly one IF_NEEDED frame demand outstanding and
+  re-issues when the previous one resolves without completing the still.
+  This mirrors upstream's still-image example and is load-bearing, not
+  a poll. The park must never sit between a resolved demand and its
+  successor (that quantizes every pass to the pacing tick).
+  `RenderFrameFinished` events do not exist in static mode (mbgl gates
+  them to Continuous) — don't build logic on them. A session `Resize`
+  future can never complete on its own in static mode; resize is
+  started and the next still's demand loop drives it — never await a
+  bare resize before a still. `DrainFrameResults` returns `ErrNotReady`
+  when empty — not an error. There is no cancel for a pending still and
+  the map refuses a second one — an abandoned still must be settled by
+  driving the same await (bounded), else the worker is poisoned.
+  Blocking `Future.Await` is safe under the core-worker driver; the
+  caller-graphics-thread driver self-deadlocks on it — do not
+  reintroduce that driver without restoring a host service loop.
 
 ## Cache intent: nocache, TTL, owned
 
