@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"container/list"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"strconv"
@@ -66,6 +67,36 @@ type TileStore struct {
 type tileEntry struct {
 	key  uint64
 	data []byte
+}
+
+// gzipReaders recycles inflate state across tile decompressions: a
+// gzip.Reader carries the full window buffers, and cold-viewport bursts
+// decompress dozens of tiles back to back. Hits never touch gzip — the
+// LRU stores decompressed blobs — so this only serves misses.
+var gzipReaders = sync.Pool{New: func() any { return new(gzip.Reader) }}
+
+// gunzipTile decompresses a gzip-framed tile blob using a pooled reader
+// and an exact-size output buffer taken from the gzip ISIZE trailer
+// (the uncompressed length mod 2^32 — always the true length at tile
+// sizes), so decompression is one allocation and no growth copies.
+func gunzipTile(blob []byte) ([]byte, error) {
+	zr := gzipReaders.Get().(*gzip.Reader)
+	defer gzipReaders.Put(zr)
+	if err := zr.Reset(bytes.NewReader(blob)); err != nil {
+		return nil, err
+	}
+	size := binary.LittleEndian.Uint32(blob[len(blob)-4:])
+	out := make([]byte, 0, size)
+	buf := bytes.NewBuffer(out)
+	if _, err := io.Copy(buf, zr); err != nil {
+		return nil, err
+	}
+	// Close validates nothing further here (CRC is checked at EOF) but
+	// keeps the reader in a Reset-able state for the pool.
+	if err := zr.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func newTileStore(path string, maxBytes int64) (*TileStore, error) {
@@ -252,13 +283,8 @@ func (s *TileStore) Get(z, x, y uint32) ([]byte, bool, error) {
 	// MVT blobs in mbtiles are conventionally gzip-compressed; mbgl's
 	// network path expects decompressed bytes (HTTP would have undone
 	// Content-Encoding before mbgl saw them).
-	if len(blob) >= 2 && blob[0] == 0x1f && blob[1] == 0x8b {
-		zr, err := gzip.NewReader(bytes.NewReader(blob))
-		if err != nil {
-			return nil, false, fmt.Errorf("renderer: tile gunzip z=%d x=%d y=%d: %w", z, x, y, err)
-		}
-		blob, err = io.ReadAll(zr)
-		_ = zr.Close()
+	if len(blob) >= 18 && blob[0] == 0x1f && blob[1] == 0x8b {
+		blob, err = gunzipTile(blob)
 		if err != nil {
 			return nil, false, fmt.Errorf("renderer: tile gunzip z=%d x=%d y=%d: %w", z, x, y, err)
 		}
