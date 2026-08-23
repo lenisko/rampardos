@@ -1098,6 +1098,12 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		fb.Close()
 	}
 
+	// demandPipelineDepth demands stay queued natively so progressive
+	// passes chain without host round-trips; the observation tick below
+	// is paid once per depth passes, not per pass. Leftovers at
+	// completion resolve during the next render's upfront flush.
+	const demandPipelineDepth = 4
+
 	firstToken := w.frameToken + 1
 	outstanding := 0
 	rendered := false
@@ -1120,7 +1126,7 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		demands++
 		return nil
 	}
-	for outstanding < 2 {
+	for outstanding < demandPipelineDepth {
 		if err := issue(); err != nil {
 			return err
 		}
@@ -1222,8 +1228,15 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			// the binding, so the tick bounds their observation latency.
 			// A turn that DID drain a result skips the park and tops the
 			// pipeline back up immediately.
+			// 250µs, not 1ms: since the binding dropped its notification
+			// API, frame results are poll-only and nothing can interrupt
+			// this park — its width is paid once per pipeline-depth
+			// passes as pure observation latency. The C API grew
+			// per-session frame wakes (mln_wake) that the Go binding
+			// does not surface yet; when it does, this park can select
+			// on a real signal instead of a tick.
 			waitStart := time.Now()
-			timer := time.NewTimer(time.Millisecond)
+			timer := time.NewTimer(250 * time.Microsecond)
 			select {
 			case <-still.Done():
 			case <-timer.C:
@@ -1242,7 +1255,7 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		}
 
 		if !completed {
-			for outstanding < 2 {
+			for outstanding < demandPipelineDepth {
 				if err := issue(); err != nil {
 					return err
 				}
