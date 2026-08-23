@@ -45,6 +45,12 @@ type GoPoolRenderer struct {
 	cfg Config
 	sem *semaphore.Weighted
 
+	// store is the process-wide tile provider backing every worker's
+	// resource-provider callback: one SQLite pool + one tile LRU instead
+	// of a native MBTilesFileSource per worker runtime. Nil when
+	// RENDERER_TILE_PROVIDER=off (falls back to mbtiles:// sources).
+	store *TileStore
+
 	mu    sync.RWMutex
 	pools map[string]*goStylePool
 }
@@ -79,9 +85,32 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 		return nil, fmt.Errorf("renderer: discover styles: %w", err)
 	}
 
+	// The shared tile provider is on by default; RENDERER_TILE_PROVIDER=off
+	// is the kill switch back to the native mbtiles source, and a store
+	// that fails to open degrades the same way rather than blocking boot.
+	var store *TileStore
+	if os.Getenv("RENDERER_TILE_PROVIDER") != "off" {
+		cacheMB := 64
+		if v, err := strconv.Atoi(os.Getenv("RENDERER_TILE_CACHE_MB")); err == nil && v > 0 {
+			cacheMB = v
+		}
+		st, err := newTileStore(cfg.MbtilesFile, int64(cacheMB)<<20)
+		if err != nil {
+			slog.Warn("Tile provider disabled: store open failed; falling back to native mbtiles source", "error", err)
+		} else if tj, err := st.TileJSON(); err != nil {
+			slog.Warn("Tile provider disabled: dataset metadata unusable; falling back to native mbtiles source", "error", err)
+			st.Close()
+		} else {
+			cfg.TileJSON = tj
+			store = st
+			slog.Info("Tile provider active", "mbtiles", cfg.MbtilesFile, "cacheMB", cacheMB, "maxzoom", tj["maxzoom"])
+		}
+	}
+
 	r := &GoPoolRenderer{
 		cfg:   cfg,
 		sem:   semaphore.NewWeighted(int64(cfg.PoolSize)),
+		store: store,
 		pools: make(map[string]*goStylePool),
 	}
 	if services.GlobalMetrics != nil {
@@ -179,6 +208,7 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 	zoomAdj := styleZoomOffset(raw)
 
 	cfg := goStylePoolConfig{
+		store:           r.store,
 		styleID:         id,
 		scaleLabel:      strconv.Itoa(ratio),
 		viewportZoomAdj: zoomAdj,
@@ -234,6 +264,21 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 // serialises reload — same as the previous implementation's setStyleAll
 // drain pattern.
 func (r *GoPoolRenderer) ReloadStyles(ctx context.Context) error {
+	// Dataset activate/combine retargets the mbtiles symlink; follow it
+	// before re-preparing styles so the inline TileJSON matches the new
+	// dataset's zoom range and the tile cache drops stale blobs.
+	if r.store != nil {
+		if err := r.store.Reopen(); err != nil {
+			slog.Error("Reload: tile store reopen failed; keeping previous dataset handle", "error", err)
+		} else if tj, err := r.store.TileJSON(); err != nil {
+			slog.Error("Reload: dataset metadata unusable; keeping previous TileJSON", "error", err)
+		} else {
+			r.mu.Lock()
+			r.cfg.TileJSON = tj
+			r.mu.Unlock()
+		}
+	}
+
 	r.mu.RLock()
 	keys := make([]string, 0, len(r.pools))
 	for key := range r.pools {
@@ -293,12 +338,16 @@ func (r *GoPoolRenderer) Close() error {
 		pool.close()
 	}
 	r.pools = nil
+	if r.store != nil {
+		r.store.Close()
+	}
 	return nil
 }
 
 // goStylePoolConfig captures the per-pool parameters. Pool members are
 // scale-segregated; ratio is therefore baked in at pool construction.
 type goStylePoolConfig struct {
+	store           *TileStore // shared tile provider; nil = native mbtiles path
 	styleID         string
 	scaleLabel      string
 	viewportZoomAdj float64
@@ -782,6 +831,20 @@ func (w *goWorker) init() error {
 
 	startupCtx, cancel := context.WithTimeout(context.Background(), w.pool.cfg.startupTimeout)
 	defer cancel()
+
+	if w.pool.cfg.store != nil {
+		f, err := w.rt.SetResourceProvider(w.pool.cfg.store.Provide)
+		if err != nil {
+			return fmt.Errorf("renderer: set resource provider: %w", err)
+		}
+		cc, err := f.Await(startupCtx)
+		if err != nil {
+			return fmt.Errorf("renderer: set resource provider: %w", err)
+		}
+		if cc.Disposition == maplibre.CommandDispositionFailed {
+			return fmt.Errorf("renderer: set resource provider failed: %s", cc.Diagnostic)
+		}
+	}
 
 	// MapModeStatic is the render-once mode; the executor disables the
 	// animation tick and aligns with our request/reply pattern. The event

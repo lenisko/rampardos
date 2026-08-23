@@ -63,6 +63,25 @@ visible in the code.
   caller-graphics-thread driver self-deadlocks on it — do not
   reintroduce that driver without restoring a host service loop.
 
+## Tile provider (shared renderer resource provider)
+
+- One process-wide `TileStore` (SQLite pool + byte-bounded LRU of
+  decompressed tiles) serves every worker via the binding's resource
+  provider; `RENDERER_TILE_PROVIDER=off` is the kill switch back to the
+  native mbtiles source, and any store-open failure degrades the same
+  way. `RENDERER_TILE_CACHE_MB` bounds the LRU (default 64).
+- The custom `rampardos://tile/` scheme is what routes tiles to the
+  provider: mbgl only consults providers for network-path URLs, so
+  styleprep inlines a TileJSON with that scheme instead of an
+  `mbtiles://` url. file:// glyphs/sprites never reach the provider.
+- The provider must return DECOMPRESSED tile bytes (mbgl's network path
+  assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
+  rows for the mbtiles query. maxzoom in the inline TileJSON is what
+  makes overzoom work.
+- Dataset activate/combine retargets the mbtiles symlink; ReloadStyles
+  reopens the store, drops the tile LRU, and rebuilds the inline
+  TileJSON before re-preparing styles.
+
 ## Cache intent: nocache, TTL, owned
 
 - `nocache=true` bypasses the composite LRU **read** (forces a fresh

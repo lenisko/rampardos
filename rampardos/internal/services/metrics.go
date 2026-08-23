@@ -116,6 +116,14 @@ type MetricsManager struct {
 	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // frame demands issued per render (>1 = multi-pass still)
 	rendererReadback            *prometheus.HistogramVec // seconds for the full readback operation (start→wait→take) per render
 
+	// Shared tile provider (renderer resource provider backed by SQLite
+	// + an in-process LRU of decompressed tile blobs). outcome: lru_hit,
+	// sqlite_hit, not_found, error, passthrough.
+	tileProviderRequests   *prometheus.CounterVec
+	tileProviderFetch      *prometheus.HistogramVec
+	tileProviderCacheBytes prometheus.Gauge
+	tileProviderEvictions  prometheus.Counter
+
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
 	// saturation metrics above.
@@ -351,6 +359,27 @@ func newMetricsManager() *MetricsManager {
 			Help:    "Number of frame demands issued per render. High values mean the still needed multiple passes before completing (e.g. as tiles arrived progressively).",
 			Buckets: []float64{1, 2, 3, 5, 10, 20, 50},
 		}, []string{"style", "scale"}),
+
+		tileProviderRequests: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_tileprovider_requests_total",
+			Help: "Tile requests served by the shared renderer tile provider, by outcome: lru_hit (in-process cache), sqlite_hit (prepared-statement read), not_found (sparse dataset, served as empty), error, passthrough (non-tile URL declined to native networking).",
+		}, []string{"outcome"}),
+
+		tileProviderFetch: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_tileprovider_fetch_seconds",
+			Help:    "Time to serve one tile from SQLite (query + gunzip; lru_hit requests are not timed, they are sub-microsecond map lookups). This is the per-tile cost the native MBTilesFileSource path used to hide inside render wall time.",
+			Buckets: []float64{0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
+		}, []string{"outcome"}),
+
+		tileProviderCacheBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "rampardos_tileprovider_cache_bytes",
+			Help: "Decompressed bytes currently held by the tile provider's LRU (bounded by RENDERER_TILE_CACHE_MB).",
+		}),
+
+		tileProviderEvictions: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "rampardos_tileprovider_cache_evictions_total",
+			Help: "Tiles evicted from the provider LRU to stay under the byte bound.",
+		}),
 
 		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_readback_seconds_per_render",
@@ -602,6 +631,25 @@ func (m *MetricsManager) RecordRendererPumpBreakdown(
 // sess.ReadPremultipliedRGBA8Into() call.
 func (m *MetricsManager) RecordRendererReadback(style, scale string, seconds float64) {
 	m.rendererReadback.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(seconds)
+}
+
+// RecordTileProviderRequest counts one provider request by outcome and,
+// for outcomes that touched SQLite, observes the fetch duration.
+func (m *MetricsManager) RecordTileProviderRequest(outcome string, seconds float64) {
+	m.tileProviderRequests.WithLabelValues(outcome).Inc()
+	if outcome == "sqlite_hit" || outcome == "not_found" {
+		m.tileProviderFetch.WithLabelValues(outcome).Observe(seconds)
+	}
+}
+
+// SetTileProviderCacheBytes publishes the LRU's current byte size.
+func (m *MetricsManager) SetTileProviderCacheBytes(n int64) {
+	m.tileProviderCacheBytes.Set(float64(n))
+}
+
+// IncTileProviderEvictions counts one LRU eviction.
+func (m *MetricsManager) IncTileProviderEvictions() {
+	m.tileProviderEvictions.Inc()
 }
 
 // SetRendererGlobalCapacity is called once at renderer init to expose

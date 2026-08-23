@@ -109,6 +109,13 @@ type Config struct {
 	FontsDir    string // e.g. "TileServer/Fonts"
 	MbtilesFile string // e.g. "TileServer/Datasets/Combined.mbtiles"
 
+	// TileJSON, when non-nil, is the inline vector-source object
+	// PrepareStyle embeds instead of the mbtiles:// URL — the tile
+	// provider's scheme plus the dataset's zoom range and bounds. Set
+	// by the Go renderer when its shared TileStore is active; nil keeps
+	// the native MBTilesFileSource path.
+	TileJSON map[string]any
+
 	// DiscoverStyles returns the current set of local style IDs by
 	// scanning the disk. Called at startup and on each ReloadStyles
 	// so that newly added style directories are picked up without a

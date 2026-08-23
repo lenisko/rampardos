@@ -245,3 +245,19 @@ and adopted:
 - There is no cancel for a pending still (and the map refuses a second
   one): the settle path drives the same await bounded by settleTimeout,
   with the poison backstop unchanged.
+
+## Fourth revision (2026-08-23): shared tile provider
+
+Prod tracing showed the ~17ms gap vs Node was mbgl's MBTilesFileSource
+(actor hop + per-query SQL parse on its own worker), pixel-independent
+and per-tile — the cost Node's better-sqlite3 prepared statements
+avoided. Replaced on the hot path with a process-wide TileStore
+(mattn/go-sqlite3 read-only pool + prepared statement + byte-bounded
+LRU of decompressed tiles) serving every worker through the binding's
+resource provider. Styleprep inlines a TileJSON on the
+`rampardos://tile/` scheme so mbgl routes tiles to the provider;
+metadata (maxzoom, bounds) comes from the dataset. Instrumented as
+rampardos_tileprovider_* (request outcomes, fetch histogram, cache
+gauge/evictions). Kill switch: RENDERER_TILE_PROVIDER=off restores the
+native mbtiles path. Fixture p50 fetch ~180µs; the prod A/B decides the
+render-level win.
