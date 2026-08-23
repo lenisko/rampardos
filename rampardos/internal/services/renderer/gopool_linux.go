@@ -996,15 +996,22 @@ func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 // Debug aid for the executor conversion; cheap and env-gated.
 var serviceTrace = os.Getenv("RENDERER_SERVICE_TRACE") != ""
 
-// awaitStill drives a still-image request to completion by keeping a
-// frame demand outstanding — upstream's still-image example's await. A
-// static-mode map renders only on demand, so when the previous demand
-// resolves without completing the still, another IF_NEEDED demand goes
-// out. Since upstream installed the session scheduler's repaint hook
-// (cf27aa58, fixing the stranding we reported on the PR), plain
-// IF_NEEDED keep-alives are sufficient: worker continuations and still
-// completion deliver autonomously, and the demand loop only paces
-// draws.
+// awaitStill drives a still-image request to completion with a small
+// pipeline of frame demands. A static-mode map renders only on demand;
+// with real tiles a still is many progressive passes, and frame results
+// are poll-only in the binding, so a single queued demand costs up to a
+// pacing tick of host latency per pass. Distinct CoalescingBoundary
+// values stop RequestFrame's supersede rule from collapsing the queue,
+// letting two IF_NEEDED demands sit queued natively: every map update
+// finds a demand already waiting and passes chain with no host
+// round-trip (upstream's repaint hook, cf27aa58, re-evaluates queued
+// demands as work lands). The loop just observes results, tops the
+// queue back up, and watches for failure events.
+//
+// Demands left queued when the still completes cannot be cancelled;
+// they resolve during the next render, possibly drawing its first pass
+// with a pre-pipeline token. The upfront flush discards genuinely stale
+// results, and after it any rendered frame counts toward this still.
 func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct{}], budget time.Duration) error {
 	deadline := time.Now().Add(budget)
 	start := time.Now()
@@ -1014,8 +1021,22 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	var timeToFirst time.Duration
 	sawFirst := false
 
+	// Flush results from earlier renders (including leftover pipeline
+	// demands that resolved since). Everything drained after this point
+	// was produced with this render's map state.
+	for {
+		fb, err := w.sess.DrainFrameResults()
+		if err != nil {
+			if errors.Is(err, maplibre.ErrNotReady) {
+				break
+			}
+			return fmt.Errorf("renderer: still image: flush frame results: %w", err)
+		}
+		fb.Close()
+	}
+
 	firstToken := w.frameToken + 1
-	demandPending := false
+	outstanding := 0
 	rendered := false
 	completed := false
 
@@ -1023,18 +1044,23 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		w.frameToken++
 		demand := maplibre.NewFrameDemand()
 		demand.Token = w.frameToken
+		// Distinct boundaries per demand: identical boundaries would make
+		// the second demand supersede the first instead of queueing.
+		demand.CoalescingBoundary = w.frameToken
 		if err := w.sess.RequestFrame(demand); err != nil {
 			return fmt.Errorf("renderer: still image: request frame: %w", err)
 		}
 		if serviceTrace {
 			fmt.Fprintf(os.Stderr, "TRACE +%6dus demand token=%d\n", time.Since(start).Microseconds(), demand.Token)
 		}
-		demandPending = true
+		outstanding++
 		demands++
 		return nil
 	}
-	if err := issue(); err != nil {
-		return err
+	for outstanding < 2 {
+		if err := issue(); err != nil {
+			return err
+		}
 	}
 
 	for {
@@ -1064,15 +1090,17 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				if serviceTrace {
 					fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition)
 				}
-				if res.Token < firstToken {
-					continue // stale result from an earlier render
-				}
+				progressed = true
 				if !sawFirst {
 					timeToFirst = time.Since(start)
 					sawFirst = true
 				}
-				demandPending = false
-				progressed = true
+				if res.Token >= firstToken {
+					outstanding--
+				}
+				// Post-flush, a rendered frame drew this render's state
+				// whichever demand produced it (a leftover from the
+				// previous render's pipeline included).
 				if res.Disposition == maplibre.RenderResultRendered {
 					rendered = true
 				}
@@ -1129,9 +1157,8 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			// Nothing arrived this turn: park until the still completes
 			// or the pacing tick fires; frame results are poll-only in
 			// the binding, so the tick bounds their observation latency.
-			// A turn that DID drain a result skips the park and
-			// re-demands immediately — the park must never sit between
-			// a resolved demand and its successor.
+			// A turn that DID drain a result skips the park and tops the
+			// pipeline back up immediately.
 			waitStart := time.Now()
 			timer := time.NewTimer(time.Millisecond)
 			select {
@@ -1145,15 +1172,17 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			timer.Stop()
 			totalWait += time.Since(waitStart)
 		} else if completed && !rendered {
-			// Completed OK but our rendered result is still queued;
+			// Completed OK but the rendered result is still queued;
 			// keep draining (no new demands), bounded by the deadline.
 			time.Sleep(time.Millisecond)
 			continue
 		}
 
-		if !completed && !demandPending {
-			if err := issue(); err != nil {
-				return err
+		if !completed {
+			for outstanding < 2 {
+				if err := issue(); err != nil {
+					return err
+				}
 			}
 		}
 	}

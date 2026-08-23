@@ -41,11 +41,16 @@ visible in the code.
   whenever you touch viewport/tile math.
 - **Executor-binding still invariants** (`goWorker.awaitStill`, the
   core-worker driver): a static-mode map renders only on demand, so the
-  await keeps exactly one IF_NEEDED frame demand outstanding and
-  re-issues when the previous one resolves without completing the still.
-  This mirrors upstream's still-image example and is load-bearing, not
-  a poll. The park must never sit between a resolved demand and its
-  successor (that quantizes every pass to the pacing tick).
+  await keeps a two-deep pipeline of IF_NEEDED frame demands queued
+  (distinct CoalescingBoundary per demand — identical boundaries
+  supersede instead of queueing), topping it up as results drain. The
+  pipeline is load-bearing: frame results are poll-only in the binding,
+  so with a single demand every progressive pass pays up to a pacing
+  tick of host latency; with a spare queued, passes chain natively.
+  Leftover demands at completion cannot be cancelled and may draw the
+  next render's first pass — awaitStill flushes stale results upfront
+  and counts any post-flush rendered frame. The park must never sit
+  between a resolved demand and the top-up.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   future can never complete on its own in static mode; resize is
