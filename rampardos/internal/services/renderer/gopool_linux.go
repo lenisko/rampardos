@@ -27,6 +27,7 @@ import (
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/services"
 	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
+	xdraw "golang.org/x/image/draw"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -141,7 +142,11 @@ func (r *GoPoolRenderer) releaseGlobal() {
 }
 
 func (r *GoPoolRenderer) Render(ctx context.Context, req Request) ([]byte, error) {
-	vp := TileToViewport(req.Z, req.X, req.Y, req.Scale)
+	tileSize := NormalizeTileSize(req.TileSize)
+	if req.Z == 0 && tileSize < TileSizePx {
+		return r.renderDownscaledWorldTile(ctx, req, tileSize)
+	}
+	vp := TileToViewport(req.Z, req.X, req.Y, req.Scale, tileSize)
 	vp.StyleID = req.StyleID
 	vp.Format = req.Format
 	img, err := r.renderViewportImage(ctx, vp, false)
@@ -149,6 +154,24 @@ func (r *GoPoolRenderer) Render(ctx context.Context, req Request) ([]byte, error
 		return nil, err
 	}
 	return encodeRGBAImage(img, req.Format)
+}
+
+// renderDownscaledWorldTile serves a sub-512 tile at z=0. The small
+// tile path renders at zoom z-1, but MapLibre clamps zoom to its
+// minimum of 0, so the frame would show only part of the world.
+// Render the 512 world tile instead and resample it to size.
+func (r *GoPoolRenderer) renderDownscaledWorldTile(ctx context.Context, req Request, tileSize int) ([]byte, error) {
+	vp := TileToViewport(0, 0, 0, req.Scale, TileSizePx)
+	vp.StyleID = req.StyleID
+	vp.Format = req.Format
+	full, err := r.renderViewportImage(ctx, vp, false)
+	if err != nil {
+		return nil, err
+	}
+	px := tileSize * int(vp.Scale)
+	small := image.NewNRGBA(image.Rect(0, 0, px, px))
+	xdraw.CatmullRom.Scale(small, small.Bounds(), full, full.Bounds(), xdraw.Src, nil)
+	return encodeRGBAImage(small, req.Format)
 }
 
 func (r *GoPoolRenderer) RenderViewport(ctx context.Context, req ViewportRequest) ([]byte, error) {
