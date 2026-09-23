@@ -33,9 +33,23 @@ visible in the code.
   `log2(tileSize/256)` from the user's zoom before dispatching, so a
   512-tileSize style sees `zoom-1` internally. See `styleZoomOffset`.
   The adjustment is only applied on the viewport path; `TileToViewport`
-  already produces a 512-pixel frame that matches MapLibre's native
-  units for the common 512-tileSize case, so tile rendering is already
-  correct.
+  already produces a frame in MapLibre's native units (512 px at `z`,
+  or 256 px at `z-1` for `?tileSize=256`) for the common 512-tileSize
+  case, so tile rendering is already correct.
+- **`/tile` output size.** Tiles are 512 logical px by default, which
+  256-px clients (Leaflet, OpenLayers) squeeze into a 256 slot, halving
+  label size. `?tileSize=256` renders a 256-px frame one MapLibre zoom
+  lower: same extent, labels sized for 256. Local styles only — external
+  styles are proxied and return 400. At `z=0` the `z-1` frame would be
+  clamped to MapLibre's minimum zoom and show part of the world, so
+  `Render` downsamples the 512 world tile instead.
+- **Tile cache filenames.** 512 tiles keep `style-z-x-y-scale.format`
+  so existing caches survive upgrades, and because `static_map.go`
+  (redownload) and `image_utils_native.go` (stitch grid) parse that
+  shape by splitting on `-`. Other sizes append `-<size>`
+  (`tileCachePath`). Static maps only stitch 512 tiles, so the parsers
+  never see a suffixed name — keep it that way or teach them the
+  suffix.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.

@@ -10,24 +10,43 @@ import "math"
 // grid dimensions and offsets.
 const TileSizePx = 512
 
+// SmallTileSizePx is the logical edge of a "256" tile — the size
+// Leaflet/OpenLayers and most web-map clients expect by default. It
+// covers the same extent as a TileSizePx tile, rendered one MapLibre
+// zoom level lower so text and line widths aren't halved when the
+// client draws it into a 256-pixel slot.
+const SmallTileSizePx = 256
+
+// NormalizeTileSize maps 0 to TileSizePx and leaves other values alone.
+func NormalizeTileSize(tileSize int) int {
+	if tileSize == 0 {
+		return TileSizePx
+	}
+	return tileSize
+}
+
 // TileToViewport converts a tile address (z, x, y) and DPR scale into
 // the ViewportRequest that produces the equivalent raster. The
 // returned viewport is:
 //
 //   - Centred on the tile's centre in lng/lat (web-mercator / EPSG:3857)
-//   - Sized to TileSizePx logical pixels on each side (constant,
+//   - Sized to tileSize logical pixels on each side (constant,
 //     regardless of scale — the Scale field is the DPR and the backend
-//     multiplies Width × Scale to get actual pixels, so a scale=2 tile
-//     renders as 512 actual pixels on each side)
-//   - At integer zoom, with zero bearing and pitch
+//     multiplies Width × Scale to get actual pixels, so a scale=2
+//     512 tile renders as 1024 actual pixels on each side)
+//   - At zoom z - log2(TileSizePx/tileSize), so the frame always
+//     covers exactly the tile's extent: z for 512, z-1 for 256
+//   - With zero bearing and pitch
 //
 // Conversion uses the standard spherical Mercator XYZ tile scheme.
 // Caller precondition: 0 ≤ z ≤ 22, 0 ≤ x,y < 2^z. The caller must
 // set StyleID and Format on the returned ViewportRequest before
 // dispatching to a Renderer; this helper is pure geometry.
 //
-// A scale of 0 is normalised to 1.
-func TileToViewport(z, x, y int, scale uint8) ViewportRequest {
+// A scale of 0 is normalised to 1; a tileSize of 0 to TileSizePx.
+// Note that a 256 tile at z=0 yields zoom -1, which MapLibre clamps
+// to 0 — NodePoolRenderer.Render handles that case separately.
+func TileToViewport(z, x, y int, scale uint8, tileSize int) ViewportRequest {
 	n := math.Exp2(float64(z))
 	nx := (float64(x) + 0.5) / n
 	ny := (float64(y) + 0.5) / n
@@ -39,13 +58,14 @@ func TileToViewport(z, x, y int, scale uint8) ViewportRequest {
 	if scale == 0 {
 		scale = 1
 	}
+	tileSize = NormalizeTileSize(tileSize)
 
 	return ViewportRequest{
 		Longitude: lng,
 		Latitude:  lat,
-		Zoom:      float64(z),
-		Width:     TileSizePx,
-		Height:    TileSizePx,
+		Zoom:      float64(z) - math.Log2(float64(TileSizePx)/float64(tileSize)),
+		Width:     tileSize,
+		Height:    tileSize,
 		Bearing:   0,
 		Pitch:     0,
 		Scale:     scale,
