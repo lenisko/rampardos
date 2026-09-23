@@ -176,6 +176,12 @@ Runtime dependencies (bundled inside the docker image):
 | GET | `/multistaticmap/pregenerated/{id}` | Serve a pregenerated multi-static map |
 | GET | `/metrics` | Prometheus metrics |
 
+Tiles are 512×512 logical pixels by default (`{scale}` multiplies
+that). Clients that expect 256-px tiles — Leaflet, OpenLayers, etc. —
+either set `tileSize: 512, zoomOffset: -1`, or request
+`?tileSize=256` to get a 256×256 tile (512×512 at `scale=2`) with
+labels sized for a 256-px slot. `tileSize=256` is local styles only.
+
 ### Admin (basic auth)
 
 Gated by `ADMIN_USERNAME` / `ADMIN_PASSWORD`. UI under `/admin/...`,
