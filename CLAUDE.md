@@ -44,13 +44,16 @@ visible in the code.
   await keeps a two-deep pipeline of IF_NEEDED frame demands queued
   (distinct CoalescingBoundary per demand — identical boundaries
   supersede instead of queueing), topping it up as results drain. The
-  pipeline is load-bearing: frame results are poll-only in the binding,
-  so with a single demand every progressive pass pays up to a pacing
-  tick of host latency; with a spare queued, passes chain natively.
-  Leftover demands at completion cannot be cancelled and may draw the
-  next render's first pass — awaitStill flushes stale results upfront
-  and counts any post-flush rendered frame. The park must never sit
-  between a resolved demand and the top-up.
+  pipeline is load-bearing: with a spare demand queued, progressive
+  passes chain on the core worker without waiting a host round-trip
+  between passes. The await is wake-driven: the session's FrameWake
+  callback feeds a non-blocking channel and the loop parks on
+  wake/still-completion with a 50ms timer as missed-wake insurance
+  only — there is no pacing tick, and the park must never sit between
+  a resolved demand and the top-up (park only when nothing
+  progressed). Leftover demands at completion cannot be cancelled and
+  may draw the next render's first pass — awaitStill flushes stale
+  results upfront and counts any post-flush rendered frame.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   future can never complete on its own in static mode; resize is
