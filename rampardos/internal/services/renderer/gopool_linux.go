@@ -76,8 +76,11 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	}
 
 	// Catch a wrong-variant FFI at process start, not at first render.
-	backends := maplibre.SupportedRenderBackends()
-	if !backends.Has(maplibre.RenderBackendOpenGL) {
+	backends, err := maplibre.SupportedRenderBackendMask()
+	if err != nil {
+		return nil, fmt.Errorf("renderer: query render backends: %w", err)
+	}
+	if !backends.Has(maplibre.RenderBackendFlagOpengl) {
 		return nil, fmt.Errorf("renderer: linked FFI does not advertise OpenGL backend; check Dockerfile MISE_ENV variant (expected linux-<arch>-egl)")
 	}
 
@@ -733,6 +736,8 @@ func (p *goStylePool) close() {
 // display+config it borrows. Plain goroutine — nothing here is
 // thread-affine: the native session worker does all graphics work, and
 // every async call returns a Future safe to await from any goroutine.
+// The session's FrameWake feeds the worker's wake channel, so the
+// still await is event-driven rather than tick-polled.
 type goWorker struct {
 	pool        *goStylePool
 	startupErrs chan<- error
@@ -750,6 +755,12 @@ type goWorker struct {
 	m    *maplibre.MapHandle
 	sess *maplibre.RenderSessionHandle
 	egl  *eglDisplay
+
+	// wake is fed by the session's FrameWake callback: native invokes it
+	// (from any thread, calls may coalesce) whenever a frame result
+	// becomes drainable. Buffered-1 + non-blocking send turns bursts
+	// into one pending token.
+	wake chan struct{}
 
 	curW     uint32
 	curH     uint32
@@ -806,12 +817,12 @@ func (w *goWorker) loop() {
 				return
 			}
 		case goWorkerCmdReload:
-			// SetStyleURL is a command — the executor loads the style
+			// SetStyleUrl is a command — the executor loads the style
 			// in the background and the next render observes completion
 			// or failure. Reply on the submission result so reload
 			// doesn't block renders; the command's own completion is
 			// deliberately not awaited.
-			_, err := w.m.SetStyleURL(cmd.reload)
+			_, err := w.m.SetStyleUrl(cmd.reload)
 			cmd.reply <- goWorkerResult{err: err}
 		}
 	}
@@ -824,7 +835,8 @@ func (w *goWorker) init() error {
 		return err
 	}
 
-	w.rt, err = maplibre.NewRuntime()
+	opts := maplibre.DefaultRuntimeOptions()
+	w.rt, err = maplibre.RuntimeCreate(opts)
 	if err != nil {
 		return fmt.Errorf("renderer: new runtime: %w", err)
 	}
@@ -833,16 +845,12 @@ func (w *goWorker) init() error {
 	defer cancel()
 
 	if w.pool.cfg.store != nil {
-		f, err := w.rt.SetResourceProvider(w.pool.cfg.store.Provide)
+		f, err := w.rt.SetResourceProvider(maplibre.ResourceProvider{Callback: w.pool.cfg.store.Provide})
 		if err != nil {
 			return fmt.Errorf("renderer: set resource provider: %w", err)
 		}
-		cc, err := f.Await(startupCtx)
-		if err != nil {
+		if _, err := f.Await(startupCtx); err != nil {
 			return fmt.Errorf("renderer: set resource provider: %w", err)
-		}
-		if cc.Disposition == maplibre.CommandDispositionFailed {
-			return fmt.Errorf("renderer: set resource provider failed: %s", cc.Diagnostic)
 		}
 	}
 
@@ -850,13 +858,15 @@ func (w *goWorker) init() error {
 	// animation tick and aligns with our request/reply pattern. The event
 	// mask is trimmed to the two failure events the still await consumes;
 	// still completion arrives via its Future, and frame pacing is
-	// demand-resolution-driven, not event-driven.
+	// wake-driven.
 	w.curW, w.curH, w.curScale = 256, 256, float64(w.pool.cfg.ratio)
-	mapFuture, err := w.rt.NewMapWithOptions(maplibre.MapOptions{
-		Width:       w.curW,
-		Height:      w.curH,
-		ScaleFactor: w.curScale,
-		Mode:        maplibre.MapModeStatic,
+	mapFuture, err := w.rt.MapCreate(maplibre.MapOptions{
+		InitialExtent: maplibre.LogicalExtent{
+			Width:       w.curW,
+			Height:      w.curH,
+			ScaleFactor: w.curScale,
+		},
+		MapMode: maplibre.MapModeStatic,
 		EventMask: maplibre.RuntimeEventMaskMapLoadingFailed |
 			maplibre.RuntimeEventMaskMapRenderError,
 	})
@@ -870,10 +880,12 @@ func (w *goWorker) init() error {
 
 	// Core-worker driver with a dedicated (private) EGL context: the
 	// native session worker creates and owns the context from our
-	// display+config and needs no host graphics service. This grants
-	// CPU readback only (ring depth 1) — exactly our output path.
-	sess, attach, err := w.m.AttachOpenGLOwnedTexture(
-		maplibre.OpenGLOwnedTextureDescriptor{
+	// display+config and needs no host graphics service. FrameWake is
+	// the signal our still await parks on — the callback only schedules
+	// (non-blocking channel send) per the wake contract.
+	w.wake = make(chan struct{}, 1)
+	attach, err := w.m.OpenglOwnedTextureAttach(
+		maplibre.OpenglOwnedTextureDescriptor{
 			Extent: maplibre.RenderTargetExtent{
 				Width:       w.curW,
 				Height:      w.curH,
@@ -882,30 +894,36 @@ func (w *goWorker) init() error {
 			Context: w.egl.descriptor(),
 		},
 		maplibre.RenderSessionAttachOptions{
-			Driver:                    maplibre.RenderDriverCoreWorker,
+			Driver:                    maplibre.RenderDriverKindCoreWorker,
 			RequestedTextureRingDepth: 1,
+			FrameWake: maplibre.Wake{Callback: func() {
+				select {
+				case w.wake <- struct{}{}:
+				default:
+				}
+			}},
 		},
 	)
 	if err != nil {
 		return fmt.Errorf("renderer: attach OpenGL owned texture render target: %w", err)
 	}
-	w.sess = sess
-	if _, err := attach.Await(startupCtx); err != nil {
+	w.sess = attach.Session
+	if _, err := attach.Completion.Await(startupCtx); err != nil {
 		return fmt.Errorf("renderer: attach: %w", err)
 	}
 
-	caps, err := w.sess.Capabilities()
+	caps, err := w.sess.GetCapabilities()
 	if err != nil {
 		return fmt.Errorf("renderer: session capabilities: %w", err)
 	}
-	if caps.Flags&maplibre.RenderSessionCapabilityReadback == 0 {
+	if caps.Flags&maplibre.RenderSessionCapabilityFlagReadback == 0 {
 		return fmt.Errorf("renderer: attached session does not grant readback; cannot render stills")
 	}
 
 	// Style loading proceeds on the native executor; the first render
 	// observes any failure via MapLoadingFailed. Worker reports ready
 	// as soon as the binding state is constructed.
-	if _, err := w.m.SetStyleURL(w.pool.cfg.styleURL); err != nil {
+	if _, err := w.m.SetStyleUrl(w.pool.cfg.styleURL); err != nil {
 		return fmt.Errorf("renderer: set style url: %w", err)
 	}
 
@@ -930,7 +948,9 @@ func (w *goWorker) cleanup() {
 		_ = w.sess.Close()
 	}
 	if w.m != nil {
-		_ = w.m.Close()
+		if f, err := w.m.Close(); err == nil {
+			_, _ = f.Await(settleCtx)
+		}
 	}
 	if w.rt != nil {
 		if f, err := w.rt.Close(); err == nil {
@@ -954,7 +974,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	wantW := uint32(vp.Width)
 	wantH := uint32(vp.Height)
 	wantScale := float64(scale)
-	var resize *maplibre.Future[struct{}]
+	var resize *maplibre.Future[maplibre.CommandCompletion]
 	if wantW != w.curW || wantH != w.curH || wantScale != w.curScale {
 		// Resize applies the extent and updates the map viewport. The
 		// future only completes once a frame is produced at the new
@@ -973,11 +993,16 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		resize = f
 	}
 
-	if _, err := w.m.JumpTo(maplibre.CameraOptions{}.
-		WithCenter(maplibre.LatLng{Latitude: vp.Latitude, Longitude: vp.Longitude}).
-		WithZoom(vp.Zoom).
-		WithBearing(vp.Bearing).
-		WithPitch(vp.Pitch)); err != nil {
+	zoom, bearing, pitch := vp.Zoom, vp.Bearing, vp.Pitch
+	if _, err := w.m.UpdateCamera(maplibre.CameraUpdate{
+		Mode: maplibre.CameraUpdateModeJump,
+		Camera: maplibre.CameraOptions{
+			Center:  &maplibre.LatLng{Latitude: vp.Latitude, Longitude: vp.Longitude},
+			Zoom:    &zoom,
+			Bearing: &bearing,
+			Pitch:   &pitch,
+		},
+	}); err != nil {
 		return nil, fmt.Errorf("renderer: camera: %w", err)
 	}
 
@@ -999,10 +1024,13 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		// but completion can propagate a beat behind the frame result;
 		// flush it rather than assuming.
 		flushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, err := resize.Await(flushCtx)
+		cc, err := resize.Await(flushCtx)
 		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("renderer: resize: %w", err)
+		}
+		if cc.Disposition == maplibre.CommandDispositionFailed {
+			return nil, fmt.Errorf("renderer: resize failed: %s", cc.Diagnostic)
 		}
 		w.curW, w.curH, w.curScale = wantW, wantH, wantScale
 	}
@@ -1011,7 +1039,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	physH := vp.Height * scale
 
 	readStart := time.Now()
-	rb, err := w.sess.ReadPremultipliedRGBA8()
+	rb, err := w.sess.TextureReadPremultipliedRgba8()
 	if err != nil {
 		return nil, fmt.Errorf("renderer: read pixels: %w", err)
 	}
@@ -1059,17 +1087,61 @@ func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 // Debug aid for the executor conversion; cheap and env-gated.
 var serviceTrace = os.Getenv("RENDERER_SERVICE_TRACE") != ""
 
+// drainFrames drains and closes one frame-result batch, returning its
+// results. ErrNotReady means an empty queue, reported as (nil, nil).
+func (w *goWorker) drainFrames() ([]maplibre.RenderFrameResult, error) {
+	fb, err := w.sess.DrainFrameResults()
+	if err != nil {
+		if errors.Is(err, maplibre.ErrNotReady) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer fb.Close()
+	n, err := fb.Count()
+	if err != nil {
+		return nil, err
+	}
+	results := make([]maplibre.RenderFrameResult, 0, n)
+	for i := uint(0); i < n; i++ {
+		res, err := fb.Get(i)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
+// drainEvents drains and closes one runtime event batch. ErrNotReady
+// means an empty queue, reported as (nil, nil).
+func (w *goWorker) drainEvents() ([]maplibre.RuntimeEvent, error) {
+	eb, err := w.rt.DrainEvents()
+	if err != nil {
+		if errors.Is(err, maplibre.ErrNotReady) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer eb.Close()
+	view, err := eb.Get()
+	if err != nil {
+		return nil, err
+	}
+	// Copy out: the view's records belong to the batch handle.
+	results := make([]maplibre.RuntimeEvent, len(view.Events))
+	copy(results, view.Events)
+	return results, nil
+}
+
 // awaitStill drives a still-image request to completion with a small
-// pipeline of frame demands. A static-mode map renders only on demand;
-// with real tiles a still is many progressive passes, and frame results
-// are poll-only in the binding, so a single queued demand costs up to a
-// pacing tick of host latency per pass. Distinct CoalescingBoundary
+// pipeline of frame demands, parking on the session's FrameWake. A
+// static-mode map renders only on demand; distinct CoalescingBoundary
 // values stop RequestFrame's supersede rule from collapsing the queue,
-// letting two IF_NEEDED demands sit queued natively: every map update
-// finds a demand already waiting and passes chain with no host
-// round-trip (upstream's repaint hook, cf27aa58, re-evaluates queued
-// demands as work lands). The loop just observes results, tops the
-// queue back up, and watches for failure events.
+// so passes chain natively while the host just observes results and
+// tops the queue back up. With the wake there is no polling tick — the
+// park ends when a frame result lands, the still completes, or the
+// safety cap fires (missed-wake insurance only).
 //
 // Demands left queued when the still completes cannot be cancelled;
 // they resolve during the next render, possibly drawing its first pass
@@ -1088,21 +1160,25 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	// demands that resolved since). Everything drained after this point
 	// was produced with this render's map state.
 	for {
-		fb, err := w.sess.DrainFrameResults()
+		stale, err := w.drainFrames()
 		if err != nil {
-			if errors.Is(err, maplibre.ErrNotReady) {
-				break
-			}
 			return fmt.Errorf("renderer: still image: flush frame results: %w", err)
 		}
-		fb.Close()
+		if len(stale) == 0 {
+			break
+		}
+	}
+	// A wake latched by pre-flush results is stale too.
+	select {
+	case <-w.wake:
+	default:
 	}
 
 	// demandPipelineDepth demands stay queued natively so progressive
-	// passes chain without host round-trips; the observation tick below
-	// is paid once per depth passes, not per pass. Leftovers at
-	// completion resolve during the next render's upfront flush.
-	const demandPipelineDepth = 4
+	// passes chain without host round-trips. Depth 2 suffices with the
+	// wake: the host reacts to results as they land rather than on a
+	// tick, so the queue only needs to cover back-to-back native passes.
+	const demandPipelineDepth = 2
 
 	firstToken := w.frameToken + 1
 	outstanding := 0
@@ -1111,11 +1187,14 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 
 	issue := func() error {
 		w.frameToken++
-		demand := maplibre.NewFrameDemand()
-		demand.Token = w.frameToken
-		// Distinct boundaries per demand: identical boundaries would make
-		// the second demand supersede the first instead of queueing.
-		demand.CoalescingBoundary = w.frameToken
+		demand := maplibre.FrameDemand{
+			Flags: maplibre.FrameDemandFlagIfNeeded,
+			Token: w.frameToken,
+			// Distinct boundaries per demand: identical boundaries would
+			// make the second demand supersede the first instead of
+			// queueing.
+			CoalescingBoundary: w.frameToken,
+		}
 		if err := w.sess.RequestFrame(demand); err != nil {
 			return fmt.Errorf("renderer: still image: request frame: %w", err)
 		}
@@ -1142,52 +1221,42 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		iterations++
 
 		progressed := false
-
-		// DrainFrameResults reports ErrNotReady when nothing is queued —
-		// an empty drain, not a failure.
-		fb, err := w.sess.DrainFrameResults()
-		if err != nil && !errors.Is(err, maplibre.ErrNotReady) {
+		results, err := w.drainFrames()
+		if err != nil {
 			return fmt.Errorf("renderer: still image: drain frame results: %w", err)
 		}
-		if err == nil {
-			results, rerr := fb.Results()
-			fb.Close()
-			if rerr != nil {
-				return fmt.Errorf("renderer: still image: frame results: %w", rerr)
+		for _, res := range results {
+			if serviceTrace {
+				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition)
 			}
-			for _, res := range results {
-				if serviceTrace {
-					fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition)
-				}
-				progressed = true
-				if !sawFirst {
-					timeToFirst = time.Since(start)
-					sawFirst = true
-				}
-				if res.Token >= firstToken {
-					outstanding--
-				}
-				// Post-flush, a rendered frame drew this render's state
-				// whichever demand produced it (a leftover from the
-				// previous render's pipeline included).
-				if res.Disposition == maplibre.RenderResultRendered {
-					rendered = true
-				}
+			progressed = true
+			if !sawFirst {
+				timeToFirst = time.Since(start)
+				sawFirst = true
+			}
+			if res.Token >= firstToken {
+				outstanding--
+			}
+			// Post-flush, a rendered frame drew this render's state
+			// whichever demand produced it (a leftover from the
+			// previous render's pipeline included).
+			if res.Disposition == maplibre.RenderResultRendered {
+				rendered = true
 			}
 		}
 
-		batch, err := w.rt.DrainEvents()
+		events, err := w.drainEvents()
 		if err != nil {
 			return fmt.Errorf("renderer: still image: drain events: %w", err)
 		}
-		for _, ev := range batch.Events {
+		for _, ev := range events {
 			if serviceTrace {
 				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d event type=%d msg=%q\n", time.Since(start).Microseconds(), iterations, ev.Type, ev.Message)
 			}
 			switch ev.Type {
-			case maplibre.RuntimeEventMapLoadingFailed:
+			case maplibre.RuntimeEventTypeMapLoadingFailed:
 				return fmt.Errorf("renderer: map loading failed: %s", ev.Message)
-			case maplibre.RuntimeEventMapRenderError:
+			case maplibre.RuntimeEventTypeMapRenderError:
 				return fmt.Errorf("renderer: map render error: %s", ev.Message)
 			}
 		}
@@ -1223,21 +1292,13 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		}
 
 		if !completed && !progressed {
-			// Nothing arrived this turn: park until the still completes
-			// or the pacing tick fires; frame results are poll-only in
-			// the binding, so the tick bounds their observation latency.
-			// A turn that DID drain a result skips the park and tops the
-			// pipeline back up immediately.
-			// 250µs, not 1ms: since the binding dropped its notification
-			// API, frame results are poll-only and nothing can interrupt
-			// this park — its width is paid once per pipeline-depth
-			// passes as pure observation latency. The C API grew
-			// per-session frame wakes (mln_wake) that the Go binding
-			// does not surface yet; when it does, this park can select
-			// on a real signal instead of a tick.
+			// Park until the wake fires (a frame result landed), the
+			// still completes, or the safety cap passes — the cap is
+			// missed-wake insurance, not pacing, so it is generous.
 			waitStart := time.Now()
-			timer := time.NewTimer(250 * time.Microsecond)
+			timer := time.NewTimer(50 * time.Millisecond)
 			select {
+			case <-w.wake:
 			case <-still.Done():
 			case <-timer.C:
 			case <-ctx.Done():
@@ -1247,10 +1308,22 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			}
 			timer.Stop()
 			totalWait += time.Since(waitStart)
-		} else if completed && !rendered {
+		} else if completed && !rendered && !progressed {
 			// Completed OK but the rendered result is still queued;
-			// keep draining (no new demands), bounded by the deadline.
-			time.Sleep(time.Millisecond)
+			// park for its wake (no new demands), bounded by the
+			// deadline via the loop's checks.
+			waitStart := time.Now()
+			timer := time.NewTimer(50 * time.Millisecond)
+			select {
+			case <-w.wake:
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				totalWait += time.Since(waitStart)
+				return ctx.Err()
+			}
+			timer.Stop()
+			totalWait += time.Since(waitStart)
 			continue
 		}
 

@@ -355,9 +355,12 @@ func parseTileURL(u string) (z, x, y uint32, ok bool) {
 // else (file:// glyphs and sprites never get here, external HTTP does)
 // passes through to native networking.
 func (s *TileStore) Provide(req maplibre.ResourceRequest, h *maplibre.ResourceRequestHandle) maplibre.ResourceProviderDecision {
-	u := req.RequestedURL
-	if !strings.HasPrefix(u, tileURLPrefix) {
-		u = req.ResolvedURL
+	u := ""
+	if req.RequestedUrl != nil {
+		u = *req.RequestedUrl
+	}
+	if !strings.HasPrefix(u, tileURLPrefix) && req.ResolvedUrl != nil {
+		u = *req.ResolvedUrl
 	}
 	z, x, y, ok := parseTileURL(u)
 	if !ok {
@@ -373,14 +376,15 @@ func (s *TileStore) Provide(req maplibre.ResourceRequest, h *maplibre.ResourceRe
 	case err != nil:
 		response.Status = maplibre.ResourceResponseStatusError
 		response.ErrorReason = maplibre.ResourceErrorReasonOther
-		response.ErrorMessage = err.Error()
+		msg := err.Error()
+		response.ErrorMessage = &msg
 	case !found:
 		response.Status = maplibre.ResourceResponseStatusNoContent
 	default:
-		response.Status = maplibre.ResourceResponseStatusOK
+		response.Status = maplibre.ResourceResponseStatusOk
 		response.Bytes = data
-		response.HasExpires = true
-		response.ExpiresUnixMS = time.Now().Add(tileExpiry).UnixMilli()
+		expires := time.Now().Add(tileExpiry).UnixMilli()
+		response.ExpiresUnixMs = &expires
 	}
 	if cerr := h.Complete(response); cerr != nil && services.GlobalMetrics != nil {
 		services.GlobalMetrics.RecordTileProviderRequest("error", 0)

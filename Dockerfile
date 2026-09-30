@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=cf27aa58d65918d97318093e9969bc4fc74422c2
+ARG MLN_FFI_REV=bf24c08405af04009e9e3f34e6177af6154d155c
 
 # ================================
 # Get Git commit SHA
@@ -152,7 +152,7 @@ RUN case "$TARGETARCH" in \
         amd64) MLN_ARCH=x64;; \
         *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
     esac \
- && MLN_PRESET="linux-${MLN_ARCH}-egl" \
+ && MLN_PRESET="linux-gnu-${MLN_ARCH}-egl" \
  && cmake --workflow --preset "$MLN_PRESET" \
  && cmake --install "build/${MLN_PRESET}" \
  && mkdir -p /ffi/install \

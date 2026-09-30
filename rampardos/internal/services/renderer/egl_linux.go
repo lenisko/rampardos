@@ -127,14 +127,16 @@ func newEGLDisplay() (*eglDisplay, error) {
 // The returned descriptor is valid only as long as this eglDisplay is
 // alive. Caller must keep the *eglDisplay referenced for the lifetime
 // of the RenderSession that uses it.
-func (d *eglDisplay) descriptor() maplibre.OpenGLContextDescriptor {
-	return maplibre.OpenGLContextDescriptor{
-		Ownership: maplibre.OpenGLContextOwnershipDedicated,
-		EGL: &maplibre.EGLContextDescriptor{
-			Display:        maplibre.NativePointer(C.mln_go_egl_display_handle(&d.raw)),
-			Config:         maplibre.NativePointer(C.mln_go_egl_config_handle(&d.raw)),
-			ClientAPI:      maplibre.OpenGLClientAPIGL,
-			GetProcAddress: maplibre.NativePointer(C.mln_go_egl_proc_address_handle()),
+func (d *eglDisplay) descriptor() maplibre.OpenglContextDescriptor {
+	return maplibre.OpenglContextDescriptor{
+		Ownership: maplibre.OpenglContextOwnershipDedicated,
+		Data: maplibre.OpenglContextDescriptorDataEglVariant{
+			Value: maplibre.EglContextDescriptor{
+				Display:        uintptr(C.mln_go_egl_display_handle(&d.raw)),
+				Config:         uintptr(C.mln_go_egl_config_handle(&d.raw)),
+				ClientApi:      maplibre.OpenglClientApiGl,
+				GetProcAddress: uintptr(C.mln_go_egl_proc_address_handle()),
+			},
 		},
 	}
 }
