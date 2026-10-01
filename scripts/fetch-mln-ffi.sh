@@ -26,7 +26,7 @@ set -euo pipefail
 # check by design. Build in Docker (mln-ffi-build stage) or copy
 # /ffi/install out of that stage for host development.
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi}"
-MLN_FFI_REV="${MLN_FFI_REV:-bf24c08405af04009e9e3f34e6177af6154d155c}"
+MLN_FFI_REV="${MLN_FFI_REV:-c66e0c6f13eee3a455e9a25518350a80dba7b62f}"
 MLN_FFI_SNAPSHOT_TAG="${MLN_FFI_SNAPSHOT_TAG:-unstable-native-snapshot}"
 
 case "$(uname -s)-$(uname -m)" in

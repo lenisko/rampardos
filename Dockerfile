@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=bf24c08405af04009e9e3f34e6177af6154d155c
+ARG MLN_FFI_REV=c66e0c6f13eee3a455e9a25518350a80dba7b62f
 
 # ================================
 # Get Git commit SHA
