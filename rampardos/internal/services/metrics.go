@@ -124,6 +124,11 @@ type MetricsManager struct {
 	tileProviderCacheBytes prometheus.Gauge
 	tileProviderEvictions  prometheus.Counter
 
+	// Still-await loop health: which frame dispositions drive renders,
+	// and how often the missed-wake insurance timer is what moved one.
+	rendererStillFrameResults *prometheus.CounterVec
+	rendererStillKeepalives   *prometheus.CounterVec
+
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
 	// saturation metrics above.
@@ -380,6 +385,14 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_tileprovider_cache_evictions_total",
 			Help: "Tiles evicted from the provider LRU to stay under the byte bound.",
 		}),
+		rendererStillFrameResults: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_still_frame_results_total",
+			Help: "Frame results drained by the still await, by disposition (rendered, no_update, size_pending, target_not_ready, superseded, deadline_missed). Non-rendered dispositions other than no_update wait on the map's next update to make progress.",
+		}, []string{"style", "scale", "disposition"}),
+		rendererStillKeepalives: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_still_keepalive_total",
+			Help: "Times the still await's 50ms missed-wake insurance expired with no demand in flight and issued a keep-alive demand. Each one cost up to 50ms of render time; a healthy loop keeps this near zero.",
+		}, []string{"style", "scale"}),
 
 		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_readback_seconds_per_render",
@@ -983,4 +996,12 @@ func (m *MetricsManager) GetTemplateRenderStats() []TemplateRenderStat {
 		}
 	}
 	return stats
+}
+
+func (m *MetricsManager) IncRendererStillFrameResult(style, scale, disposition string) {
+	m.rendererStillFrameResults.WithLabelValues(bucketLabel(style), bucketLabel(scale), disposition).Inc()
+}
+
+func (m *MetricsManager) IncRendererStillKeepalive(style, scale string) {
+	m.rendererStillKeepalives.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
 }

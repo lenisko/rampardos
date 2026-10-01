@@ -1247,6 +1247,9 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				sawFirst = true
 			}
 			outstanding = 0
+			if services.GlobalMetrics != nil {
+				services.GlobalMetrics.IncRendererStillFrameResult(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, dispositionLabel(res.Disposition))
+			}
 			if res.Disposition == maplibre.RenderResultRendered {
 				rendered = true
 				// A rendered frame that still needs repaint has more to
@@ -1347,6 +1350,9 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 					// instead of the render timeout.
 					if outstanding == 0 {
 						wantDemand = true
+						if services.GlobalMetrics != nil {
+							services.GlobalMetrics.IncRendererStillKeepalive(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
+						}
 					}
 				case <-ctx.Done():
 					timer.Stop()
@@ -1357,6 +1363,25 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			timer.Stop()
 			totalWait += time.Since(waitStart)
 		}
+	}
+}
+
+func dispositionLabel(d maplibre.RenderResult) string {
+	switch d {
+	case maplibre.RenderResultRendered:
+		return "rendered"
+	case maplibre.RenderResultNoUpdate:
+		return "no_update"
+	case maplibre.RenderResultSizePending:
+		return "size_pending"
+	case maplibre.RenderResultTargetNotReady:
+		return "target_not_ready"
+	case maplibre.RenderResultSuperseded:
+		return "superseded"
+	case maplibre.RenderResultDeadlineMissed:
+		return "deadline_missed"
+	default:
+		return "other"
 	}
 }
 
