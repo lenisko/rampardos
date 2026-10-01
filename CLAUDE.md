@@ -40,20 +40,22 @@ visible in the code.
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
 - **Executor-binding still invariants** (`goWorker.awaitStill`, the
-  core-worker driver): a static-mode map renders only on demand, so the
-  await keeps a two-deep pipeline of IF_NEEDED frame demands queued
-  (distinct CoalescingBoundary per demand — identical boundaries
-  supersede instead of queueing), topping it up as results drain. The
-  pipeline is load-bearing: with a spare demand queued, progressive
-  passes chain on the core worker without waiting a host round-trip
-  between passes. The await is wake-driven: the session's FrameWake
-  callback feeds a non-blocking channel and the loop parks on
-  wake/still-completion with a 50ms timer as missed-wake insurance
-  only — there is no pacing tick, and the park must never sit between
-  a resolved demand and the top-up (park only when nothing
-  progressed). Leftover demands at completion cannot be cancelled and
-  may draw the next render's first pass — awaitStill flushes stale
-  results upfront and counts any post-flush rendered frame.
+  core-worker driver): a static-mode map renders only on demand, and
+  the await is update-driven — it issues exactly one IF_NEEDED frame
+  demand per `MapRenderUpdateAvailable` runtime event, plus one per
+  rendered frame that reports `NeedsRepaint`. The map itself signals
+  when it has work (style/tile arrival), so there is never more than a
+  single outstanding demand and the CoalescingBoundary supersede rule
+  is moot. This replaced an earlier speculative two-deep pipeline; the
+  reactive shape needs **both** wakes feeding the park: the session's
+  FrameWake (a frame result landed) and the runtime's EventWake (the
+  queue became nonempty — a new update to demand against). Both share
+  one non-blocking channel; the loop parks on it, the still, and a 50ms
+  timer that is missed-wake insurance only (no pacing tick), and parks
+  only when nothing drained this turn. Still completion arrives via its
+  Future, not the still-image event. The upfront flush discards a prior
+  render's last in-flight result; with one demand outstanding there is
+  no pre-pipeline leftover to draw the next render's first pass.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   future can never complete on its own in static mode; resize is

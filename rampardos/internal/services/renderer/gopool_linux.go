@@ -835,7 +835,23 @@ func (w *goWorker) init() error {
 		return err
 	}
 
+	// The wake channel is shared by the runtime's EventWake and the
+	// session's FrameWake: the still await parks on it and does not care
+	// which side fired — it drains both queues every turn. Created
+	// before RuntimeCreate because EventWake is a runtime option.
+	w.wake = make(chan struct{}, 1)
+	wakeCallback := func() {
+		select {
+		case w.wake <- struct{}{}:
+		default:
+		}
+	}
+
 	opts := maplibre.DefaultRuntimeOptions()
+	// Wakes when the runtime event queue becomes nonempty. Update-driven
+	// demands depend on this: a MapRenderUpdateAvailable event must end
+	// the await's park even when no frame result is in flight.
+	opts.EventWake = maplibre.Wake{Callback: wakeCallback}
 	w.rt, err = maplibre.RuntimeCreate(opts)
 	if err != nil {
 		return fmt.Errorf("renderer: new runtime: %w", err)
@@ -856,9 +872,11 @@ func (w *goWorker) init() error {
 
 	// MapModeStatic is the render-once mode; the executor disables the
 	// animation tick and aligns with our request/reply pattern. The event
-	// mask is trimmed to the two failure events the still await consumes;
-	// still completion arrives via its Future, and frame pacing is
-	// wake-driven.
+	// mask carries the two failure events the still await fail-fasts on
+	// plus MapRenderUpdateAvailable, which drives demands: the map
+	// publishes an update whenever state or queued render-thread work is
+	// available, and the await answers each with one frame demand. Still
+	// completion arrives via its Future.
 	w.curW, w.curH, w.curScale = 256, 256, float64(w.pool.cfg.ratio)
 	mapFuture, err := w.rt.MapCreate(maplibre.MapOptions{
 		InitialExtent: maplibre.LogicalExtent{
@@ -868,7 +886,8 @@ func (w *goWorker) init() error {
 		},
 		MapMode: maplibre.MapModeStatic,
 		EventMask: maplibre.RuntimeEventMaskMapLoadingFailed |
-			maplibre.RuntimeEventMaskMapRenderError,
+			maplibre.RuntimeEventMaskMapRenderError |
+			maplibre.RuntimeEventMaskMapRenderUpdateAvailable,
 	})
 	if err != nil {
 		return fmt.Errorf("renderer: new map: %w", err)
@@ -880,10 +899,10 @@ func (w *goWorker) init() error {
 
 	// Core-worker driver with a dedicated (private) EGL context: the
 	// native session worker creates and owns the context from our
-	// display+config and needs no host graphics service. FrameWake is
-	// the signal our still await parks on — the callback only schedules
-	// (non-blocking channel send) per the wake contract.
-	w.wake = make(chan struct{}, 1)
+	// display+config and needs no host graphics service. FrameWake shares
+	// the wake channel with the runtime's EventWake — the callback only
+	// schedules (non-blocking channel send) per the wake contract, and
+	// the await drains both queues per turn regardless of which fired.
 	attach, err := w.m.OpenglOwnedTextureAttach(
 		maplibre.OpenglOwnedTextureDescriptor{
 			Extent: maplibre.RenderTargetExtent{
@@ -896,12 +915,7 @@ func (w *goWorker) init() error {
 		maplibre.RenderSessionAttachOptions{
 			Driver:                    maplibre.RenderDriverKindCoreWorker,
 			RequestedTextureRingDepth: 1,
-			FrameWake: maplibre.Wake{Callback: func() {
-				select {
-				case w.wake <- struct{}{}:
-				default:
-				}
-			}},
+			FrameWake:                 maplibre.Wake{Callback: wakeCallback},
 		},
 	)
 	if err != nil {
@@ -1134,19 +1148,22 @@ func (w *goWorker) drainEvents() ([]maplibre.RuntimeEvent, error) {
 	return results, nil
 }
 
-// awaitStill drives a still-image request to completion with a small
-// pipeline of frame demands, parking on the session's FrameWake. A
-// static-mode map renders only on demand; distinct CoalescingBoundary
-// values stop RequestFrame's supersede rule from collapsing the queue,
-// so passes chain natively while the host just observes results and
-// tops the queue back up. With the wake there is no polling tick — the
-// park ends when a frame result lands, the still completes, or the
-// safety cap fires (missed-wake insurance only).
+// awaitStill drives a still-image request to completion with
+// update-driven frame demands, parking on the shared wake channel
+// (runtime EventWake + session FrameWake). A static-mode map renders
+// only on demand; rather than keep a speculative pipeline queued, the
+// await issues exactly one demand per MapRenderUpdateAvailable event
+// and one per rendered frame that reports NeedsRepaint — the map tells
+// us when it has work, so there is never more than a single outstanding
+// demand and the CoalescingBoundary supersede problem does not arise.
+// Still completion arrives via its Future.
 //
-// Demands left queued when the still completes cannot be cancelled;
-// they resolve during the next render, possibly drawing its first pass
-// with a pre-pipeline token. The upfront flush discards genuinely stale
-// results, and after it any rendered frame counts toward this still.
+// This is the upstream canonical still loop (maplibre-native-ffi
+// example zig-readback): demand on update, finish on the still, let the
+// wake schedule the park. With one demand outstanding at a time there
+// is no pre-pipeline leftover to draw the next render's first pass, so
+// the upfront flush only discards results from a prior render's final
+// in-flight demand.
 func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct{}], budget time.Duration) error {
 	deadline := time.Now().Add(budget)
 	start := time.Now()
@@ -1156,9 +1173,9 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	var timeToFirst time.Duration
 	sawFirst := false
 
-	// Flush results from earlier renders (including leftover pipeline
-	// demands that resolved since). Everything drained after this point
-	// was produced with this render's map state.
+	// Flush results from an earlier render's last in-flight demand.
+	// Everything drained after this point was produced with this
+	// render's map state.
 	for {
 		stale, err := w.drainFrames()
 		if err != nil {
@@ -1174,25 +1191,20 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	default:
 	}
 
-	// demandPipelineDepth demands stay queued natively so progressive
-	// passes chain without host round-trips. Depth 2 suffices with the
-	// wake: the host reacts to results as they land rather than on a
-	// tick, so the queue only needs to cover back-to-back native passes.
-	const demandPipelineDepth = 2
-
-	firstToken := w.frameToken + 1
 	outstanding := 0
 	rendered := false
 	completed := false
 
 	issue := func() error {
+		if outstanding > 0 {
+			// One demand in flight already answers the map's work; a
+			// second would only supersede or queue needlessly.
+			return nil
+		}
 		w.frameToken++
 		demand := maplibre.FrameDemand{
-			Flags: maplibre.FrameDemandFlagIfNeeded,
-			Token: w.frameToken,
-			// Distinct boundaries per demand: identical boundaries would
-			// make the second demand supersede the first instead of
-			// queueing.
+			Flags:              maplibre.FrameDemandFlagIfNeeded,
+			Token:              w.frameToken,
 			CoalescingBoundary: w.frameToken,
 		}
 		if err := w.sess.RequestFrame(demand); err != nil {
@@ -1205,10 +1217,10 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		demands++
 		return nil
 	}
-	for outstanding < demandPipelineDepth {
-		if err := issue(); err != nil {
-			return err
-		}
+
+	// Kick the first frame: the initial map state is the first "update".
+	if err := issue(); err != nil {
+		return err
 	}
 
 	for {
@@ -1221,27 +1233,28 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		iterations++
 
 		progressed := false
+		demandNow := false
 		results, err := w.drainFrames()
 		if err != nil {
 			return fmt.Errorf("renderer: still image: drain frame results: %w", err)
 		}
 		for _, res := range results {
 			if serviceTrace {
-				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition)
+				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d repaint=%t\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition, res.NeedsRepaint)
 			}
 			progressed = true
 			if !sawFirst {
 				timeToFirst = time.Since(start)
 				sawFirst = true
 			}
-			if res.Token >= firstToken {
-				outstanding--
-			}
-			// Post-flush, a rendered frame drew this render's state
-			// whichever demand produced it (a leftover from the
-			// previous render's pipeline included).
+			outstanding = 0
 			if res.Disposition == maplibre.RenderResultRendered {
 				rendered = true
+				// A rendered frame that still needs repaint has more to
+				// draw: demand the follow-up pass.
+				if res.NeedsRepaint {
+					demandNow = true
+				}
 			}
 		}
 
@@ -1258,6 +1271,10 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				return fmt.Errorf("renderer: map loading failed: %s", ev.Message)
 			case maplibre.RuntimeEventTypeMapRenderError:
 				return fmt.Errorf("renderer: map render error: %s", ev.Message)
+			case maplibre.RuntimeEventTypeMapRenderUpdateAvailable:
+				// The map has state or queued render-thread work; answer
+				// with a frame demand.
+				demandNow = true
 			}
 		}
 
@@ -1291,48 +1308,47 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			return nil
 		}
 
-		if !completed && !progressed {
-			// Park until the wake fires (a frame result landed), the
-			// still completes, or the safety cap passes — the cap is
+		// Issue a demand when the map signalled work this turn (update
+		// event or a rendered-but-repaint frame), unless the still has
+		// already completed — then we only await the final rendered
+		// result, demanding nothing new.
+		if !completed && demandNow {
+			if err := issue(); err != nil {
+				return err
+			}
+		}
+
+		if !progressed {
+			// Nothing drained this turn: park until a wake fires (a
+			// frame result or runtime event landed), the still
+			// completes, or the safety cap passes — the cap is
 			// missed-wake insurance, not pacing, so it is generous.
 			waitStart := time.Now()
 			timer := time.NewTimer(50 * time.Millisecond)
-			select {
-			case <-w.wake:
-			case <-still.Done():
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				totalWait += time.Since(waitStart)
-				return ctx.Err()
-			}
-			timer.Stop()
-			totalWait += time.Since(waitStart)
-		} else if completed && !rendered && !progressed {
-			// Completed OK but the rendered result is still queued;
-			// park for its wake (no new demands), bounded by the
-			// deadline via the loop's checks.
-			waitStart := time.Now()
-			timer := time.NewTimer(50 * time.Millisecond)
-			select {
-			case <-w.wake:
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				totalWait += time.Since(waitStart)
-				return ctx.Err()
-			}
-			timer.Stop()
-			totalWait += time.Since(waitStart)
-			continue
-		}
-
-		if !completed {
-			for outstanding < demandPipelineDepth {
-				if err := issue(); err != nil {
-					return err
+			if completed {
+				// No new demands once completed; just wait for the
+				// rendered result's wake.
+				select {
+				case <-w.wake:
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					totalWait += time.Since(waitStart)
+					return ctx.Err()
+				}
+			} else {
+				select {
+				case <-w.wake:
+				case <-still.Done():
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					totalWait += time.Since(waitStart)
+					return ctx.Err()
 				}
 			}
+			timer.Stop()
+			totalWait += time.Since(waitStart)
 		}
 	}
 }
