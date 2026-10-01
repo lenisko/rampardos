@@ -1192,15 +1192,15 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	}
 
 	outstanding := 0
+	// wantDemand latches a work signal (update event or repaint) until a
+	// demand can carry it. Dropping a signal that arrives while a demand
+	// is in flight stalls the still: if that in-flight demand resolves
+	// NoUpdate, the map does not republish the update it already sent.
+	wantDemand := false
 	rendered := false
 	completed := false
 
 	issue := func() error {
-		if outstanding > 0 {
-			// One demand in flight already answers the map's work; a
-			// second would only supersede or queue needlessly.
-			return nil
-		}
 		w.frameToken++
 		demand := maplibre.FrameDemand{
 			Flags:              maplibre.FrameDemandFlagIfNeeded,
@@ -1233,7 +1233,6 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		iterations++
 
 		progressed := false
-		demandNow := false
 		results, err := w.drainFrames()
 		if err != nil {
 			return fmt.Errorf("renderer: still image: drain frame results: %w", err)
@@ -1253,7 +1252,7 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				// A rendered frame that still needs repaint has more to
 				// draw: demand the follow-up pass.
 				if res.NeedsRepaint {
-					demandNow = true
+					wantDemand = true
 				}
 			}
 		}
@@ -1274,7 +1273,7 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			case maplibre.RuntimeEventTypeMapRenderUpdateAvailable:
 				// The map has state or queued render-thread work; answer
 				// with a frame demand.
-				demandNow = true
+				wantDemand = true
 			}
 		}
 
@@ -1312,10 +1311,11 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		// event or a rendered-but-repaint frame), unless the still has
 		// already completed — then we only await the final rendered
 		// result, demanding nothing new.
-		if !completed && demandNow {
+		if !completed && wantDemand && outstanding == 0 {
 			if err := issue(); err != nil {
 				return err
 			}
+			wantDemand = false
 		}
 
 		if !progressed {
@@ -1341,6 +1341,13 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				case <-w.wake:
 				case <-still.Done():
 				case <-timer.C:
+					// A quiet park with nothing in flight means a work
+					// signal was lost or never sent; an IF_NEEDED
+					// keep-alive demand bounds that to one timer period
+					// instead of the render timeout.
+					if outstanding == 0 {
+						wantDemand = true
+					}
 				case <-ctx.Done():
 					timer.Stop()
 					totalWait += time.Since(waitStart)

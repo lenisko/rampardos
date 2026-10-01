@@ -52,7 +52,12 @@ visible in the code.
   queue became nonempty — a new update to demand against). Both share
   one non-blocking channel; the loop parks on it, the still, and a 50ms
   timer that is missed-wake insurance only (no pacing tick), and parks
-  only when nothing drained this turn. Still completion arrives via its
+  only when nothing drained this turn. A work signal that arrives while
+  a demand is in flight must be latched and issued once that demand
+  resolves — dropping it stalls the still to the render timeout, since
+  the map does not republish an update it already sent. A quiet timer
+  expiry with nothing in flight issues a keep-alive IF_NEEDED demand
+  for the same reason. Still completion arrives via its
   Future, not the still-image event. The upfront flush discards a prior
   render's last in-flight result; with one demand outstanding there is
   no pre-pipeline leftover to draw the next render's first pass.
