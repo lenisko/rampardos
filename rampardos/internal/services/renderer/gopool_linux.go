@@ -66,7 +66,7 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 		cfg.StylePoolMin = 1
 	}
 	if cfg.StylePoolIdleTTL <= 0 {
-		cfg.StylePoolIdleTTL = 2 * time.Minute
+		cfg.StylePoolIdleTTL = 10 * time.Minute
 	}
 	if cfg.RenderTimeout <= 0 {
 		cfg.RenderTimeout = 15 * time.Second
@@ -437,7 +437,7 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 		cfg.minPoolSize = 1
 	}
 	if cfg.idleTTL <= 0 {
-		cfg.idleTTL = 2 * time.Minute
+		cfg.idleTTL = 10 * time.Minute
 	}
 	if cfg.settleTimeout <= 0 {
 		cfg.settleTimeout = 5 * time.Second

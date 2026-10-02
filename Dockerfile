@@ -327,6 +327,12 @@ ENV MESA_GL_VERSION_OVERRIDE=3.3
 # why the image no longer needs Xvfb or DISPLAY: those existed only for
 # the Node binding, which required an X display for its GL context.
 ENV EGL_PLATFORM=surfaceless
+# Each renderer worker brings its own native threads, and glibc gives
+# threads their own malloc arenas that it rarely returns to the OS. With
+# workers retiring and regrowing, the default arena count let RSS climb
+# without bound (~3 MB per retired worker in a local churn probe); two
+# shared arenas held it flat.
+ENV MALLOC_ARENA_MAX=2
 EXPOSE 9000
 
 ENTRYPOINT ["/app/rampardos"]

@@ -19,7 +19,7 @@ type Config struct {
 	RendererPoolSize       int           // global cap on concurrent renders (semaphore size)
 	RendererStylePoolSize  int           // ceiling on workers per (style, scale) pool (default: RendererPoolSize)
 	RendererStylePoolMin   int           // workers a pool keeps when idle (default: 1)
-	RendererStylePoolIdle  time.Duration // quiet interval before retiring one worker (default: 2m)
+	RendererStylePoolIdle  time.Duration // quiet interval before retiring one worker (default: 10m)
 	RendererRenderTimeout  time.Duration // per-render deadline
 	RendererStartupTimeout time.Duration // max handshake wait
 
@@ -87,7 +87,7 @@ func Load() *Config {
 		RendererPoolSize:       getEnvInt("RENDERER_POOL_SIZE", 0),
 		RendererStylePoolSize:  getEnvInt("STYLE_POOL_SIZE", 0),
 		RendererStylePoolMin:   getEnvInt("STYLE_POOL_MIN", 1),
-		RendererStylePoolIdle:  getEnvSeconds("STYLE_POOL_IDLE_SECONDS", 120),
+		RendererStylePoolIdle:  getEnvSeconds("STYLE_POOL_IDLE_SECONDS", 600),
 		RendererRenderTimeout:  getEnvSeconds("RENDERER_TIMEOUT_SECONDS", 15),
 		RendererStartupTimeout: getEnvSeconds("RENDERER_STARTUP_TIMEOUT_SECONDS", 10),
 
