@@ -10,23 +10,23 @@
 #   PORT=8080 ./start.sh                # env var override
 #
 # Environment variables (take precedence over flags):
-#   PORT, HOSTNAME, RENDERER_POOL_SIZE, RENDERER_TIMEOUT_SECONDS,
-#   RENDERER_WORKER_LIFETIME, RENDERER_WORKER_SCRIPT,
-#   ADMIN_USERNAME, ADMIN_PASSWORD
+#   PORT, HOSTNAME, RENDERER_POOL_SIZE, STYLE_POOL_SIZE,
+#   RENDERER_TIMEOUT_SECONDS, ADMIN_USERNAME, ADMIN_PASSWORD
+#
+# The renderer is in-process (RENDERER_BACKEND=go-pool) and needs a binary
+# built with -tags mln_ffi against libmaplibre-native-c.so:
+#   make build-ffi && make build-go-renderer
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/bin/rampardos"
-WORKER_SCRIPT="$SCRIPT_DIR/rampardos-render-worker/render-worker.js"
 
 # Defaults (overridden by env vars, then by flags)
 : "${PORT:=9000}"
 : "${HOSTNAME:=0.0.0.0}"
 : "${RENDERER_POOL_SIZE:=2}"
 : "${RENDERER_TIMEOUT_SECONDS:=15}"
-: "${RENDERER_WORKER_LIFETIME:=500}"
-: "${RENDERER_WORKER_SCRIPT:=$WORKER_SCRIPT}"
 : "${ADMIN_USERNAME:=}"
 : "${ADMIN_PASSWORD:=}"
 
@@ -37,8 +37,6 @@ while [[ $# -gt 0 ]]; do
         --host)             HOSTNAME="$2"; shift 2 ;;
         --pool-size)        RENDERER_POOL_SIZE="$2"; shift 2 ;;
         --timeout)          RENDERER_TIMEOUT_SECONDS="$2"; shift 2 ;;
-        --worker-lifetime)  RENDERER_WORKER_LIFETIME="$2"; shift 2 ;;
-        --worker-script)    RENDERER_WORKER_SCRIPT="$2"; shift 2 ;;
         --admin-user)       ADMIN_USERNAME="$2"; shift 2 ;;
         --admin-pass)       ADMIN_PASSWORD="$2"; shift 2 ;;
         --help|-h)
@@ -50,7 +48,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --pool-size N         Renderer workers per style (default: 2)"
             echo "  --timeout N           Render timeout in seconds (default: 15)"
             echo "  --worker-lifetime N   Renders per worker before recycle (default: 500)"
-            echo "  --worker-script PATH  Path to render-worker.js"
             echo "  --admin-user USER     Admin UI username"
             echo "  --admin-pass PASS     Admin UI password"
             echo ""
@@ -71,16 +68,6 @@ if [ ! -f "$BINARY" ]; then
     exit 1
 fi
 
-if [ ! -f "$RENDERER_WORKER_SCRIPT" ]; then
-    echo "Worker script not found at $RENDERER_WORKER_SCRIPT"
-    echo "Run 'make npm-install' or check --worker-script path."
-    exit 1
-fi
-
-if [ ! -d "$SCRIPT_DIR/rampardos-render-worker/node_modules/@maplibre/maplibre-gl-native" ]; then
-    echo "Node dependencies not installed — running npm install..."
-    (cd "$SCRIPT_DIR/rampardos-render-worker" && npm install)
-fi
 
 # Ensure runtime directories exist
 mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regeneratable
@@ -89,8 +76,7 @@ mkdir -p Templates Markers Temp
 
 # Export all settings
 export PORT HOSTNAME
-export RENDERER_POOL_SIZE RENDERER_TIMEOUT_SECONDS RENDERER_WORKER_LIFETIME
-export RENDERER_WORKER_SCRIPT
+export RENDERER_POOL_SIZE RENDERER_TIMEOUT_SECONDS
 export ADMIN_USERNAME ADMIN_PASSWORD
 
 echo "Starting rampardos on $HOSTNAME:$PORT (pool_size=$RENDERER_POOL_SIZE)"

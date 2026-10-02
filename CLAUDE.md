@@ -39,6 +39,58 @@ visible in the code.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
+- **Executor-binding still invariants** (`goWorker.awaitStill`, the
+  core-worker driver): a static-mode map renders only on demand, and
+  the await is update-driven — it issues exactly one IF_NEEDED frame
+  demand per `MapRenderUpdateAvailable` runtime event, plus one per
+  rendered frame that reports `NeedsRepaint`. The map itself signals
+  when it has work (style/tile arrival), so there is never more than a
+  single outstanding demand and the CoalescingBoundary supersede rule
+  is moot. This replaced an earlier speculative two-deep pipeline; the
+  reactive shape needs **both** wakes feeding the park: the session's
+  FrameWake (a frame result landed) and the runtime's EventWake (the
+  queue became nonempty — a new update to demand against). Both share
+  one non-blocking channel; the loop parks on it, the still, and a 50ms
+  timer that is missed-wake insurance only (no pacing tick), and parks
+  only when nothing drained this turn. A work signal that arrives while
+  a demand is in flight must be latched and issued once that demand
+  resolves — dropping it stalls the still to the render timeout, since
+  the map does not republish an update it already sent. A quiet timer
+  expiry with nothing in flight issues a keep-alive IF_NEEDED demand
+  for the same reason. Still completion arrives via its
+  Future, not the still-image event. The upfront flush discards a prior
+  render's last in-flight result; with one demand outstanding there is
+  no pre-pipeline leftover to draw the next render's first pass.
+  `RenderFrameFinished` events do not exist in static mode (mbgl gates
+  them to Continuous) — don't build logic on them. A session `Resize`
+  future can never complete on its own in static mode; resize is
+  started and the next still's demand loop drives it — never await a
+  bare resize before a still. `DrainFrameResults` returns `ErrNotReady`
+  when empty — not an error. There is no cancel for a pending still and
+  the map refuses a second one — an abandoned still must be settled by
+  driving the same await (bounded), else the worker is poisoned.
+  Blocking `Future.Await` is safe under the core-worker driver; the
+  caller-graphics-thread driver self-deadlocks on it — do not
+  reintroduce that driver without restoring a host service loop.
+
+## Tile provider (shared renderer resource provider)
+
+- One process-wide `TileStore` (SQLite pool + byte-bounded LRU of
+  decompressed tiles) serves every worker via the binding's resource
+  provider; `RENDERER_TILE_PROVIDER=off` is the kill switch back to the
+  native mbtiles source, and any store-open failure degrades the same
+  way. `RENDERER_TILE_CACHE_MB` bounds the LRU (default 64).
+- The custom `rampardos://tile/` scheme is what routes tiles to the
+  provider: mbgl only consults providers for network-path URLs, so
+  styleprep inlines a TileJSON with that scheme instead of an
+  `mbtiles://` url. file:// glyphs/sprites never reach the provider.
+- The provider must return DECOMPRESSED tile bytes (mbgl's network path
+  assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
+  rows for the mbtiles query. maxzoom in the inline TileJSON is what
+  makes overzoom work.
+- Dataset activate/combine retargets the mbtiles symlink; ReloadStyles
+  reopens the store, drops the tile LRU, and rebuilds the inline
+  TileJSON before re-preparing styles.
 
 ## Cache intent: nocache, TTL, owned
 
