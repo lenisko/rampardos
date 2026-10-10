@@ -1102,14 +1102,16 @@ func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 var serviceTrace = os.Getenv("RENDERER_SERVICE_TRACE") != ""
 
 // drainFrames drains and closes one frame-result batch, returning its
-// results. ErrNotReady means an empty queue, reported as (nil, nil).
+// results. An empty queue is reported as (nil, nil).
 func (w *goWorker) drainFrames() ([]maplibre.RenderFrameResult, error) {
 	fb, err := w.sess.DrainFrameResults()
 	if err != nil {
-		if errors.Is(err, maplibre.ErrNotReady) {
-			return nil, nil
-		}
 		return nil, err
+	}
+	if fb == nil {
+		// The binding reports an empty queue (MLN_STATUS_NOT_READY) as an
+		// absent batch.
+		return nil, nil
 	}
 	defer fb.Close()
 	n, err := fb.Count()
@@ -1136,6 +1138,9 @@ func (w *goWorker) drainEvents() ([]maplibre.RuntimeEvent, error) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if eb == nil {
+		return nil, nil
 	}
 	defer eb.Close()
 	view, err := eb.Get()

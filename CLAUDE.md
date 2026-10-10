@@ -65,8 +65,9 @@ visible in the code.
   them to Continuous) — don't build logic on them. A session `Resize`
   future can never complete on its own in static mode; resize is
   started and the next still's demand loop drives it — never await a
-  bare resize before a still. `DrainFrameResults` returns `ErrNotReady`
-  when empty — not an error. There is no cancel for a pending still and
+  bare resize before a still. `DrainFrameResults` returns a nil batch and
+  no error when the queue is empty (the binding maps NOT_READY to
+  absence) — check for nil before using the batch. There is no cancel for a pending still and
   the map refuses a second one — an abandoned still must be settled by
   driving the same await (bounded), else the worker is poisoned.
   Blocking `Future.Await` is safe under the core-worker driver; the
