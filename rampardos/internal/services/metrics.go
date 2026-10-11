@@ -132,6 +132,9 @@ type MetricsManager struct {
 	// and how often the missed-wake insurance timer is what moved one.
 	rendererStillFrameResults *prometheus.CounterVec
 	rendererStillKeepalives   *prometheus.CounterVec
+	// Renders that changed a worker's target size, to show how often
+	// request sizes alternate on the same worker.
+	rendererResizes *prometheus.CounterVec
 
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
@@ -416,6 +419,10 @@ func newMetricsManager() *MetricsManager {
 		rendererStillKeepalives: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_still_keepalive_total",
 			Help: "Times the still await's 50ms missed-wake insurance expired with no frame demand armed. The await re-arms a waiting demand on every result, so this should stay at zero; a non-zero count means that invariant broke.",
+		}, []string{"style", "scale"}),
+		rendererResizes: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_resizes_total",
+			Help: "Renders that resized the worker's render target because the requested logical size differed from that worker's previous render. Divide by rampardos_renderer_viewport_duration_seconds_count for the share of renders that paid for a resize.",
 		}, []string{"style", "scale"}),
 
 		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -1054,4 +1061,8 @@ func (m *MetricsManager) IncRendererStillFrameResult(style, scale, disposition s
 
 func (m *MetricsManager) IncRendererStillKeepalive(style, scale string) {
 	m.rendererStillKeepalives.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
+}
+
+func (m *MetricsManager) IncRendererResize(style, scale string) {
+	m.rendererResizes.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
 }

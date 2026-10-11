@@ -1020,6 +1020,9 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 			return nil, fmt.Errorf("renderer: resize: %w", err)
 		}
 		resize = f
+		if services.GlobalMetrics != nil {
+			services.GlobalMetrics.IncRendererResize(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
+		}
 	}
 
 	zoom, bearing, pitch := vp.Zoom, vp.Bearing, vp.Pitch
