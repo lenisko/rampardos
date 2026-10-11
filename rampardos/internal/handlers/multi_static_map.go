@@ -171,7 +171,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 	genCtx := context.WithoutCancel(r.Context())
 	v, sfErr, _ := h.sfg.Do(path, func() (any, error) {
 		if !nocache && services.GlobalCompositeImageCache != nil {
-			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+			if cached, ok := services.GlobalCompositeImageCache.Get(services.CompositeKindMulti, path); ok {
 				return sfgResult{img: cached, cached: true}, nil
 			}
 		}
@@ -208,7 +208,7 @@ func (h *MultiStaticMapHandler) handleRequest(w http.ResponseWriter, r *http.Req
 			return nil, err
 		}
 		if services.GlobalCompositeImageCache != nil {
-			services.GlobalCompositeImageCache.Add(path, composed)
+			services.GlobalCompositeImageCache.Add(services.CompositeKindMulti, path, composed)
 		}
 		return sfgResult{img: composed, cached: false}, nil
 	})

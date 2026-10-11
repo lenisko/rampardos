@@ -198,7 +198,7 @@ func TestGenerateStaticMapSingleflightSurvivesLeaderCancel(t *testing.T) {
 // the result back so other callers benefit.
 func TestNoCacheForcesFreshRenderButPopulatesLRU(t *testing.T) {
 	prev := services.GlobalCompositeImageCache
-	services.GlobalCompositeImageCache = services.NewCompositeImageCache(16)
+	services.GlobalCompositeImageCache = services.NewCompositeImageCache(16, 64<<20)
 	t.Cleanup(func() { services.GlobalCompositeImageCache = prev })
 
 	var renders atomic.Int32

@@ -67,8 +67,20 @@ visible in the code.
   round-trip on the critical path for local-style requests.
 - `CompositeImageCache` (`services.GlobalCompositeImageCache`) is
   the cross-request burst-sharing mechanism. Keyed by path. Holds
-  base renders and final staticmap outputs as `image.Image`. Size
-  via `COMPOSITE_IMAGE_CACHE_SIZE` (default 200).
+  base renders, final staticmaps and multistaticmap composites as
+  `image.Image`. **Bounded by decoded-pixel bytes**
+  (`COMPOSITE_IMAGE_CACHE_MB`, default 256), not entry count: a
+  scale=2 multi composite is tens of times a scale=1 staticmap, and
+  the old count bound (200) reached ~1 GB of heap in prod (#34).
+  `COMPOSITE_IMAGE_CACHE_SIZE` (default 1000) is only a secondary
+  cap. An image bigger than the whole budget is not cached.
+- Count a lookup once: the fast-path `Get` records hit/miss; the
+  double-checked lookup inside singleflight must use `Recheck`.
+  `rampardos_composite_cache_lookups_total{kind}` and
+  `..._kind_bytes{kind}` split base / final / multi, to show which
+  kind earns its memory.
+- The pregenerated fetch-back (`/staticmap/pregenerated/{id}`) is
+  served from the disk file and never consults this cache.
 - Shared bases (N users, same viewport, different drawables) and
   shared components (multi requests reusing panel viewports) both
   hit this cache without triggering any PNG round-trip. The

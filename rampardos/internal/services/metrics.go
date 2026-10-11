@@ -68,8 +68,12 @@ type MetricsManager struct {
 	// In-memory image cache metrics (marker LRU, tile LRU). Distinct
 	// from the on-disk {cache_hits,misses}_total{type=...} counters:
 	// these measure whether a decoded image was reused from memory.
-	imageCacheHits   *prometheus.CounterVec
-	imageCacheMisses *prometheus.CounterVec
+	imageCacheHits      *prometheus.CounterVec
+	imageCacheMisses    *prometheus.CounterVec
+	imageCacheBytes     *prometheus.GaugeVec
+	imageCacheEvictions *prometheus.CounterVec
+	compositeLookups    *prometheus.CounterVec
+	compositeKindBytes  *prometheus.GaugeVec
 
 	// Tile generation time split by source: disk cache hit, local
 	// render via maplibre-native, or external download. Covers every
@@ -249,6 +253,26 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_image_cache_misses_total",
 			Help: "Misses on the in-memory decoded-image LRUs. A miss forces a file read + image.Decode.",
 		}, []string{"cache"}),
+
+		imageCacheBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_image_cache_bytes",
+			Help: "Decoded pixel bytes held by a byte-bounded in-memory image LRU.",
+		}, []string{"cache"}),
+
+		imageCacheEvictions: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_image_cache_evictions_total",
+			Help: "Entries pushed out of an in-memory image LRU by its byte or entry limit.",
+		}, []string{"cache"}),
+
+		compositeLookups: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_composite_cache_lookups_total",
+			Help: "Composite image LRU lookups by entry kind (base, final, multi) and result (hit, miss). One per logical request lookup.",
+		}, []string{"kind", "result"}),
+
+		compositeKindBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "rampardos_composite_cache_kind_bytes",
+			Help: "Decoded pixel bytes held by the composite image LRU, by entry kind (base, final, multi).",
+		}, []string{"kind"}),
 
 		tileGenerateDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_tile_generate_duration_seconds",
@@ -597,6 +621,32 @@ func (m *MetricsManager) RecordImageCacheHit(name string) {
 
 func (m *MetricsManager) RecordImageCacheMiss(name string) {
 	m.imageCacheMisses.WithLabelValues(name).Inc()
+}
+
+func (m *MetricsManager) SetImageCacheBytes(name string, bytes int64) {
+	m.imageCacheBytes.WithLabelValues(name).Set(float64(bytes))
+}
+
+func (m *MetricsManager) RecordImageCacheEviction(name string) {
+	m.imageCacheEvictions.WithLabelValues(name).Inc()
+}
+
+// RecordCompositeCacheLookup records a composite LRU lookup on both
+// the per-kind counter and the shared image_cache_{hits,misses}
+// series, so existing cache="composite" panels keep working.
+func (m *MetricsManager) RecordCompositeCacheLookup(kind string, hit bool) {
+	result := "miss"
+	if hit {
+		result = "hit"
+		m.RecordImageCacheHit(ImageCacheComposite)
+	} else {
+		m.RecordImageCacheMiss(ImageCacheComposite)
+	}
+	m.compositeLookups.WithLabelValues(kind, result).Inc()
+}
+
+func (m *MetricsManager) SetCompositeCacheKindBytes(kind string, bytes int64) {
+	m.compositeKindBytes.WithLabelValues(kind).Set(float64(bytes))
 }
 
 // RecordMarkerRequest records a marker request
