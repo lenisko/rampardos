@@ -358,11 +358,12 @@ ENV EGL_PLATFORM=surfaceless
 # without bound (~3 MB per retired worker in a local churn probe); two
 # shared arenas held it flat.
 ENV MALLOC_ARENA_MAX=2
-# The Go-side counterpart. The in-memory image caches are count-bounded,
-# so their live heap can reach ~800 MB, and with GOGC=100 the heap then
-# grows to ~2x that before collecting; freed spans return to the OS only
-# slowly. A soft limit makes the GC collect and scavenge as the heap nears
-# it. Override per deployment; see #34.
+# The Go-side counterpart. With GOGC=100 the heap grows to ~2x the live
+# set before collecting, and freed spans return to the OS only slowly. A
+# soft limit makes the GC collect and scavenge as the heap nears it. Keep
+# it comfortably above COMPOSITE_IMAGE_CACHE_MB plus the count-bounded
+# tile and marker image caches, or the GC runs continuously. Override per
+# deployment; see #34.
 ENV GOMEMLIMIT=1GiB
 EXPOSE 9000
 
