@@ -169,10 +169,11 @@ func main() {
 	// image.Decode at 54% of CPU before this cache existed.
 	services.InitGlobalTileImageCache(cfg.TileImageCacheSize)
 
-	// Cross-request burst-sharing cache for base renders and final
-	// staticmap outputs. Replaces the short-TTL disk cache for the
-	// non-pregenerate hot path.
-	services.InitGlobalCompositeImageCache(cfg.CompositeImageCacheSize)
+	// Cross-request burst-sharing cache for base renders, final
+	// staticmap outputs and multistaticmap composites. Replaces the
+	// short-TTL disk cache for the non-pregenerate hot path. Bounded
+	// by bytes; the entry count is a secondary cap.
+	services.InitGlobalCompositeImageCache(cfg.CompositeImageCacheSize, int64(cfg.CompositeImageCacheMB)<<20)
 
 	// Initialize image settings
 	services.InitImageSettings(cfg)
