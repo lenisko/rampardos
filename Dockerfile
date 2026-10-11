@@ -52,7 +52,31 @@ RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then \
     else \
     mkdir -p /fontnik && cd /fontnik && npm install fontnik@0.7.4; \
     fi
-RUN find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "*.map" -o -name "LICENSE*" -o -name "README*" -o -name "CHANGELOG*" \) -delete \
+# The arm64 from-source build leaves its toolchain, sources and dev
+# dependencies behind (~270 MB, mostly mason_packages and aws-sdk). The
+# addon build-glyphs loads is lib/binding/fontnik.node; build/ only holds
+# an intermediate copy. On amd64 none of these paths exist.
+RUN rm -rf \
+        /fontnik/.git \
+        /fontnik/.mason \
+        /fontnik/.toolchain \
+        /fontnik/mason_packages \
+        /fontnik/build \
+        /fontnik/src \
+        /fontnik/test \
+        /fontnik/bench \
+        /fontnik/scripts \
+        /fontnik/cloudformation \
+        /fontnik/fonts \
+        /fontnik/proto \
+        /fontnik/package-lock.json \
+        /fontnik/binding.gyp \
+        /fontnik/common.gypi \
+        /fontnik/local.env \
+        /fontnik/node_modules/aws-sdk \
+        /fontnik/node_modules/benchmark \
+        /fontnik/node_modules/.cache \
+    && find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "*.map" -o -name "LICENSE*" -o -name "README*" -o -name "CHANGELOG*" \) -delete \
     && find /fontnik/node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" -o -name "example" -o -name "examples" \) -exec rm -rf {} + 2>/dev/null || true
 
 # ================================
