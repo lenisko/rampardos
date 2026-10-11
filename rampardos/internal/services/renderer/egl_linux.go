@@ -1,4 +1,4 @@
-// Per-worker EGL display + config for the Go renderer's OpenGL backend.
+// Process-wide EGL display + config for the Go renderer's OpenGL backend.
 //
 // Since the native-executor binding's core-worker driver (upstream
 // maplibre-native-ffi#631, "Run private OpenGL textures on core
@@ -17,6 +17,12 @@
 // The display backend is picked via EGL_PLATFORM=surfaceless in the
 // runtime image's env so eglGetDisplay(EGL_DEFAULT_DISPLAY) returns
 // Mesa's surfaceless platform.
+//
+// eglGetDisplay(EGL_DEFAULT_DISPLAY) returns the same display to every
+// caller in the process, so every worker borrows one display (and one
+// llvmpipe rasterizer). It is initialized once and never terminated:
+// eglTerminate would invalidate the contexts of every other worker
+// still rendering on it, and the display costs nothing to keep.
 package renderer
 
 /*
@@ -70,10 +76,9 @@ static int mln_go_egl_init(mln_go_egl_display *out, char *err, size_t err_len) {
     return 0;
 }
 
-static void mln_go_egl_destroy(mln_go_egl_display *d) {
-    if (d == NULL || d->display == EGL_NO_DISPLAY) return;
-    eglTerminate(d->display);
-    memset(d, 0, sizeof(*d));
+// eglQueryString fails with EGL_NOT_INITIALIZED on a terminated display.
+static int mln_go_egl_initialized(const mln_go_egl_display *d) {
+    return eglQueryString(d->display, EGL_VERSION) != NULL;
 }
 
 // The binding takes these handles as uintptr (maplibre.NativePointer) and
@@ -98,24 +103,38 @@ import "C"
 
 import (
 	"fmt"
+	"sync"
 
 	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
 )
 
-// eglDisplay is the per-worker headless EGL display + config. Any
-// goroutine may construct it; nothing here is thread-affine. close()
-// only after the session that borrowed it has completed detach — the
-// contract keeps the EGLDisplay initialized through session teardown.
+// eglDisplay is the process-wide headless EGL display + config. Any
+// goroutine may use it; nothing here is thread-affine. The binding
+// requires the display to stay initialized through session teardown;
+// never terminating it satisfies that for every worker at once.
 type eglDisplay struct {
 	raw C.mln_go_egl_display
 }
 
+var (
+	sharedEGLMu sync.Mutex
+	sharedEGL   *eglDisplay
+)
+
+// newEGLDisplay returns the shared display, initializing it on first
+// use. A failed initialization is not cached, so a later worker retries.
 func newEGLDisplay() (*eglDisplay, error) {
+	sharedEGLMu.Lock()
+	defer sharedEGLMu.Unlock()
+	if sharedEGL != nil {
+		return sharedEGL, nil
+	}
 	d := &eglDisplay{}
 	var errBuf [256]C.char
 	if rc := C.mln_go_egl_init(&d.raw, &errBuf[0], C.size_t(len(errBuf))); rc != 0 {
 		return nil, fmt.Errorf("renderer: EGL init (rc=%d): %s", int(rc), C.GoString(&errBuf[0]))
 	}
+	sharedEGL = d
 	return d, nil
 }
 
@@ -123,10 +142,6 @@ func newEGLDisplay() (*eglDisplay, error) {
 // for a core-worker session: the session creates a private context from
 // this display+config with the named client API and joins no share
 // group.
-//
-// The returned descriptor is valid only as long as this eglDisplay is
-// alive. Caller must keep the *eglDisplay referenced for the lifetime
-// of the RenderSession that uses it.
 func (d *eglDisplay) descriptor() maplibre.OpenglContextDescriptor {
 	return maplibre.OpenglContextDescriptor{
 		Ownership: maplibre.OpenglContextOwnershipDedicated,
@@ -141,6 +156,6 @@ func (d *eglDisplay) descriptor() maplibre.OpenglContextDescriptor {
 	}
 }
 
-func (d *eglDisplay) close() {
-	C.mln_go_egl_destroy(&d.raw)
+func (d *eglDisplay) initialized() bool {
+	return C.mln_go_egl_initialized(&d.raw) != 0
 }

@@ -990,11 +990,7 @@ func (w *goWorker) cleanup() {
 			_, _ = f.Await(settleCtx)
 		}
 	}
-	if w.egl != nil {
-		// Only after session detach: the display must stay initialized
-		// through session teardown.
-		w.egl.close()
-	}
+	// w.egl is the process-wide display; it outlives every worker.
 }
 
 // renderOne is the per-worker hot path. Resize only if extent changed
