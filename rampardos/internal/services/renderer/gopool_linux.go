@@ -389,7 +389,7 @@ type goStylePoolConfig struct {
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
 // is OS-thread-pinned and holds its own RuntimeHandle + MapHandle +
-// RenderSessionHandle + eglDisplay for its lifetime.
+// RenderSessionHandle for its lifetime; the eglDisplay is process-wide.
 type goStylePool struct {
 	cfg goStylePoolConfig
 
