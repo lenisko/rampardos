@@ -848,9 +848,8 @@ func (w *goWorker) init() error {
 	}
 
 	opts := maplibre.DefaultRuntimeOptions()
-	// Wakes when the runtime event queue becomes nonempty. Update-driven
-	// demands depend on this: a MapRenderUpdateAvailable event must end
-	// the await's park even when no frame result is in flight.
+	// Wakes when the runtime event queue becomes nonempty, so a loading
+	// or render failure ends the await's park promptly.
 	opts.EventWake = maplibre.Wake{Callback: wakeCallback}
 	w.rt, err = maplibre.RuntimeCreate(opts)
 	if err != nil {
@@ -872,13 +871,11 @@ func (w *goWorker) init() error {
 
 	// MapModeStatic is the render-once mode; the executor disables the
 	// animation tick and aligns with our request/reply pattern. The event
-	// mask carries the two failure events the still await fail-fasts on
-	// plus MapRenderUpdateAvailable, which drives demands: the map
-	// publishes an update whenever state or queued render-thread work is
-	// available, and the await answers each with one frame demand. Still
-	// completion arrives via its Future.
+	// mask carries only the two failure events the still await fail-fasts
+	// on: frame demands wait for map updates inside the binding, and
+	// still completion arrives via its Future.
 	w.curW, w.curH, w.curScale = 256, 256, float64(w.pool.cfg.ratio)
-	mapFuture, err := w.rt.MapCreate(maplibre.MapOptions{
+	mapFuture, err := w.rt.CreateMap(maplibre.MapOptions{
 		InitialExtent: maplibre.LogicalExtent{
 			Width:       w.curW,
 			Height:      w.curH,
@@ -886,8 +883,7 @@ func (w *goWorker) init() error {
 		},
 		MapMode: maplibre.MapModeStatic,
 		EventMask: maplibre.RuntimeEventMaskMapLoadingFailed |
-			maplibre.RuntimeEventMaskMapRenderError |
-			maplibre.RuntimeEventMaskMapRenderUpdateAvailable,
+			maplibre.RuntimeEventMaskMapRenderError,
 	})
 	if err != nil {
 		return fmt.Errorf("renderer: new map: %w", err)
@@ -903,9 +899,9 @@ func (w *goWorker) init() error {
 	// the wake channel with the runtime's EventWake — the callback only
 	// schedules (non-blocking channel send) per the wake contract, and
 	// the await drains both queues per turn regardless of which fired.
-	attach, err := w.m.OpenglOwnedTextureAttach(
+	attach, err := w.m.AttachOpenglOwnedTexture(
 		maplibre.OpenglOwnedTextureDescriptor{
-			Extent: maplibre.RenderTargetExtent{
+			Extent: maplibre.LogicalExtent{
 				Width:       w.curW,
 				Height:      w.curH,
 				ScaleFactor: w.curScale,
@@ -996,7 +992,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		// pending still), so rather than awaiting it here, let the still
 		// image's demand loop below drive it to completion — session
 		// operations are ordered ahead of the still's frames.
-		f, err := w.sess.Resize(maplibre.RenderTargetExtent{
+		f, err := w.sess.Resize(maplibre.LogicalExtent{
 			Width:       wantW,
 			Height:      wantH,
 			ScaleFactor: wantScale,
@@ -1053,7 +1049,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	physH := vp.Height * scale
 
 	readStart := time.Now()
-	rb, err := w.sess.TextureReadPremultipliedRgba8()
+	rb, err := w.sess.ReadTexture()
 	if err != nil {
 		return nil, fmt.Errorf("renderer: read pixels: %w", err)
 	}
@@ -1114,18 +1110,13 @@ func (w *goWorker) drainFrames() ([]maplibre.RenderFrameResult, error) {
 		return nil, nil
 	}
 	defer fb.Close()
-	n, err := fb.Count()
+	view, err := fb.Get()
 	if err != nil {
 		return nil, err
 	}
-	results := make([]maplibre.RenderFrameResult, 0, n)
-	for i := uint(0); i < n; i++ {
-		res, err := fb.Get(i)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, res)
-	}
+	// Copy out: the view's records belong to the batch handle.
+	results := make([]maplibre.RenderFrameResult, len(view.Results))
+	copy(results, view.Results)
 	return results, nil
 }
 
@@ -1153,22 +1144,24 @@ func (w *goWorker) drainEvents() ([]maplibre.RuntimeEvent, error) {
 	return results, nil
 }
 
-// awaitStill drives a still-image request to completion with
-// update-driven frame demands, parking on the shared wake channel
-// (runtime EventWake + session FrameWake). A static-mode map renders
-// only on demand; rather than keep a speculative pipeline queued, the
-// await issues exactly one demand per MapRenderUpdateAvailable event
-// and one per rendered frame that reports NeedsRepaint — the map tells
-// us when it has work, so there is never more than a single outstanding
-// demand and the CoalescingBoundary supersede problem does not arise.
-// Still completion arrives via its Future.
+// stillDemandBoundary is the coalescing boundary every still demand
+// shares, so a newly armed demand supersedes any earlier one still
+// waiting instead of queueing behind it.
+const stillDemandBoundary = 1
+
+// awaitStill drives a still-image request to completion with one
+// waiting frame demand (IF_NEEDED | WAIT_FOR_UPDATE), parking on the
+// shared wake channel (session FrameWake + runtime EventWake). A
+// static-mode map renders only on demand; a waiting demand that finds
+// nothing new parks inside the binding and reruns on the map's next
+// update, so the host re-arms one demand per result and never hears
+// about updates itself. Still completion arrives via its Future.
 //
-// This is the upstream canonical still loop (maplibre-native-ffi
-// example zig-readback): demand on update, finish on the still, let the
-// wake schedule the park. With one demand outstanding at a time there
-// is no pre-pipeline leftover to draw the next render's first pass, so
-// the upfront flush only discards results from a prior render's final
-// in-flight demand.
+// On completion a session barrier ends the demand left waiting and
+// returns once every earlier render has a terminal result. That keeps
+// a parked demand from drawing the next render's first frame before
+// its flush, and orders the readback after the frame that completed
+// the still.
 func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct{}], budget time.Duration) error {
 	deadline := time.Now().Add(budget)
 	start := time.Now()
@@ -1178,9 +1171,9 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	var timeToFirst time.Duration
 	sawFirst := false
 
-	// Flush results from an earlier render's last in-flight demand.
-	// Everything drained after this point was produced with this
-	// render's map state.
+	// Flush results from an earlier render. Its waiting demand was
+	// ended by that render's barrier, so everything drained after this
+	// point was produced with this render's map state.
 	for {
 		stale, err := w.drainFrames()
 		if err != nil {
@@ -1196,21 +1189,15 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	default:
 	}
 
-	outstanding := 0
-	// wantDemand latches a work signal (update event or repaint) until a
-	// demand can carry it. Dropping a signal that arrives while a demand
-	// is in flight stalls the still: if that in-flight demand resolves
-	// NoUpdate, the map does not republish the update it already sent.
-	wantDemand := false
-	rendered := false
+	outstanding := false
 	completed := false
 
-	issue := func() error {
+	arm := func() error {
 		w.frameToken++
 		demand := maplibre.FrameDemand{
-			Flags:              maplibre.FrameDemandFlagIfNeeded,
+			Flags:              maplibre.FrameDemandFlagIfNeeded | maplibre.FrameDemandFlagWaitForUpdate,
 			Token:              w.frameToken,
-			CoalescingBoundary: w.frameToken,
+			CoalescingBoundary: stillDemandBoundary,
 		}
 		if err := w.sess.RequestFrame(demand); err != nil {
 			return fmt.Errorf("renderer: still image: request frame: %w", err)
@@ -1218,13 +1205,12 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		if serviceTrace {
 			fmt.Fprintf(os.Stderr, "TRACE +%6dus demand token=%d\n", time.Since(start).Microseconds(), demand.Token)
 		}
-		outstanding++
+		outstanding = true
 		demands++
 		return nil
 	}
 
-	// Kick the first frame: the initial map state is the first "update".
-	if err := issue(); err != nil {
+	if err := arm(); err != nil {
 		return err
 	}
 
@@ -1244,24 +1230,24 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		}
 		for _, res := range results {
 			if serviceTrace {
-				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d repaint=%t\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition, res.NeedsRepaint)
+				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition)
 			}
 			progressed = true
 			if !sawFirst {
 				timeToFirst = time.Since(start)
 				sawFirst = true
 			}
-			outstanding = 0
+			if res.Token == w.frameToken {
+				outstanding = false
+			}
 			if services.GlobalMetrics != nil {
 				services.GlobalMetrics.IncRendererStillFrameResult(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, dispositionLabel(res.Disposition))
 			}
-			if res.Disposition == maplibre.RenderResultRendered {
-				rendered = true
-				// A rendered frame that still needs repaint has more to
-				// draw: demand the follow-up pass.
-				if res.NeedsRepaint {
-					wantDemand = true
-				}
+			switch res.Disposition {
+			case maplibre.RenderResultTargetNotReady:
+				return fmt.Errorf("renderer: still image: render target not ready")
+			case maplibre.RenderResultDeadlineMissed:
+				return fmt.Errorf("renderer: still image: frame demand deadline missed")
 			}
 		}
 
@@ -1278,10 +1264,6 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				return fmt.Errorf("renderer: map loading failed: %s", ev.Message)
 			case maplibre.RuntimeEventTypeMapRenderError:
 				return fmt.Errorf("renderer: map render error: %s", ev.Message)
-			case maplibre.RuntimeEventTypeMapRenderUpdateAvailable:
-				// The map has state or queued render-thread work; answer
-				// with a frame demand.
-				wantDemand = true
 			}
 		}
 
@@ -1292,8 +1274,6 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 					fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d still COMPLETED\n", time.Since(start).Microseconds(), iterations)
 				}
 				completed = true
-				// Failure surfaces immediately; success still needs the
-				// rendered frame result observed above.
 				if _, err := still.Await(ctx); err != nil {
 					return fmt.Errorf("renderer: still image: %w", err)
 				}
@@ -1301,7 +1281,16 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			}
 		}
 
-		if completed && rendered {
+		if completed {
+			barrier, err := w.sess.Barrier()
+			if err != nil {
+				return fmt.Errorf("renderer: still image: barrier: %w", err)
+			}
+			barrierStart := time.Now()
+			if _, err := barrier.Await(ctx); err != nil {
+				return fmt.Errorf("renderer: still image: barrier: %w", err)
+			}
+			totalWait += time.Since(barrierStart)
 			if services.GlobalMetrics != nil {
 				services.GlobalMetrics.RecordRendererPumpBreakdown(
 					w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
@@ -1315,15 +1304,12 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			return nil
 		}
 
-		// Issue a demand when the map signalled work this turn (update
-		// event or a rendered-but-repaint frame), unless the still has
-		// already completed — then we only await the final rendered
-		// result, demanding nothing new.
-		if !completed && wantDemand && outstanding == 0 {
-			if err := issue(); err != nil {
+		// Keep one waiting demand armed while the still is pending: a
+		// result means the previous demand is spent.
+		if !outstanding {
+			if err := arm(); err != nil {
 				return err
 			}
-			wantDemand = false
 		}
 
 		if !progressed {
@@ -1333,37 +1319,21 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			// missed-wake insurance, not pacing, so it is generous.
 			waitStart := time.Now()
 			timer := time.NewTimer(50 * time.Millisecond)
-			if completed {
-				// No new demands once completed; just wait for the
-				// rendered result's wake.
-				select {
-				case <-w.wake:
-				case <-timer.C:
-				case <-ctx.Done():
-					timer.Stop()
-					totalWait += time.Since(waitStart)
-					return ctx.Err()
-				}
-			} else {
-				select {
-				case <-w.wake:
-				case <-still.Done():
-				case <-timer.C:
-					// A quiet park with nothing in flight means a work
-					// signal was lost or never sent; an IF_NEEDED
-					// keep-alive demand bounds that to one timer period
-					// instead of the render timeout.
-					if outstanding == 0 {
-						wantDemand = true
-						if services.GlobalMetrics != nil {
-							services.GlobalMetrics.IncRendererStillKeepalive(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
-						}
+			select {
+			case <-w.wake:
+			case <-still.Done():
+			case <-timer.C:
+				if !outstanding {
+					// Unreachable while every result re-arms; counted
+					// so a regression in that invariant is visible.
+					if services.GlobalMetrics != nil {
+						services.GlobalMetrics.IncRendererStillKeepalive(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
 					}
-				case <-ctx.Done():
-					timer.Stop()
-					totalWait += time.Since(waitStart)
-					return ctx.Err()
 				}
+			case <-ctx.Done():
+				timer.Stop()
+				totalWait += time.Since(waitStart)
+				return ctx.Err()
 			}
 			timer.Stop()
 			totalWait += time.Since(waitStart)

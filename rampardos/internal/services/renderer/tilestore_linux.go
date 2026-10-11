@@ -389,5 +389,8 @@ func (s *TileStore) Provide(req maplibre.ResourceRequest, h *maplibre.ResourceRe
 	if cerr := h.Complete(response); cerr != nil && services.GlobalMetrics != nil {
 		services.GlobalMetrics.RecordTileProviderRequest("error", 0)
 	}
+	// A handled request's handle is ours to release once completed; the
+	// pass-through path above must not touch it.
+	_ = h.Close()
 	return maplibre.ResourceProviderDecisionHandle
 }

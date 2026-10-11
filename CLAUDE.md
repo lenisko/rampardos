@@ -40,27 +40,22 @@ visible in the code.
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
 - **Executor-binding still invariants** (`goWorker.awaitStill`, the
-  core-worker driver): a static-mode map renders only on demand, and
-  the await is update-driven — it issues exactly one IF_NEEDED frame
-  demand per `MapRenderUpdateAvailable` runtime event, plus one per
-  rendered frame that reports `NeedsRepaint`. The map itself signals
-  when it has work (style/tile arrival), so there is never more than a
-  single outstanding demand and the CoalescingBoundary supersede rule
-  is moot. This replaced an earlier speculative two-deep pipeline; the
-  reactive shape needs **both** wakes feeding the park: the session's
-  FrameWake (a frame result landed) and the runtime's EventWake (the
-  queue became nonempty — a new update to demand against). Both share
-  one non-blocking channel; the loop parks on it, the still, and a 50ms
-  timer that is missed-wake insurance only (no pacing tick), and parks
-  only when nothing drained this turn. A work signal that arrives while
-  a demand is in flight must be latched and issued once that demand
-  resolves — dropping it stalls the still to the render timeout, since
-  the map does not republish an update it already sent. A quiet timer
-  expiry with nothing in flight issues a keep-alive IF_NEEDED demand
-  for the same reason. Still completion arrives via its
-  Future, not the still-image event. The upfront flush discards a prior
-  render's last in-flight result; with one demand outstanding there is
-  no pre-pipeline leftover to draw the next render's first pass.
+  core-worker driver): a static-mode map renders only on demand. The
+  await keeps exactly one frame demand armed with
+  `IF_NEEDED | WAIT_FOR_UPDATE` and a fixed CoalescingBoundary, and
+  re-arms it on every result. A demand that finds nothing new waits
+  inside the binding and reruns on the map's next update, so the host
+  never subscribes to update events and never sees NoUpdate churn; the
+  fixed boundary means a newer demand supersedes a waiting one instead
+  of queueing. When the still's Future completes, a session `Barrier`
+  is issued and awaited: it ends the demand left waiting (else the next
+  render's camera update wakes it and its frame lands before that
+  render's flush) and orders the readback after the completing frame.
+  TargetNotReady / DeadlineMissed results fail the render rather than
+  re-arming into a spin. FrameWake and the runtime EventWake share one
+  non-blocking channel; the park selects on it, the still, and a 50ms
+  timer that is missed-wake insurance only. The event mask carries only
+  the two failure events.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   future can never complete on its own in static mode; resize is

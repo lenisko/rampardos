@@ -391,7 +391,7 @@ func newMetricsManager() *MetricsManager {
 		}, []string{"style", "scale", "disposition"}),
 		rendererStillKeepalives: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_still_keepalive_total",
-			Help: "Times the still await's 50ms missed-wake insurance expired with no demand in flight and issued a keep-alive demand. Each one cost up to 50ms of render time; a healthy loop keeps this near zero.",
+			Help: "Times the still await's 50ms missed-wake insurance expired with no frame demand armed. The await re-arms a waiting demand on every result, so this should stay at zero; a non-zero count means that invariant broke.",
 		}, []string{"style", "scale"}),
 
 		rendererReadback: promauto.NewHistogramVec(prometheus.HistogramOpts{
