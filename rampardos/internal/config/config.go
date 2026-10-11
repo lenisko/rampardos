@@ -51,7 +51,8 @@ type Config struct {
 	ImageQuality            int    // JPEG/WebP quality 1-100 (default: 90)
 	MarkerImageCacheSize    int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
 	TileImageCacheSize      int    // Max decoded tile images to cache in memory (default: 500, 0 disables). Each entry is ~256 KB (256x256 NRGBA); 500 ≈ 128 MB.
-	CompositeImageCacheSize int    // Max base+staticmap images cached in memory (default: 200, 0 disables). Each entry ~640 KB for 400×400 NRGBA; 200 ≈ 128 MB.
+	CompositeImageCacheMB   int    // Byte budget for base/staticmap/multistaticmap images cached in memory, in MB of decoded pixels (default: 256, 0 disables). Entries vary ~0.5 MB (scale=1 staticmap) to tens of MB (scale=2 multistaticmap), so this is the real bound.
+	CompositeImageCacheSize int    // Secondary cap on composite cache entry count (default: 1000, 0 disables).
 
 	// Experimental features
 	ExperimentalGSat bool // Enable Google Satellite external style
@@ -116,7 +117,8 @@ func Load() *Config {
 		ImageQuality:            getEnvInt("IMAGE_QUALITY", 90),
 		MarkerImageCacheSize:    getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
 		TileImageCacheSize:      getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
-		CompositeImageCacheSize: getEnvInt("COMPOSITE_IMAGE_CACHE_SIZE", 200),
+		CompositeImageCacheMB:   getEnvInt("COMPOSITE_IMAGE_CACHE_MB", 256),
+		CompositeImageCacheSize: getEnvInt("COMPOSITE_IMAGE_CACHE_SIZE", 1000),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),
 

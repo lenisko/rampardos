@@ -173,7 +173,7 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	basePath := staticMap.BasePath()
 
 	if !nocache && services.GlobalCompositeImageCache != nil {
-		if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+		if cached, ok := services.GlobalCompositeImageCache.Get(services.CompositeKindFinal, path); ok {
 			return cached, true, nil
 		}
 	}
@@ -188,8 +188,10 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 	}
 	genCtx := context.WithoutCancel(ctx)
 	v, err, _ := h.sfg.Do(path, func() (any, error) {
+		// Recheck, not Get: the fast path above already counted this
+		// request's lookup in the hit/miss metrics.
 		if !nocache && services.GlobalCompositeImageCache != nil {
-			if cached, ok := services.GlobalCompositeImageCache.Get(path); ok {
+			if cached, ok := services.GlobalCompositeImageCache.Recheck(path); ok {
 				return sfgResult{img: cached, cached: true}, nil
 			}
 		}
@@ -198,7 +200,7 @@ func (h *StaticMapHandler) GenerateStaticMap(ctx context.Context, staticMap mode
 			return nil, err
 		}
 		if services.GlobalCompositeImageCache != nil {
-			services.GlobalCompositeImageCache.Add(path, img)
+			services.GlobalCompositeImageCache.Add(services.CompositeKindFinal, path, img)
 		}
 		return sfgResult{img: img, cached: false}, nil
 	})
@@ -362,14 +364,14 @@ func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.Stat
 	// the read to force a fresh render; sfg still dedupes concurrent
 	// siblings and the result is still written back.
 	if !nocache && services.GlobalCompositeImageCache != nil {
-		if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
+		if img, ok := services.GlobalCompositeImageCache.Get(services.CompositeKindBase, basePath); ok {
 			return img, nil
 		}
 	}
 
 	v, err, _ := h.baseSfg.Do(basePath, func() (any, error) {
 		if !nocache && services.GlobalCompositeImageCache != nil {
-			if img, ok := services.GlobalCompositeImageCache.Get(basePath); ok {
+			if img, ok := services.GlobalCompositeImageCache.Recheck(basePath); ok {
 				return img, nil
 			}
 		}
@@ -378,7 +380,7 @@ func (h *StaticMapHandler) ensureBase(ctx context.Context, staticMap models.Stat
 			return nil, err
 		}
 		if services.GlobalCompositeImageCache != nil {
-			services.GlobalCompositeImageCache.Add(basePath, img)
+			services.GlobalCompositeImageCache.Add(services.CompositeKindBase, basePath, img)
 		}
 		return img, nil
 	})

@@ -131,7 +131,8 @@ centre. Full reference: `rampardos/internal/config/config.go`.
 | `MARKER_CACHE_MAX_AGE_MINUTES` | TTL for marker image cache | `1440` (1 day) |
 | `MARKER_IMAGE_CACHE_SIZE` | Resized marker images cached in RAM | `2000` |
 | `TILE_IMAGE_CACHE_SIZE` | Decoded tile images cached in RAM | `500` |
-| `COMPOSITE_IMAGE_CACHE_SIZE` | Composited base+staticmap images in RAM | `200` |
+| `COMPOSITE_IMAGE_CACHE_MB` | RAM budget (decoded pixels) for base, staticmap and multistaticmap images | `256` |
+| `COMPOSITE_IMAGE_CACHE_SIZE` | Secondary cap on the number of those images | `1000` |
 | `TILE_URL_<name>` | External XYZ tile URL template (e.g. `TILE_URL_MY_TILES=https://...`) | — |
 | `RENDERER_POOL_SIZE` | Renderer worker count per style (0 = NumCPU) | `0` |
 | `STYLE_POOL_SIZE` | Max styles kept live at once (0 = unbounded) | `0` |
