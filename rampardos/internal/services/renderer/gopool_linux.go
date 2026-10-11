@@ -1093,9 +1093,11 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		services.GlobalMetrics.RecordRendererReadback(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, readDur.Seconds())
 	}
 
-	out := image.NewNRGBA(image.Rect(0, 0, physW, physH))
-	unpremultiplyRGBA(out.Pix, tr.Data)
-	return out, nil
+	// The binding hands back a Go-owned copy of the pixels, so convert
+	// it in place and use it as the image rather than allocating a
+	// second frame-sized buffer.
+	unpremultiplyRGBA(tr.Data)
+	return &image.NRGBA{Pix: tr.Data, Stride: physW * 4, Rect: image.Rect(0, 0, physW, physH)}, nil
 }
 
 // settleAbandonedStill drives an abandoned still request to completion,
@@ -1376,24 +1378,5 @@ func dispositionLabel(d maplibre.RenderResult) string {
 		return "deadline_missed"
 	default:
 		return "other"
-	}
-}
-
-// unpremultiplyRGBA converts premultiplied RGBA bytes (binding output)
-// to non-premultiplied RGBA (image.NRGBA layout). Pure byte loop — hot
-// enough on the render path that we keep the implementation inline.
-func unpremultiplyRGBA(dst, src []byte) {
-	for i := 0; i < len(src); i += 4 {
-		r, g, b, a := src[i], src[i+1], src[i+2], src[i+3]
-		switch a {
-		case 0, 255:
-			dst[i+0], dst[i+1], dst[i+2], dst[i+3] = r, g, b, a
-		default:
-			ai := uint32(a)
-			dst[i+0] = byte((uint32(r)*255 + ai/2) / ai)
-			dst[i+1] = byte((uint32(g)*255 + ai/2) / ai)
-			dst[i+2] = byte((uint32(b)*255 + ai/2) / ai)
-			dst[i+3] = a
-		}
 	}
 }

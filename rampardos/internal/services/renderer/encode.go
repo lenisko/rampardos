@@ -92,3 +92,19 @@ func encodeRGBAImage(img *image.NRGBA, format models.ImageFormat) ([]byte, error
 	}
 	return buf.Bytes(), nil
 }
+
+// unpremultiplyRGBA converts premultiplied RGBA bytes (binding output)
+// to non-premultiplied RGBA (image.NRGBA layout) in place. Pure byte
+// loop — hot enough on the render path that we keep it inline.
+func unpremultiplyRGBA(pix []byte) {
+	for i := 0; i < len(pix); i += 4 {
+		a := pix[i+3]
+		if a == 0 || a == 255 {
+			continue
+		}
+		ai := uint32(a)
+		pix[i+0] = byte((uint32(pix[i+0])*255 + ai/2) / ai)
+		pix[i+1] = byte((uint32(pix[i+1])*255 + ai/2) / ai)
+		pix[i+2] = byte((uint32(pix[i+2])*255 + ai/2) / ai)
+	}
+}
