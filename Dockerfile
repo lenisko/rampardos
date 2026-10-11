@@ -281,17 +281,16 @@ RUN PKG_CONFIG_PATH=/ffi/install/share/pkgconfig CGO_ENABLED=1 \
 # ================================
 # Final runtime image
 # ================================
-# Ubuntu 24.04 (not Debian Bookworm) because maplibre-native's prebuilt
-# mbgl.node requires glibc ≥ 2.38 and GLIBCXX ≥ 3.4.32, which Debian 12
-# (glibc 2.36) does not provide. Ubuntu 24.04 ships glibc 2.39.
+# The runtime glibc must cover the symbol versions the Go binary picks up
+# from rampardos-build (golang:1.26, Debian trixie, glibc 2.41); today it
+# references nothing newer than GLIBC_2.34. libmaplibre-native-c.so is
+# built with `zig cc` against glibc 2.17. Ubuntu 24.04 ships glibc 2.39.
 FROM --platform=$TARGETPLATFORM ubuntu:24.04 AS runtime
 WORKDIR /app
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates \
-    # maplibre-native (Node binding) runtime deps — Mesa/OpenGL headless
-    libglx0 libgl1 libegl1 libgbm1 libopengl0 \
     # maplibre-native (Go binding via FFI) runtime deps — Mesa EGL with
     # the llvmpipe software DRI driver for fully headless render. EGL
     # surfaceless platform is selected via EGL_PLATFORM=surfaceless below.
@@ -299,7 +298,7 @@ RUN apt-get update \
     # directly (DT_NEEDED on libmaplibre-native-c.so), where the previous
     # fork build did not — without it the binary fails at load with
     # "libGLESv2.so.2: cannot open shared object file".
-    libegl-mesa0 libgl1-mesa-dri libgles2 \
+    libegl1 libegl-mesa0 libgl1-mesa-dri libgles2 \
     # fontnik / build-glyphs (admin font processing) runs on Node and
     # needs these; libmaplibre-native-c.so itself links only EGL/GLES/libc
     # because upstream vendors ICU and static-links libuv and zlib.
@@ -324,11 +323,11 @@ RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
 # maplibre-native-ffi shared library. Reached only via the chain
 #     rampardos (DT_RPATH=/opt/rampardos/lib)
 #       → libmaplibre-native-c.so (DT_RPATH=$ORIGIN, set in mln-ffi-build)
-# so the Node binding's mbgl.node and any other process that doesn't load
-# libmaplibre-native-c.so resolves its deps from /usr/lib/<triple>/ as
-# Ubuntu intended. Earlier revisions registered /opt/rampardos/lib with
-# ldconfig globally, which shadowed Ubuntu's libpng for everything else in
-# the image — fontnik's node addon aborted on a version mismatch.
+# so any process that doesn't load libmaplibre-native-c.so resolves its
+# deps from /usr/lib/<triple>/ as Ubuntu intended. Earlier revisions
+# registered /opt/rampardos/lib with ldconfig globally, which shadowed
+# Ubuntu's libpng for everything else in the image — fontnik's node addon
+# aborted on a version mismatch.
 #
 # The published artifact carries RUNPATH=$ORIGIN already and needs only
 # libc, libm, libpthread and libdl — EGL is resolved through upstream's
