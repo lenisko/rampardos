@@ -30,7 +30,8 @@ RUN git clone --depth 1 -b 1.36.0 https://github.com/mapbox/tippecanoe.git \
     && make -j$(nproc) LDFLAGS="-static -static-libgcc -static-libstdc++" \
     && make install \
     && mkdir -p /tippecanoe-out \
-    && cp /usr/local/bin/tippecanoe* /usr/local/bin/tile-join /tippecanoe-out/
+    && cp /usr/local/bin/tippecanoe* /usr/local/bin/tile-join /tippecanoe-out/ \
+    && strip /tippecanoe-out/*
 
 # ================================
 # Build fontnik / build-glyphs (for font processing in admin)
