@@ -9,6 +9,7 @@ import (
 	_ "image/gif"
 	"image/jpeg"
 	"log/slog"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -336,7 +337,9 @@ func drawMarkerNRGBA(canvas *image.NRGBA, staticMap models.StaticMap, marker mod
 			return
 		}
 		if targetWidth > 0 && targetHeight > 0 {
-			markerImg = resizeImage(markerImg, targetWidth, targetHeight)
+			mb := markerImg.Bounds()
+			w, h := fitMarkerSize(mb.Dx(), mb.Dy(), targetWidth, targetHeight)
+			markerImg = resizeImage(markerImg, w, h)
 			if services.GlobalCacheIndex != nil {
 				services.GlobalCacheIndex.AddMarkerImage(markerPath, targetWidth, targetHeight, markerImg)
 			}
@@ -599,6 +602,22 @@ func loadImageWithRetry(path string, redownload TileRedownloader) (image.Image, 
 		}
 	}
 	return img, err
+}
+
+// fitMarkerSize returns the size that fits a srcW×srcH image inside a
+// boxW×boxH marker box without changing its aspect ratio, enlarging or
+// shrinking as needed. This is ImageMagick's `-resize WxH` geometry,
+// which SwiftTileserverCache used for markers; tightly cropped sprites
+// would otherwise be stretched to the box. The marker is still centred
+// on its point, so the box acts as a bound, not an exact size.
+func fitMarkerSize(srcW, srcH, boxW, boxH int) (int, int) {
+	if srcW <= 0 || srcH <= 0 {
+		return boxW, boxH
+	}
+	f := math.Min(float64(boxW)/float64(srcW), float64(boxH)/float64(srcH))
+	w := max(1, int(math.Round(f*float64(srcW))))
+	h := max(1, int(math.Round(f*float64(srcH))))
+	return min(w, boxW), min(h, boxH)
 }
 
 // resizeImage resizes an image to the target dimensions
