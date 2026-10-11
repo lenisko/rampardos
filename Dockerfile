@@ -298,11 +298,11 @@ RUN apt-get update \
     # directly (DT_NEEDED on libmaplibre-native-c.so), where the previous
     # fork build did not — without it the binary fails at load with
     # "libGLESv2.so.2: cannot open shared object file".
+    # libmaplibre-native-c.so itself links only EGL/GLES/libc because
+    # upstream vendors ICU and static-links libuv and zlib, and
+    # build-glyphs needs only libc/libstdc++, so no image or network
+    # libraries are installed for either.
     libegl1 libegl-mesa0 libgl1-mesa-dri libgles2 \
-    # fontnik / build-glyphs (admin font processing) runs on Node and
-    # needs these; libmaplibre-native-c.so itself links only EGL/GLES/libc
-    # because upstream vendors ICU and static-links libuv and zlib.
-    libcurl4 libjpeg8 libwebp7 libpng16-16 libicu74 \
     # SQLite — mbgl's mbtiles file source reads the dataset directly
     libsqlite3-0 \
  && rm -rf /var/lib/apt/lists/*
