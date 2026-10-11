@@ -78,6 +78,10 @@ RUN rm -rf \
         /fontnik/node_modules/.cache \
     && find /fontnik/node_modules -type f \( -name "*.md" -o -name "*.ts" -o -name "*.map" -o -name "LICENSE*" -o -name "README*" -o -name "CHANGELOG*" \) -delete \
     && find /fontnik/node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" -o -name "example" -o -name "examples" \) -exec rm -rf {} + 2>/dev/null || true
+# The runtime takes its node from here so build-glyphs runs on the same
+# Node ABI the addon was built against. node needs only libc, libstdc++
+# and libgcc_s, which the runtime base provides at newer versions.
+RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 
 # ================================
 # maplibre-native-ffi — the C ABI shared library the in-process Go
@@ -285,10 +289,7 @@ WORKDIR /app
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
-    # Node.js via NodeSource
- && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
+    ca-certificates \
     # maplibre-native (Node binding) runtime deps — Mesa/OpenGL headless
     libglx0 libgl1 libegl1 libgbm1 libopengl0 \
     # maplibre-native (Go binding via FFI) runtime deps — Mesa EGL with
@@ -305,14 +306,14 @@ RUN apt-get update \
     libcurl4 libjpeg8 libwebp7 libpng16-16 libicu74 \
     # SQLite — mbgl's mbtiles file source reads the dataset directly
     libsqlite3-0 \
- && apt-get purge -y curl \
- && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
 # Tippecanoe binaries (tile-join for mbtiles operations)
 COPY --from=tippecanoe-build /tippecanoe-out/ /usr/local/bin/
 
-# Fontnik (build-glyphs for font processing)
+# Fontnik (build-glyphs for font processing), with the node it was built
+# against — build-glyphs is the only Node consumer left in the image.
+COPY --from=fontnik-build /node-stripped /usr/bin/node
 COPY --from=fontnik-build /fontnik /app/fontnik
 RUN if [ -x /app/fontnik/bin/build-glyphs ]; then \
       ln -s /app/fontnik/bin/build-glyphs /usr/local/bin/build-glyphs; \
