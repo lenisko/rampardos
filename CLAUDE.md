@@ -72,9 +72,10 @@ visible in the code.
   the two failure events.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
-  future can never complete on its own in static mode; resize is
-  started and the next still's demand loop drives it — never await a
-  bare resize before a still. `DrainFrameResults` returns a nil batch and
+  on a static map completes once the driver applies the extent (since
+  FFI `f416c4f3`; before it, the future stranded until a still drove
+  it). The worker still starts it, runs the still, then checks its
+  completion — that ordering stays correct either way. `DrainFrameResults` returns a nil batch and
   no error when the queue is empty (the binding maps NOT_READY to
   absence) — check for nil before using the batch. There is no cancel for a pending still and
   the map refuses a second one — an abandoned still must be settled by

@@ -1005,12 +1005,11 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	wantScale := float64(scale)
 	var resize *maplibre.Future[maplibre.CommandCompletion]
 	if wantW != w.curW || wantH != w.curH || wantScale != w.curScale {
-		// Resize applies the extent and updates the map viewport. The
-		// future only completes once a frame is produced at the new
-		// extent (a static-mode map publishes no update without a
-		// pending still), so rather than awaiting it here, let the still
-		// image's demand loop below drive it to completion — session
-		// operations are ordered ahead of the still's frames.
+		// Resize applies the extent and updates the map viewport. On a
+		// static map the driver applies it without waiting for a map
+		// update, and the next still renders at the new extent; session
+		// operations are ordered ahead of the still's frames, so it is
+		// started here and its completion checked after the still.
 		f, err := w.sess.Resize(maplibre.LogicalExtent{
 			Width:       wantW,
 			Height:      wantH,
