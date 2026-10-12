@@ -56,6 +56,11 @@ type Request struct {
 	Z, X, Y int
 	Scale   uint8 // DPR / pixel ratio; typically 1 or 2. Implementations may reject larger values.
 	Format  models.ImageFormat
+	// TileSize is the logical tile edge in pixels: TileSizePx (512,
+	// also used when zero) or SmallTileSizePx (256). A 256 tile covers
+	// the same geographic extent as a 512 one, so labels and lines
+	// come out at the right size for 256-px web-map clients.
+	TileSize int
 }
 
 // ViewportRequest is an arbitrary map view.

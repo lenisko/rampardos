@@ -21,6 +21,7 @@ import (
 	"github.com/lenisko/rampardos/internal/models"
 	"github.com/lenisko/rampardos/internal/services"
 	png "github.com/lenisko/rampardos/internal/utils/pngfast"
+	xdraw "golang.org/x/image/draw"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
 )
@@ -229,10 +230,32 @@ func (npr *NodePoolRenderer) loadPool(id string, ratio int) (*stylePool, error) 
 // Render converts a tile request to a viewport, dispatches to the
 // appropriate pool, and encodes the raw RGBA result.
 func (npr *NodePoolRenderer) Render(ctx context.Context, req Request) ([]byte, error) {
-	vp := TileToViewport(req.Z, req.X, req.Y, req.Scale)
+	tileSize := NormalizeTileSize(req.TileSize)
+	if req.Z == 0 && tileSize < TileSizePx {
+		return npr.renderDownscaledWorldTile(ctx, req, tileSize)
+	}
+	vp := TileToViewport(req.Z, req.X, req.Y, req.Scale, tileSize)
 	vp.StyleID = req.StyleID
 	vp.Format = req.Format
 	return npr.renderViewportInternal(ctx, vp)
+}
+
+// renderDownscaledWorldTile serves a sub-512 tile at z=0. The small
+// tile path renders at zoom z-1, but MapLibre clamps zoom to its
+// minimum of 0, so the frame would show only part of the world.
+// Render the 512 world tile instead and resample it to size.
+func (npr *NodePoolRenderer) renderDownscaledWorldTile(ctx context.Context, req Request, tileSize int) ([]byte, error) {
+	vp := TileToViewport(0, 0, 0, req.Scale, TileSizePx)
+	vp.StyleID = req.StyleID
+	vp.Format = req.Format
+	full, err := npr.RenderViewportImage(ctx, vp)
+	if err != nil {
+		return nil, err
+	}
+	px := tileSize * int(vp.Scale)
+	small := image.NewNRGBA(image.Rect(0, 0, px, px))
+	xdraw.CatmullRom.Scale(small, small.Bounds(), full, full.Bounds(), xdraw.Src, nil)
+	return encodeRGBAImage(small, req.Format)
 }
 
 // RenderViewport dispatches an arbitrary viewport request directly,
@@ -261,9 +284,9 @@ func (npr *NodePoolRenderer) RenderViewportImage(ctx context.Context, req Viewpo
 	// Rewrite the caller's (web-map convention) zoom into the style's
 	// native tileSize convention before handing it to MapLibre. See
 	// styleZoomOffset for the full derivation. Not applied on the
-	// tile-render path — TileToViewport already produces a frame whose
-	// 512-pixel viewport matches MapLibre's native zoom unit for the
-	// common 512-tileSize case.
+	// tile-render path — TileToViewport already produces a frame
+	// (512 px at z, or 256 px at z-1) in MapLibre's native zoom unit
+	// for the common 512-tileSize case.
 	adjusted := req
 	adjusted.Zoom = req.Zoom - pool.cfg.viewportZoomAdj
 	slog.Debug("renderer viewport dispatch",

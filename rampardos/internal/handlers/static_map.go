@@ -529,7 +529,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 			idx := i
 			i++
 			go func() {
-				result, err := h.tileHandler.GenerateTile(ctx, staticMap.Style, zoom, tileX, tileY, scale, staticMap.GetFormat())
+				result, err := h.tileHandler.GenerateTile(ctx, staticMap.Style, zoom, tileX, tileY, scale, staticMap.GetFormat(), renderer.TileSizePx)
 				if err != nil {
 					results <- tileSlot{index: idx, err: err}
 					return
@@ -570,7 +570,7 @@ func (h *StaticMapHandler) generateBaseStaticMapFromTiles(ctx context.Context, s
 		tileStyle := strings.Join(parts[:len(parts)-4], "-")
 		tileFormat := models.ImageFormat(strings.TrimPrefix(ext, "."))
 
-		_, err := h.tileHandler.GenerateTile(ctx, tileStyle, tileZ, tileX, tileY, uint8(tileScale), tileFormat)
+		_, err := h.tileHandler.GenerateTile(ctx, tileStyle, tileZ, tileX, tileY, uint8(tileScale), tileFormat, renderer.TileSizePx)
 		return err
 	}
 
