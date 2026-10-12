@@ -33,12 +33,75 @@ visible in the code.
   `log2(tileSize/256)` from the user's zoom before dispatching, so a
   512-tileSize style sees `zoom-1` internally. See `styleZoomOffset`.
   The adjustment is only applied on the viewport path; `TileToViewport`
-  already produces a 512-pixel frame that matches MapLibre's native
-  units for the common 512-tileSize case, so tile rendering is already
-  correct.
+  already produces a frame in MapLibre's native units (512 px at `z`,
+  or 256 px at `z-1` for `?tileSize=256`) for the common 512-tileSize
+  case, so tile rendering is already correct.
+- **`/tile` output size.** Tiles are 512 logical px by default, which
+  256-px clients (Leaflet, OpenLayers) squeeze into a 256 slot, halving
+  label size. `?tileSize=256` renders a 256-px frame one MapLibre zoom
+  lower: same extent, labels sized for 256. Local styles only — external
+  styles are proxied and return 400. At `z=0` the `z-1` frame would be
+  clamped to MapLibre's minimum zoom and show part of the world, so
+  `Render` downsamples the 512 world tile instead.
+- **Tile cache filenames.** 512 tiles keep `style-z-x-y-scale.format`
+  so existing caches survive upgrades, and because `static_map.go`
+  (redownload) and `image_utils_native.go` (stitch grid) parse that
+  shape by splitting on `-`. Other sizes append `-<size>`
+  (`tileCachePath`). Static maps only stitch 512 tiles, so the parsers
+  never see a suffixed name — keep it that way or teach them the
+  suffix.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
+- **Executor-binding still invariants** (`goWorker.awaitStill`, the
+  core-worker driver): a static-mode map renders only on demand. The
+  await keeps exactly one frame demand armed with
+  `IF_NEEDED | WAIT_FOR_UPDATE` and a fixed CoalescingBoundary, and
+  re-arms it on every result. A demand that finds nothing new waits
+  inside the binding and reruns on the map's next update, so the host
+  never subscribes to update events and never sees NoUpdate churn; the
+  fixed boundary means a newer demand supersedes a waiting one instead
+  of queueing. When the still's Future completes, a session `Barrier`
+  is issued and awaited: it ends the demand left waiting (else the next
+  render's camera update wakes it and its frame lands before that
+  render's flush) and orders the readback after the completing frame.
+  TargetNotReady / DeadlineMissed results fail the render rather than
+  re-arming into a spin. FrameWake and the runtime EventWake share one
+  non-blocking channel; the park selects on it, the still, and a 50ms
+  timer that is missed-wake insurance only. The event mask carries only
+  the two failure events.
+  `RenderFrameFinished` events do not exist in static mode (mbgl gates
+  them to Continuous) — don't build logic on them. A session `Resize`
+  on a static map completes once the driver applies the extent (since
+  FFI `f416c4f3`; before it, the future stranded until a still drove
+  it). The worker still starts it, runs the still, then checks its
+  completion — that ordering stays correct either way. `DrainFrameResults` returns a nil batch and
+  no error when the queue is empty (the binding maps NOT_READY to
+  absence) — check for nil before using the batch. There is no cancel for a pending still and
+  the map refuses a second one — an abandoned still must be settled by
+  driving the same await (bounded), else the worker is poisoned.
+  Blocking `Future.Await` is safe under the core-worker driver; the
+  caller-graphics-thread driver self-deadlocks on it — do not
+  reintroduce that driver without restoring a host service loop.
+
+## Tile provider (shared renderer resource provider)
+
+- One process-wide `TileStore` (SQLite pool + byte-bounded LRU of
+  decompressed tiles) serves every worker via the binding's resource
+  provider; `RENDERER_TILE_PROVIDER=off` is the kill switch back to the
+  native mbtiles source, and any store-open failure degrades the same
+  way. `RENDERER_TILE_CACHE_MB` bounds the LRU (default 64).
+- The custom `rampardos://tile/` scheme is what routes tiles to the
+  provider: mbgl only consults providers for network-path URLs, so
+  styleprep inlines a TileJSON with that scheme instead of an
+  `mbtiles://` url. file:// glyphs/sprites never reach the provider.
+- The provider must return DECOMPRESSED tile bytes (mbgl's network path
+  assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
+  rows for the mbtiles query. maxzoom in the inline TileJSON is what
+  makes overzoom work.
+- Dataset activate/combine retargets the mbtiles symlink; ReloadStyles
+  reopens the store, drops the tile LRU, and rebuilds the inline
+  TileJSON before re-preparing styles.
 
 ## Cache intent: nocache, TTL, owned
 
