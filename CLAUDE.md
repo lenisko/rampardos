@@ -56,26 +56,34 @@ visible in the code.
 - **Executor-binding still invariants** (`goWorker.awaitStill`, the
   core-worker driver): a static-mode map renders only on demand. The
   await keeps exactly one frame demand armed with
-  `IF_NEEDED | WAIT_FOR_UPDATE` and a fixed CoalescingBoundary, and
-  re-arms it on every result. A demand that finds nothing new waits
-  inside the binding and reruns on the map's next update, so the host
-  never subscribes to update events and never sees NoUpdate churn; the
-  fixed boundary means a newer demand supersedes a waiting one instead
-  of queueing. When the still's Future completes, a session `Barrier`
-  is issued and awaited: it ends the demand left waiting (else the next
-  render's camera update wakes it and its frame lands before that
-  render's flush) and orders the readback after the completing frame.
-  TargetNotReady / DeadlineMissed results fail the render rather than
-  re-arming into a spin. FrameWake and the runtime EventWake share one
-  non-blocking channel; the park selects on it, the still, and a 50ms
-  timer that is missed-wake insurance only. The event mask carries only
-  the two failure events.
+  `IF_NEEDED | WAIT_FOR_UPDATE` and re-arms it on every result. A
+  demand that finds nothing new waits inside the binding and reruns on
+  the map's next update, so the host never subscribes to update events
+  and never sees NoUpdate churn; a newer demand with the same flags
+  supersedes a waiting one instead of queueing (FFI dropped the
+  explicit CoalescingBoundary for this rule in #760). When the still's
+  Future completes, a session `Barrier` is issued and awaited: it ends
+  the demand left waiting (else the next render's camera update wakes
+  it and its frame lands before that render's flush) and orders the
+  readback after the completing frame. TargetNotReady results fail the
+  render rather than re-arming into a spin. The park selects on the
+  FrameWake channel, the map-failure channel, the still, and a 50ms
+  timer that is missed-wake insurance only.
+- **Map failures arrive by push.** The runtime event handler
+  (`handleEvents`) runs on the runtime's native thread: it may only
+  filter and do a non-blocking send onto `mapErr` — no blocking, no
+  `Await`, no runtime calls that wait. Events are dropped until a
+  handler is set, so it is set before `CreateMap`. `awaitStill` does
+  not flush `mapErr` at render start: a failure from a style reload
+  (`SetStyleUrl` is not awaited) arrives between renders and must fail
+  the next one, as the old drained event queue did. The map's event
+  mask carries only the two failure events.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
-  on a static map completes once the driver applies the extent (since
-  FFI `f416c4f3`; before it, the future stranded until a still drove
-  it). The worker still starts it, runs the still, then checks its
-  completion — that ordering stays correct either way. `DrainFrameResults` returns a nil batch and
+  completes once the map and driver apply the extent and the map
+  publishes its snapshot. The worker
+  starts it, runs the still, then checks its completion — that
+  ordering stays correct either way. `DrainFrameResults` returns a nil batch and
   no error when the queue is empty (the binding maps NOT_READY to
   absence) — check for nil before using the batch. There is no cancel for a pending still and
   the map refuses a second one — an abandoned still must be settled by

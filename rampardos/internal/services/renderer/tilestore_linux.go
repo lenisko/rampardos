@@ -354,7 +354,7 @@ func parseTileURL(u string) (z, x, y uint32, ok bool) {
 // worker runtime. Only provider-scheme tile URLs are handled; anything
 // else (file:// glyphs and sprites never get here, external HTTP does)
 // passes through to native networking.
-func (s *TileStore) Provide(req maplibre.ResourceRequest, h *maplibre.ResourceRequestHandle) maplibre.ResourceProviderDecision {
+func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.ResourceRequestHandle) maplibre.ResourceProviderDecision {
 	u := ""
 	if req.RequestedUrl != nil {
 		u = *req.RequestedUrl

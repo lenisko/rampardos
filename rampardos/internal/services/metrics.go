@@ -414,7 +414,7 @@ func newMetricsManager() *MetricsManager {
 		}),
 		rendererStillFrameResults: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_still_frame_results_total",
-			Help: "Frame results drained by the still await, by disposition (rendered, no_update, size_pending, target_not_ready, superseded, deadline_missed). Non-rendered dispositions other than no_update wait on the map's next update to make progress.",
+			Help: "Frame results drained by the still await, by disposition (rendered, no_update, target_not_ready, superseded). Non-rendered dispositions other than no_update wait on the map's next update to make progress.",
 		}, []string{"style", "scale", "disposition"}),
 		rendererStillKeepalives: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_still_keepalive_total",

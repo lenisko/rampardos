@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=51f413c12f1041be85baa7ba9ecc7f2540981120
+ARG MLN_FFI_REV=24d95bfb4e6ec7478adbf8861d742a899b1a5b4f
 
 # ================================
 # Get Git commit SHA
@@ -87,11 +87,10 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 # maplibre-native-ffi — the C ABI shared library the in-process Go
 # renderer links against.
 #
-# TEMPORARILY building from source: MLN_FFI_REV points at the head of
-# upstream PR #631 (the native-executor rewrite), which has no published
-# artifact — the unstable-native-snapshot tag tracks main. Revert this
-# commit to return to artifact consumption once the PR merges and the
-# snapshot tag passes it. See
+# TEMPORARILY building from source: MLN_FFI_REV is the merge of upstream
+# PR #760 (generated bindings) on main, which the published
+# unstable-native-snapshot tag does not include yet. Return to artifact
+# consumption once the snapshot tag passes it. See
 # docs/superpowers/specs/2026-08-15-ffi-native-executor-conversion.md.
 #
 # The stage is the pre-artifact build resurrected against the PR-era
@@ -110,10 +109,10 @@ FROM ubuntu:24.04 AS mln-ffi-build
 ARG MLN_FFI_REPO=https://github.com/maplibre/maplibre-native-ffi
 ARG MLN_FFI_REV
 # Keep in sync with the FFI's mise.toml [vars] at MLN_FFI_REV.
-ARG MLN_CMAKE_VERSION=4.3.3
-ARG MLN_RUST_VERSION=1.95.0
-ARG MLN_CARGO_ABOUT_VERSION=0.9.1
-ARG MLN_ZIG_VERSION=0.16.0
+ARG MLN_CMAKE_VERSION=4.4.4
+ARG MLN_RUST_VERSION=1.99.1
+ARG MLN_CARGO_ABOUT_VERSION=0.9.2
+ARG MLN_ZIG_VERSION=0.17.0
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-c"]
