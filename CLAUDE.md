@@ -71,23 +71,40 @@ visible in the code.
   timer that is missed-wake insurance only.
 - **Map failures arrive by push.** The runtime event handler
   (`handleEvents`) runs on the runtime's native thread: it may only
-  filter and do a non-blocking send onto `mapErr` — no blocking, no
-  `Await`, no runtime calls that wait. Events are dropped until a
-  handler is set, so it is set before `CreateMap`. `awaitStill` does
-  not flush `mapErr` at render start: a failure from a style reload
-  (`SetStyleUrl` is not awaited) arrives between renders and must fail
-  the next one, as the old drained event queue did. The map's event
-  mask carries only the two failure events.
+  record state and do non-blocking sends — no blocking, no `Await`, no
+  runtime calls that wait. Events are dropped until a handler is set,
+  so it is set before `CreateMap`. The mask carries the two failures no
+  still reports by itself:
+  - A style that fails to load (parse error, missing file) fails only
+    the still pending at that moment; mbgl's `lastError` covers source
+    and sprite errors, not the style, so a still requested afterwards
+    never completes. The failure is therefore worker *state*
+    (`styleFailed`), not a one-shot signal: every render refuses
+    before requesting a still while it stands. It belongs to the
+    current style only if its event generation is past the generation
+    the style command committed at (`styleGen`, set by `setStyle`,
+    which awaits the commit — commit precedes the load). A one-shot
+    signal here meant a 15 s hang plus a poisoned worker on every
+    render after the first.
+  - A render error ends no still. It goes to `mapErr`, which is flushed
+    at render start: the map renders only for a still, so a leftover
+    belongs to a render that already failed on it.
+  `TestStyleFailureFailsStillFast` (integration tag) guards both.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   completes once the map and driver apply the extent and the map
-  publishes its snapshot. The worker
-  starts it, runs the still, then checks its completion — that
-  ordering stays correct either way. `DrainFrameResults` returns a nil batch and
+  publishes its snapshot. The worker starts it, runs the still, then
+  checks its completion; `curW/curH` track the extent from the resize's
+  *acceptance* (it applies even if that render fails), and any
+  uncertainty zeroes them so the next render resizes. The camera
+  command's completion is checked the same way — an uncommitted camera
+  would serve the previous view. `DrainFrameResults` returns a nil batch and
   no error when the queue is empty (the binding maps NOT_READY to
-  absence) — check for nil before using the batch. There is no cancel for a pending still and
-  the map refuses a second one — an abandoned still must be settled by
-  driving the same await (bounded), else the worker is poisoned.
+  absence) — check for nil before using the batch. There is no cancel
+  for a pending still and the map refuses a second one — an abandoned
+  still must be settled by driving the same await (bounded), else the
+  worker is poisoned. A still whose Future is already done (it failed)
+  needs no settling: don't poison for that.
   Blocking `Future.Await` is safe under the core-worker driver; the
   caller-graphics-thread driver self-deadlocks on it — do not
   reintroduce that driver without restoring a host service loop.
@@ -99,6 +116,14 @@ visible in the code.
   provider; `RENDERER_TILE_PROVIDER=off` is the kill switch back to the
   native mbtiles source, and any store-open failure degrades the same
   way. `RENDERER_TILE_CACHE_MB` bounds the LRU (default 64).
+- With the provider active, each worker runtime's mbgl ambient cache
+  is set to 0 (`RENDERER_AMBIENT_CACHE_MB` overrides). mbgl otherwise
+  keeps a per-worker copy of every tile and, before using it, asks the
+  provider to revalidate — which the provider answers by resending the
+  tile, so half the provider calls were duplicate deliveries. Off was
+  ~25% faster per render and ~20–130 MB lighter on the real-data smoke,
+  with identical PNGs. Raise it only for a local style with remote
+  (non-provider) sources, which would otherwise refetch every render.
 - The custom `rampardos://tile/` scheme is what routes tiles to the
   provider: mbgl only consults providers for network-path URLs, so
   styleprep inlines a TileJSON with that scheme instead of an

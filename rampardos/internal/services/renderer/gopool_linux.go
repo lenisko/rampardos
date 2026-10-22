@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lenisko/rampardos/internal/fileutil"
@@ -50,6 +51,10 @@ type GoPoolRenderer struct {
 	// of a native MBTilesFileSource per worker runtime. Nil when
 	// RENDERER_TILE_PROVIDER=off (falls back to mbtiles:// sources).
 	store *TileStore
+
+	// ambientCacheBytes is each worker runtime's mbgl ambient cache
+	// budget; negative leaves mbgl's default.
+	ambientCacheBytes int64
 
 	mu    sync.RWMutex
 	pools map[string]*goStylePool
@@ -110,11 +115,28 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 		}
 	}
 
+	// mbgl keeps an ambient cache per runtime: each worker holds its own
+	// copy of every tile it fetched and, before using one, asks the
+	// provider to revalidate it, which the provider answers by resending
+	// the tile. With the provider active its LRU already serves every
+	// worker, so the ambient cache costs a duplicate per worker and a
+	// second delivery for nothing. RENDERER_AMBIENT_CACHE_MB re-enables
+	// it for a local style that pulls remote sources. Negative leaves
+	// mbgl's default (the native mbtiles path bypasses the cache anyway).
+	ambientCacheBytes := int64(-1)
+	if store != nil {
+		ambientCacheBytes = 0
+	}
+	if v, err := strconv.Atoi(os.Getenv("RENDERER_AMBIENT_CACHE_MB")); err == nil && v >= 0 {
+		ambientCacheBytes = int64(v) << 20
+	}
+
 	r := &GoPoolRenderer{
-		cfg:   cfg,
-		sem:   semaphore.NewWeighted(int64(cfg.PoolSize)),
-		store: store,
-		pools: make(map[string]*goStylePool),
+		cfg:               cfg,
+		sem:               semaphore.NewWeighted(int64(cfg.PoolSize)),
+		store:             store,
+		ambientCacheBytes: ambientCacheBytes,
+		pools:             make(map[string]*goStylePool),
 	}
 	if services.GlobalMetrics != nil {
 		services.GlobalMetrics.SetRendererGlobalCapacity(cfg.PoolSize)
@@ -233,17 +255,18 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 	zoomAdj := styleZoomOffset(raw)
 
 	cfg := goStylePoolConfig{
-		store:           r.store,
-		styleID:         id,
-		scaleLabel:      strconv.Itoa(ratio),
-		viewportZoomAdj: zoomAdj,
-		poolSize:        r.cfg.StylePoolSize,
-		minPoolSize:     r.cfg.StylePoolMin,
-		idleTTL:         r.cfg.StylePoolIdleTTL,
-		ratio:           ratio,
-		styleURL:        "file://" + preparedPath,
-		startupTimeout:  r.cfg.StartupTimeout,
-		renderTimeout:   r.cfg.RenderTimeout,
+		store:             r.store,
+		ambientCacheBytes: r.ambientCacheBytes,
+		styleID:           id,
+		scaleLabel:        strconv.Itoa(ratio),
+		viewportZoomAdj:   zoomAdj,
+		poolSize:          r.cfg.StylePoolSize,
+		minPoolSize:       r.cfg.StylePoolMin,
+		idleTTL:           r.cfg.StylePoolIdleTTL,
+		ratio:             ratio,
+		styleURL:          "file://" + preparedPath,
+		startupTimeout:    r.cfg.StartupTimeout,
+		renderTimeout:     r.cfg.RenderTimeout,
 	}
 	return newGoStylePool(cfg)
 }
@@ -372,18 +395,21 @@ func (r *GoPoolRenderer) Close() error {
 // goStylePoolConfig captures the per-pool parameters. Pool members are
 // scale-segregated; ratio is therefore baked in at pool construction.
 type goStylePoolConfig struct {
-	store           *TileStore // shared tile provider; nil = native mbtiles path
-	styleID         string
-	scaleLabel      string
-	viewportZoomAdj float64
-	poolSize        int // ceiling: most workers this pool may hold
-	minPoolSize     int // floor: workers held even when idle
-	idleTTL         time.Duration
-	settleTimeout   time.Duration
-	ratio           int
-	styleURL        string // "file://<preparedPath>"
-	startupTimeout  time.Duration
-	renderTimeout   time.Duration
+	store *TileStore // shared tile provider; nil = native mbtiles path
+	// ambientCacheBytes is the runtime's mbgl ambient cache budget;
+	// negative leaves mbgl's default.
+	ambientCacheBytes int64
+	styleID           string
+	scaleLabel        string
+	viewportZoomAdj   float64
+	poolSize          int // ceiling: most workers this pool may hold
+	minPoolSize       int // floor: workers held even when idle
+	idleTTL           time.Duration
+	settleTimeout     time.Duration
+	ratio             int
+	styleURL          string // "file://<preparedPath>"
+	startupTimeout    time.Duration
+	renderTimeout     time.Duration
 }
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
@@ -784,10 +810,22 @@ type goWorker struct {
 	// into one pending token.
 	wake chan struct{}
 
-	// mapErr is fed by the runtime event handler with the map's loading
-	// and render failures. Buffered-1 + non-blocking send keeps the first
-	// failure until a render consumes it.
+	// mapErr is fed by the runtime event handler with the map's render
+	// errors. Buffered-1 + non-blocking send keeps the first one until
+	// the await consumes it.
 	mapErr chan error
+
+	// styleFailed is the latest style load failure the event handler
+	// saw. It is state, not a signal: mbgl fails only the still pending
+	// when a style fails to load, and a still requested afterwards waits
+	// for a style that never loads, so every render must refuse while it
+	// stands. It belongs to the current style only when reported after
+	// that style's command committed (generation > styleGen); a new style
+	// command clears it by moving styleGen past it.
+	styleFailed atomic.Pointer[styleFailure]
+	// styleGen is the map generation at which the current style command
+	// committed. Worker goroutine only.
+	styleGen uint64
 
 	curW     uint32
 	curH     uint32
@@ -844,13 +882,9 @@ func (w *goWorker) loop() {
 				return
 			}
 		case goWorkerCmdReload:
-			// SetStyleUrl is a command — the executor loads the style
-			// in the background and the next render observes completion
-			// or failure. Reply on the submission result so reload
-			// doesn't block renders; the command's own completion is
-			// deliberately not awaited.
-			_, err := w.m.SetStyleUrl(cmd.reload)
-			cmd.reply <- goWorkerResult{err: err}
+			// The load itself is not awaited: renders observe a failure
+			// through styleFailed.
+			cmd.reply <- goWorkerResult{err: w.setStyle(cmd.ctx, cmd.reload)}
 		}
 	}
 }
@@ -875,13 +909,24 @@ func (w *goWorker) init() error {
 
 	// Events are dropped until a handler is set, so it is set before the
 	// map exists. The handler runs on the runtime's native thread and
-	// must not block: it only forwards failures to mapErr.
+	// must not block: it only records style failures and forwards
+	// render errors.
 	f, err := w.rt.SetEventHandler(maplibre.RuntimeEventHandler{Callback: w.handleEvents})
 	if err != nil {
 		return fmt.Errorf("renderer: set event handler: %w", err)
 	}
 	if _, err := f.Await(startupCtx); err != nil {
 		return fmt.Errorf("renderer: set event handler: %w", err)
+	}
+
+	if w.pool.cfg.ambientCacheBytes >= 0 {
+		f, err := w.rt.SetMaximumAmbientCacheSize(uint64(w.pool.cfg.ambientCacheBytes))
+		if err != nil {
+			return fmt.Errorf("renderer: set ambient cache size: %w", err)
+		}
+		if _, err := f.Await(startupCtx); err != nil {
+			return fmt.Errorf("renderer: set ambient cache size: %w", err)
+		}
 	}
 
 	if w.pool.cfg.store != nil {
@@ -896,20 +941,21 @@ func (w *goWorker) init() error {
 
 	// MapModeStatic is the render-once mode; the executor disables the
 	// animation tick and aligns with our request/reply pattern. The event
-	// mask carries only the two failure events the still await fails fast
-	// on: frame demands wait for map updates inside the binding, and
-	// still completion arrives via its Future.
+	// mask carries the two failures no still reports by itself: a style
+	// that fails to load fails only the still pending at that moment (see
+	// styleFailed), and a render error ends no still. Frame demands wait
+	// for map updates inside the binding, and still completion arrives
+	// via its Future.
 	w.curW, w.curH, w.curScale = 256, 256, float64(w.pool.cfg.ratio)
-	mapFuture, err := w.rt.CreateMap(maplibre.MapOptions{
-		InitialExtent: maplibre.LogicalExtent{
-			Width:       w.curW,
-			Height:      w.curH,
-			ScaleFactor: w.curScale,
-		},
-		MapMode: maplibre.MapModeStatic,
-		EventMask: maplibre.RuntimeEventMaskMapLoadingFailed |
-			maplibre.RuntimeEventMaskMapRenderError,
-	})
+	opts := maplibre.DefaultMapOptions()
+	opts.InitialExtent = maplibre.LogicalExtent{
+		Width:       w.curW,
+		Height:      w.curH,
+		ScaleFactor: w.curScale,
+	}
+	opts.MapMode = maplibre.MapModeStatic
+	opts.EventMask = maplibre.RuntimeEventMaskMapLoadingFailed | maplibre.RuntimeEventMaskMapRenderError
+	mapFuture, err := w.rt.CreateMap(opts)
 	if err != nil {
 		return fmt.Errorf("renderer: new map: %w", err)
 	}
@@ -929,6 +975,10 @@ func (w *goWorker) init() error {
 		default:
 		}
 	}
+	attachOpts := maplibre.DefaultRenderSessionAttachOptions()
+	attachOpts.Driver = maplibre.RenderDriverKindCoreWorker
+	attachOpts.RequestedTextureRingDepth = 1
+	attachOpts.FrameWake = maplibre.Wake{Callback: wakeCallback}
 	attach, err := w.m.AttachOpenglOwnedTexture(
 		maplibre.OpenglOwnedTextureDescriptor{
 			Extent: maplibre.LogicalExtent{
@@ -938,11 +988,7 @@ func (w *goWorker) init() error {
 			},
 			Context: w.egl.descriptor(),
 		},
-		maplibre.RenderSessionAttachOptions{
-			Driver:                    maplibre.RenderDriverKindCoreWorker,
-			RequestedTextureRingDepth: 1,
-			FrameWake:                 maplibre.Wake{Callback: wakeCallback},
-		},
+		attachOpts,
 	)
 	if err != nil {
 		return fmt.Errorf("renderer: attach OpenGL owned texture render target: %w", err)
@@ -960,13 +1006,45 @@ func (w *goWorker) init() error {
 		return fmt.Errorf("renderer: attached session does not grant readback; cannot render stills")
 	}
 
-	// Style loading proceeds on the native executor; the first render
-	// observes any failure via MapLoadingFailed. Worker reports ready
-	// as soon as the binding state is constructed.
-	if _, err := w.m.SetStyleUrl(w.pool.cfg.styleURL); err != nil {
+	// Style loading proceeds on the native executor; a failure reaches
+	// renders through styleFailed. Worker reports ready once the map
+	// adopts the URL.
+	return w.setStyle(startupCtx, w.pool.cfg.styleURL)
+}
+
+// styleFailure is a style load failure and the map generation that
+// reported it.
+type styleFailure struct {
+	generation uint64
+	message    string
+}
+
+// styleErr reports whether the current style failed to load.
+func (w *goWorker) styleErr() error {
+	if f := w.styleFailed.Load(); f != nil && f.generation > w.styleGen {
+		return fmt.Errorf("renderer: style failed to load: %s", f.message)
+	}
+	return nil
+}
+
+// setStyle submits a style URL and waits for the command to apply. The
+// command commits once the map adopts the URL, before the style loads,
+// so the wait is brief; a command that did not apply would otherwise
+// leave the worker on its old style with nothing reported. Recording
+// the commit generation retires any failure of the previous style.
+func (w *goWorker) setStyle(ctx context.Context, url string) error {
+	f, err := w.m.SetStyleUrl(url)
+	if err != nil {
 		return fmt.Errorf("renderer: set style url: %w", err)
 	}
-
+	cc, err := f.Await(ctx)
+	if err != nil {
+		return fmt.Errorf("renderer: set style url: %w", err)
+	}
+	if cc.Disposition != maplibre.CommandDispositionCommitted {
+		return fmt.Errorf("renderer: set style url did not apply (disposition %d): %s", cc.Disposition, cc.Diagnostic)
+	}
+	w.styleGen = cc.Generation
 	return nil
 }
 
@@ -1006,6 +1084,10 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	if vp.Width <= 0 || vp.Height <= 0 {
 		return nil, fmt.Errorf("renderer: invalid dimensions %dx%d", vp.Width, vp.Height)
 	}
+	// A still on a style that failed to load would never complete.
+	if err := w.styleErr(); err != nil {
+		return nil, err
+	}
 
 	wantW := uint32(vp.Width)
 	wantH := uint32(vp.Height)
@@ -1026,13 +1108,18 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 			return nil, fmt.Errorf("renderer: resize: %w", err)
 		}
 		resize = f
+		// An accepted resize applies whatever happens to this render, so
+		// track the extent from here. Leaving the old one recorded when a
+		// render fails would let the next request at the old size skip its
+		// resize and read back a frame at the size the session now has.
+		w.curW, w.curH, w.curScale = wantW, wantH, wantScale
 		if services.GlobalMetrics != nil {
 			services.GlobalMetrics.IncRendererResize(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
 		}
 	}
 
 	zoom, bearing, pitch := vp.Zoom, vp.Bearing, vp.Pitch
-	if _, err := w.m.UpdateCamera(maplibre.CameraUpdate{
+	camera, err := w.m.UpdateCamera(maplibre.CameraUpdate{
 		Mode: maplibre.CameraUpdateModeJump,
 		Camera: maplibre.CameraOptions{
 			Center:  &maplibre.LatLng{Latitude: vp.Latitude, Longitude: vp.Longitude},
@@ -1040,7 +1127,8 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 			Bearing: &bearing,
 			Pitch:   &pitch,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("renderer: camera: %w", err)
 	}
 
@@ -1057,20 +1145,20 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		return nil, err
 	}
 
+	// The still rendered the camera and any resize, but their completions
+	// can land a beat behind it. A command that did not commit means the
+	// image may show the previous view or size, so it fails the render
+	// rather than serving it.
+	if err := w.awaitCommitted(ctx, camera, "camera"); err != nil {
+		return nil, err
+	}
 	if resize != nil {
-		// A rendered still at the new size implies the extent applied,
-		// but completion can propagate a beat behind the frame result;
-		// flush it rather than assuming.
-		flushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		cc, err := resize.Await(flushCtx)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("renderer: resize: %w", err)
+		if err := w.awaitCommitted(ctx, resize, "resize"); err != nil {
+			// Force the next render to resize: the session's extent is
+			// no longer known.
+			w.curW, w.curH = 0, 0
+			return nil, err
 		}
-		if cc.Disposition == maplibre.CommandDispositionFailed {
-			return nil, fmt.Errorf("renderer: resize failed: %s", cc.Diagnostic)
-		}
-		w.curW, w.curH, w.curScale = wantW, wantH, wantScale
 	}
 
 	physW := vp.Width * scale
@@ -1089,6 +1177,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		return nil, fmt.Errorf("renderer: read pixels: %w", err)
 	}
 	if int(tr.Info.Width) != physW || int(tr.Info.Height) != physH {
+		w.curW, w.curH = 0, 0 // the target's extent is not what we recorded
 		return nil, fmt.Errorf("renderer: size mismatch: got %dx%d, want %dx%d", tr.Info.Width, tr.Info.Height, physW, physH)
 	}
 	// Guard the tight unpremultiply loop against a padded stride: it
@@ -1109,6 +1198,22 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	return &image.NRGBA{Pix: tr.Data, Stride: physW * 4, Rect: image.Rect(0, 0, physW, physH)}, nil
 }
 
+// awaitCommitted waits briefly for a map or session command the still
+// has already rendered, and fails unless it applied.
+func (w *goWorker) awaitCommitted(ctx context.Context, f *maplibre.Future[maplibre.CommandCompletion], what string) error {
+	flushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cc, err := f.Await(flushCtx)
+	if err != nil {
+		return fmt.Errorf("renderer: %s: %w", what, err)
+	}
+	switch cc.Disposition {
+	case maplibre.CommandDispositionFailed, maplibre.CommandDispositionCancelled:
+		return fmt.Errorf("renderer: %s did not apply (disposition %d): %s", what, cc.Disposition, cc.Diagnostic)
+	}
+	return nil
+}
+
 // settleAbandonedStill drives an abandoned still request to completion,
 // discarding whatever it produces. There is no cancel for a pending
 // still and the map refuses a second one, so the only settle is the
@@ -1116,6 +1221,26 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 // already cancelled) context. A worker whose still cannot settle within
 // the budget is poisoned and retired by the pool.
 func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
+	select {
+	case <-still.Done():
+		// Already terminal — it failed, or completed as the render gave
+		// up. The map holds no pending still, so the worker is healthy.
+		return
+	default:
+	}
+	if err := w.styleErr(); err != nil {
+		// Driving the await would stop at once on the style failure. mbgl
+		// fails a still pending when its style fails, so the await may
+		// just have beaten that completion; give it the budget to land.
+		select {
+		case <-still.Done():
+		case <-time.After(w.pool.cfg.settleTimeout):
+			w.poisoned = true
+			slog.Warn("renderer worker retired: still-image request pending on a failed style",
+				"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout, "error", err)
+		}
+		return
+	}
 	if err := w.awaitStill(context.Background(), still, w.pool.cfg.settleTimeout); err != nil {
 		w.poisoned = true
 		slog.Warn("renderer worker retired: could not settle abandoned still-image request",
@@ -1151,26 +1276,30 @@ func (w *goWorker) drainFrames() ([]maplibre.RenderFrameResult, error) {
 }
 
 // handleEvents is the runtime event handler. It runs on the runtime's
-// native thread, so it only filters and does a non-blocking send: a
-// failure already pending is kept and later ones are dropped, since the
-// await fails on the first. The batch is the binding's copy.
+// native thread, so it never blocks. A style failure is recorded, then
+// the wake is nudged so a parked await sees it. A render error is a
+// non-blocking send: one already pending is kept and later ones are
+// dropped, since the await fails on the first. The batch is the
+// binding's copy.
 func (w *goWorker) handleEvents(batch maplibre.EventBatchView) {
 	for _, ev := range batch.Events {
-		var err error
 		switch ev.Type {
 		case maplibre.RuntimeEventTypeMapLoadingFailed:
-			err = fmt.Errorf("renderer: map loading failed: %s", ev.Message)
+			w.styleFailed.Store(&styleFailure{generation: ev.Generation, message: ev.Message})
+			select {
+			case w.wake <- struct{}{}:
+			default:
+			}
 		case maplibre.RuntimeEventTypeMapRenderError:
-			err = fmt.Errorf("renderer: map render error: %s", ev.Message)
+			select {
+			case w.mapErr <- fmt.Errorf("renderer: map render error: %s", ev.Message):
+			default:
+			}
 		default:
 			continue
 		}
 		if serviceTrace {
-			fmt.Fprintf(os.Stderr, "TRACE event type=%d msg=%q\n", ev.Type, ev.Message)
-		}
-		select {
-		case w.mapErr <- err:
-		default:
+			fmt.Fprintf(os.Stderr, "TRACE event type=%d gen=%d msg=%q\n", ev.Type, ev.Generation, ev.Message)
 		}
 	}
 }
@@ -1210,12 +1339,15 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			break
 		}
 	}
-	// A wake latched by pre-flush results is stale too. A pending map
-	// failure is not flushed: it can come from a style reload that ran
-	// between renders, and it fails this render as the drained event
-	// queue used to.
+	// A wake latched by pre-flush results is stale too, and so is a
+	// render error: the map renders only for a still, so one left over
+	// was raised by an earlier render, which has already failed on it.
 	select {
 	case <-w.wake:
+	default:
+	}
+	select {
+	case <-w.mapErr:
 	default:
 	}
 
@@ -1318,6 +1450,12 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 				)
 			}
 			return nil
+		}
+
+		// A style that failed after this still was requested leaves it
+		// pending for good: mbgl failed only a still already pending.
+		if err := w.styleErr(); err != nil {
+			return err
 		}
 
 		// Keep one waiting demand armed while the still is pending: a
