@@ -105,7 +105,7 @@ import (
 	"fmt"
 	"sync"
 
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
+	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 )
 
 // eglDisplay is the process-wide headless EGL display + config. Any
@@ -142,14 +142,14 @@ func newEGLDisplay() (*eglDisplay, error) {
 // for a core-worker session: the session creates a private context from
 // this display+config with the named client API and joins no share
 // group.
-func (d *eglDisplay) descriptor() maplibre.OpenglContextDescriptor {
-	return maplibre.OpenglContextDescriptor{
-		Ownership: maplibre.OpenglContextOwnershipDedicated,
-		Data: maplibre.OpenglContextDescriptorDataEglVariant{
+func (d *eglDisplay) descriptor() maplibre.OpenGlContextDescriptor {
+	return maplibre.OpenGlContextDescriptor{
+		Ownership: maplibre.OpenGlContextOwnershipDedicated,
+		Data: maplibre.OpenGlContextDescriptorDataEglVariant{
 			Value: maplibre.EglContextDescriptor{
 				Display:        uintptr(C.mln_go_egl_display_handle(&d.raw)),
 				Config:         uintptr(C.mln_go_egl_config_handle(&d.raw)),
-				ClientApi:      maplibre.OpenglClientApiGl,
+				ClientApi:      maplibre.OpenGlClientApiGl,
 				GetProcAddress: uintptr(C.mln_go_egl_proc_address_handle()),
 			},
 		},

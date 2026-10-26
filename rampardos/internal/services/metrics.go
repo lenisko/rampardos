@@ -113,11 +113,11 @@ type MetricsManager struct {
 	// their historical pump_* prefix (from the pre-executor host-pumping
 	// binding) so dashboards survive; the semantics are the core-worker
 	// await analogues.
-	rendererPumpIterations      *prometheus.HistogramVec // still-await loop turns per render
-	rendererPumpSleep           *prometheus.HistogramVec // total seconds blocked in operation waits per render
+	rendererPumpIterations      *prometheus.HistogramVec // frame wakes the still await handled per render
+	rendererPumpSleep           *prometheus.HistogramVec // seconds the still await waited per render
 	rendererPumpTimeToFirstEv   *prometheus.HistogramVec // seconds from await start to first frame result
 	rendererPumpRenderUpdate    *prometheus.HistogramVec // always 0 under the core-worker driver (no host graphics work)
-	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // frame demands issued per render (>1 = multi-pass still)
+	rendererPumpRenderUpdateCnt *prometheus.HistogramVec // still frame results per render (>1 = multi-pass still)
 	rendererReadback            *prometheus.HistogramVec // seconds for the full readback operation (start→wait→take) per render
 
 	// Shared tile provider (renderer resource provider backed by SQLite
@@ -131,7 +131,6 @@ type MetricsManager struct {
 	// Still-await loop health: which frame dispositions drive renders,
 	// and how often the missed-wake insurance timer is what moved one.
 	rendererStillFrameResults *prometheus.CounterVec
-	rendererStillKeepalives   *prometheus.CounterVec
 	// Renders that changed a worker's target size, to show how often
 	// request sizes alternate on the same worker.
 	rendererResizes *prometheus.CounterVec
@@ -364,13 +363,13 @@ func newMetricsManager() *MetricsManager {
 
 		rendererPumpIterations: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_iterations_per_render",
-			Help:    "Number of still-await loop turns the Go renderer executed per render (frame/event drain + bounded operation wait). High counts mean the still needed many passes or waited on slow resource loads.",
+			Help:    "Frame wakes the still await handled per render (each drains the frame results the still's own demands produced). High counts mean the still needed many passes or waited on slow resource loads.",
 			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000},
 		}, []string{"style", "scale"}),
 
 		rendererPumpSleep: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_sleep_seconds_per_render",
-			Help:    "Total seconds the Go renderer spent parked in the still await per render (wake-driven select on FrameWake/still-completion, 50ms missed-wake insurance timer) — genuine wait on the native core worker's progress (tile IO, parse/layout, draws).",
+			Help:    "Seconds from the still request to its completion per render: the wait on the native core worker's progress (tile IO, parse/layout, draws). The host does no work while it waits.",
 			Buckets: []float64{0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25},
 		}, []string{"style", "scale"}),
 
@@ -388,7 +387,7 @@ func newMetricsManager() *MetricsManager {
 
 		rendererPumpRenderUpdateCnt: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pump_render_update_count_per_render",
-			Help:    "Number of frame demands issued per render. High values mean the still needed multiple passes before completing (e.g. as tiles arrived progressively).",
+			Help:    "Frame results of the still's own demands per render. High values mean the still needed multiple passes before completing (e.g. as tiles arrived progressively).",
 			Buckets: []float64{1, 2, 3, 5, 10, 20, 50},
 		}, []string{"style", "scale"}),
 
@@ -414,12 +413,8 @@ func newMetricsManager() *MetricsManager {
 		}),
 		rendererStillFrameResults: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_still_frame_results_total",
-			Help: "Frame results drained by the still await, by disposition (rendered, no_update, target_not_ready, superseded). Non-rendered dispositions other than no_update wait on the map's next update to make progress.",
+			Help: "Frame results of still-image demands, by disposition (rendered, no_update, target_not_ready, superseded). The still resubmits a demand that ends before the image renders; target_not_ready fails the render.",
 		}, []string{"style", "scale", "disposition"}),
-		rendererStillKeepalives: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "rampardos_renderer_still_keepalive_total",
-			Help: "Times the still await's 50ms missed-wake insurance expired with no frame demand armed. The await re-arms a waiting demand on every result, so this should stay at zero; a non-zero count means that invariant broke.",
-		}, []string{"style", "scale"}),
 		rendererResizes: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_resizes_total",
 			Help: "Renders that resized the worker's render target because the requested logical size differed from that worker's previous render. Divide by rampardos_renderer_viewport_duration_seconds_count for the share of renders that paid for a resize.",
@@ -1057,10 +1052,6 @@ func (m *MetricsManager) GetTemplateRenderStats() []TemplateRenderStat {
 
 func (m *MetricsManager) IncRendererStillFrameResult(style, scale, disposition string) {
 	m.rendererStillFrameResults.WithLabelValues(bucketLabel(style), bucketLabel(scale), disposition).Inc()
-}
-
-func (m *MetricsManager) IncRendererStillKeepalive(style, scale string) {
-	m.rendererStillKeepalives.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Inc()
 }
 
 func (m *MetricsManager) IncRendererResize(style, scale string) {

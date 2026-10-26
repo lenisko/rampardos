@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
+	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 )
 
 // TestHandleEventsForwardsFirstRenderErrorOnly guards the runtime event
@@ -14,9 +14,9 @@ import (
 func TestHandleEventsForwardsFirstRenderErrorOnly(t *testing.T) {
 	w := &goWorker{mapErr: make(chan error, 1), wake: make(chan struct{}, 1)}
 
-	w.handleEvents(maplibre.EventBatchView{Events: []maplibre.RuntimeEvent{
+	w.handleEvents([]maplibre.RuntimeEvent{
 		{Type: maplibre.RuntimeEventTypeMapStyleLoaded},
-	}})
+	})
 	select {
 	case err := <-w.mapErr:
 		t.Fatalf("non-failure event forwarded: %v", err)
@@ -25,13 +25,13 @@ func TestHandleEventsForwardsFirstRenderErrorOnly(t *testing.T) {
 
 	// Two errors in one batch, then a third in a later batch: none may
 	// block, and the first is what the await sees.
-	w.handleEvents(maplibre.EventBatchView{Events: []maplibre.RuntimeEvent{
+	w.handleEvents([]maplibre.RuntimeEvent{
 		{Type: maplibre.RuntimeEventTypeMapRenderError, Message: "first"},
 		{Type: maplibre.RuntimeEventTypeMapRenderError, Message: "second"},
-	}})
-	w.handleEvents(maplibre.EventBatchView{Events: []maplibre.RuntimeEvent{
+	})
+	w.handleEvents([]maplibre.RuntimeEvent{
 		{Type: maplibre.RuntimeEventTypeMapRenderError, Message: "third"},
-	}})
+	})
 
 	select {
 	case err := <-w.mapErr:
@@ -57,17 +57,17 @@ func TestStyleFailureIsStateScopedToTheStyle(t *testing.T) {
 	w := &goWorker{mapErr: make(chan error, 1), wake: make(chan struct{}, 1), styleGen: 5}
 
 	// A failure the previous style reported before this style committed.
-	w.handleEvents(maplibre.EventBatchView{Events: []maplibre.RuntimeEvent{
+	w.handleEvents([]maplibre.RuntimeEvent{
 		{Type: maplibre.RuntimeEventTypeMapLoadingFailed, Generation: 4, Message: "old style"},
-	}})
+	})
 	if err := w.styleErr(); err != nil {
 		t.Fatalf("failure of an earlier style applied to the current one: %v", err)
 	}
 	<-w.wake
 
-	w.handleEvents(maplibre.EventBatchView{Events: []maplibre.RuntimeEvent{
+	w.handleEvents([]maplibre.RuntimeEvent{
 		{Type: maplibre.RuntimeEventTypeMapLoadingFailed, Generation: 7, Message: "style 404"},
-	}})
+	})
 	select {
 	case <-w.wake:
 	default:

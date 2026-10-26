@@ -10,7 +10,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/grafana/pyroscope-go v1.2.7
 	github.com/klauspost/compress v1.18.2
-	github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20261021201637-24d95bfb4e6e
+	github.com/maplibre/maplibre-native-ffi/bindings/go v0.0.0-20261026102422-6ff238cb0c26
 	github.com/mattn/go-sqlite3 v1.14.50
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/image v0.34.0

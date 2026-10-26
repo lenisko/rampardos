@@ -26,7 +26,7 @@ import (
 
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/services"
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
+	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/sync/semaphore"
 )
@@ -81,11 +81,7 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	}
 
 	// Catch a wrong-variant FFI at process start, not at first render.
-	backends, err := maplibre.SupportedRenderBackendMask()
-	if err != nil {
-		return nil, fmt.Errorf("renderer: query render backends: %w", err)
-	}
-	if !backends.Has(maplibre.RenderBackendFlagOpengl) {
+	if !maplibre.SupportedRenderBackendMask().Has(maplibre.RenderBackendFlagOpenGl) {
 		return nil, fmt.Errorf("renderer: linked FFI does not advertise OpenGL backend; check Dockerfile MISE_ENV variant (expected linux-<arch>-egl)")
 	}
 
@@ -784,8 +780,8 @@ func (p *goStylePool) close() {
 // display+config it borrows. Plain goroutine — nothing here is
 // thread-affine: the native session worker does all graphics work, and
 // every async call returns a Future safe to await from any goroutine.
-// The session's FrameWake feeds the worker's wake channel, so the
-// still await is event-driven rather than tick-polled.
+// The still drives its own frame demands; the worker only waits for it,
+// woken by the session's FrameWake and the runtime event handler.
 type goWorker struct {
 	pool        *goStylePool
 	startupErrs chan<- error
@@ -804,10 +800,10 @@ type goWorker struct {
 	sess *maplibre.RenderSessionHandle
 	egl  *eglDisplay
 
-	// wake is fed by the session's FrameWake callback: native invokes it
-	// (from any thread, calls may coalesce) whenever a frame result
-	// becomes drainable. Buffered-1 + non-blocking send turns bursts
-	// into one pending token.
+	// wake is fed by the session's FrameWake callback, which native
+	// invokes (from any thread, calls may coalesce) whenever a frame result
+	// becomes drainable, and by the event handler on a style failure.
+	// Buffered-1 + non-blocking send turns bursts into one pending token.
 	wake chan struct{}
 
 	// mapErr is fed by the runtime event handler with the map's render
@@ -824,16 +820,13 @@ type goWorker struct {
 	// command clears it by moving styleGen past it.
 	styleFailed atomic.Pointer[styleFailure]
 	// styleGen is the map generation at which the current style command
-	// committed. Worker goroutine only.
+	// committed, and styleURL the URL it set. Worker goroutine only.
 	styleGen uint64
+	styleURL string
 
 	curW     uint32
 	curH     uint32
 	curScale float64
-
-	// frameToken numbers frame demands so drained results can be matched
-	// to the still image currently being driven.
-	frameToken uint64
 
 	// poisoned is set when an abandoned still-image request could not be
 	// settled. The map refuses a second still while one is pending, so
@@ -899,7 +892,7 @@ func (w *goWorker) init() error {
 	w.wake = make(chan struct{}, 1)
 	w.mapErr = make(chan error, 1)
 
-	w.rt, err = maplibre.RuntimeCreate(maplibre.DefaultRuntimeOptions())
+	w.rt, err = maplibre.NewRuntime(maplibre.RuntimeOptions{})
 	if err != nil {
 		return fmt.Errorf("renderer: new runtime: %w", err)
 	}
@@ -930,7 +923,7 @@ func (w *goWorker) init() error {
 	}
 
 	if w.pool.cfg.store != nil {
-		f, err := w.rt.SetResourceProvider(maplibre.ResourceProvider{Callback: w.pool.cfg.store.Provide})
+		f, err := w.rt.SetResourceProvider(w.pool.cfg.store.provider())
 		if err != nil {
 			return fmt.Errorf("renderer: set resource provider: %w", err)
 		}
@@ -943,24 +936,23 @@ func (w *goWorker) init() error {
 	// animation tick and aligns with our request/reply pattern. The event
 	// mask carries the two failures no still reports by itself: a style
 	// that fails to load fails only the still pending at that moment (see
-	// styleFailed), and a render error ends no still. Frame demands wait
-	// for map updates inside the binding, and still completion arrives
-	// via its Future.
+	// styleFailed), and a render error ends no still.
 	w.curW, w.curH, w.curScale = 256, 256, float64(w.pool.cfg.ratio)
-	opts := maplibre.DefaultMapOptions()
-	opts.InitialExtent = maplibre.LogicalExtent{
-		Width:       w.curW,
-		Height:      w.curH,
-		ScaleFactor: w.curScale,
-	}
-	opts.MapMode = maplibre.MapModeStatic
-	opts.EventMask = maplibre.RuntimeEventMaskMapLoadingFailed | maplibre.RuntimeEventMaskMapRenderError
-	mapFuture, err := w.rt.CreateMap(opts)
+	events := maplibre.RuntimeEventFlagMapLoadingFailed | maplibre.RuntimeEventFlagMapRenderError
+	m, ready, err := w.rt.CreateMap(maplibre.MapOptions{
+		InitialExtent: maplibre.LogicalExtent{
+			Width:       w.curW,
+			Height:      w.curH,
+			ScaleFactor: w.curScale,
+		},
+		MapMode:   maplibre.MapModeStatic,
+		EventMask: &events,
+	})
 	if err != nil {
 		return fmt.Errorf("renderer: new map: %w", err)
 	}
-	w.m, err = mapFuture.Await(startupCtx)
-	if err != nil {
+	w.m = m
+	if _, err := ready.Await(startupCtx); err != nil {
 		return fmt.Errorf("renderer: new map: %w", err)
 	}
 
@@ -968,19 +960,16 @@ func (w *goWorker) init() error {
 	// native session worker creates and owns the context from our
 	// display+config and needs no host graphics service. The FrameWake
 	// callback only schedules (non-blocking channel send) per the wake
-	// contract; the await drains the frame queue itself.
+	// contract; the await drains the frame queue itself. A private target
+	// grants one texture slot whatever the ring depth asks for.
 	wakeCallback := func() {
 		select {
 		case w.wake <- struct{}{}:
 		default:
 		}
 	}
-	attachOpts := maplibre.DefaultRenderSessionAttachOptions()
-	attachOpts.Driver = maplibre.RenderDriverKindCoreWorker
-	attachOpts.RequestedTextureRingDepth = 1
-	attachOpts.FrameWake = maplibre.Wake{Callback: wakeCallback}
-	attach, err := w.m.AttachOpenglOwnedTexture(
-		maplibre.OpenglOwnedTextureDescriptor{
+	sess, attached, err := w.m.AttachOpenGlOwnedTexture(
+		maplibre.OpenGlOwnedTextureDescriptor{
 			Extent: maplibre.LogicalExtent{
 				Width:       w.curW,
 				Height:      w.curH,
@@ -988,17 +977,20 @@ func (w *goWorker) init() error {
 			},
 			Context: w.egl.descriptor(),
 		},
-		attachOpts,
+		maplibre.RenderSessionAttachOptions{
+			Driver:    maplibre.RenderDriverKindCoreWorker,
+			FrameWake: maplibre.Wake{Callback: wakeCallback},
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("renderer: attach OpenGL owned texture render target: %w", err)
 	}
-	w.sess = attach.Session
-	if _, err := attach.Completion.Await(startupCtx); err != nil {
+	w.sess = sess
+	if _, err := attached.Await(startupCtx); err != nil {
 		return fmt.Errorf("renderer: attach: %w", err)
 	}
 
-	caps, err := w.sess.GetCapabilities()
+	caps, err := w.sess.Capabilities()
 	if err != nil {
 		return fmt.Errorf("renderer: session capabilities: %w", err)
 	}
@@ -1027,11 +1019,12 @@ func (w *goWorker) styleErr() error {
 	return nil
 }
 
-// setStyle submits a style URL and waits for the command to apply. The
-// command commits once the map adopts the URL, before the style loads,
-// so the wait is brief; a command that did not apply would otherwise
-// leave the worker on its old style with nothing reported. Recording
-// the commit generation retires any failure of the previous style.
+// setStyle submits a style URL and waits for the command to commit (a
+// command that fails or is cancelled returns an error from Await). It
+// commits once the map adopts the URL, before the style loads, so the
+// wait is brief; a command that did not apply would otherwise leave the
+// worker on its old style with nothing reported. Recording the commit
+// generation retires any failure of the previous style.
 func (w *goWorker) setStyle(ctx context.Context, url string) error {
 	f, err := w.m.SetStyleUrl(url)
 	if err != nil {
@@ -1041,10 +1034,8 @@ func (w *goWorker) setStyle(ctx context.Context, url string) error {
 	if err != nil {
 		return fmt.Errorf("renderer: set style url: %w", err)
 	}
-	if cc.Disposition != maplibre.CommandDispositionCommitted {
-		return fmt.Errorf("renderer: set style url did not apply (disposition %d): %s", cc.Disposition, cc.Diagnostic)
-	}
 	w.styleGen = cc.Generation
+	w.styleURL = url
 	return nil
 }
 
@@ -1063,7 +1054,9 @@ func (w *goWorker) cleanup() {
 		if !detached {
 			_, _ = w.sess.Abandon()
 		}
-		_ = w.sess.Close()
+		if f, err := w.sess.Close(); err == nil {
+			_, _ = f.Await(settleCtx)
+		}
 	}
 	if w.m != nil {
 		if f, err := w.m.Close(); err == nil {
@@ -1137,10 +1130,9 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		return nil, fmt.Errorf("renderer: request still image: %w", err)
 	}
 	if err := w.awaitStill(ctx, still, w.pool.cfg.renderTimeout); err != nil {
-		// The request may still be pending in the executor, and the map
-		// refuses a second still while one is. Settle it (bounded, off
-		// the caller's context) by driving the same await; poison the
-		// worker if it cannot be settled.
+		// The request may still be pending, and the map refuses a second
+		// still while one is. Let it settle (bounded); poison the worker
+		// if it does not.
 		w.settleAbandonedStill(still)
 		return nil, err
 	}
@@ -1199,27 +1191,30 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 }
 
 // awaitCommitted waits briefly for a map or session command the still
-// has already rendered, and fails unless it applied.
+// has already rendered, and fails unless it committed: Await returns an
+// error for a command that failed or was cancelled.
 func (w *goWorker) awaitCommitted(ctx context.Context, f *maplibre.Future[maplibre.CommandCompletion], what string) error {
 	flushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	cc, err := f.Await(flushCtx)
-	if err != nil {
+	if _, err := f.Await(flushCtx); err != nil {
 		return fmt.Errorf("renderer: %s: %w", what, err)
-	}
-	switch cc.Disposition {
-	case maplibre.CommandDispositionFailed, maplibre.CommandDispositionCancelled:
-		return fmt.Errorf("renderer: %s did not apply (disposition %d): %s", what, cc.Disposition, cc.Diagnostic)
 	}
 	return nil
 }
 
-// settleAbandonedStill drives an abandoned still request to completion,
-// discarding whatever it produces. There is no cancel for a pending
-// still and the map refuses a second one, so the only settle is the
-// same demand-driven await, bounded and off the caller's (typically
-// already cancelled) context. A worker whose still cannot settle within
-// the budget is poisoned and retired by the pool.
+// settleAbandonedStill waits, bounded and off the caller's (typically
+// already cancelled) context, for an abandoned still request to end.
+// There is no cancel for a pending still and the map refuses a second
+// one, but the request submits its own frame demands, so it settles by
+// itself once the map has loaded what it shows.
+//
+// A still on a failed style is the exception. mbgl fails the still
+// pending when a style load fails, but the failure event can reach us
+// after renderOne checked for it and before the request ran, leaving a
+// still that waits for a style that never loads. Loading the style
+// again fails it the same way, which fails that still. A worker whose
+// still does not settle within the budget is poisoned and retired by the
+// pool.
 func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 	select {
 	case <-still.Done():
@@ -1228,61 +1223,42 @@ func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 		return
 	default:
 	}
-	if err := w.styleErr(); err != nil {
-		// Driving the await would stop at once on the style failure. mbgl
-		// fails a still pending when its style fails, so the await may
-		// just have beaten that completion; give it the budget to land.
+	ctx, cancel := context.WithTimeout(context.Background(), w.pool.cfg.settleTimeout)
+	defer cancel()
+	reloaded := false
+	for {
+		if !reloaded && w.styleErr() != nil {
+			reloaded = true
+			if err := w.setStyle(ctx, w.styleURL); err != nil {
+				slog.Warn("renderer: reloading a failed style to settle a still failed",
+					"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "error", err)
+			}
+		}
 		select {
 		case <-still.Done():
-		case <-time.After(w.pool.cfg.settleTimeout):
+			return
+		case <-w.wake: // a frame result or a style failure; recheck
+		case <-ctx.Done():
 			w.poisoned = true
-			slog.Warn("renderer worker retired: still-image request pending on a failed style",
-				"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout, "error", err)
+			slog.Warn("renderer worker retired: abandoned still-image request did not settle",
+				"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout, "styleError", w.styleErr())
+			return
 		}
-		return
-	}
-	if err := w.awaitStill(context.Background(), still, w.pool.cfg.settleTimeout); err != nil {
-		w.poisoned = true
-		slog.Warn("renderer worker retired: could not settle abandoned still-image request",
-			"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout, "error", err)
 	}
 }
 
-// serviceTrace enables per-iteration stderr tracing of the still await.
-// Debug aid for the executor conversion; cheap and env-gated.
+// serviceTrace enables per-event stderr tracing of the still await.
+// Debug aid; cheap and env-gated.
 var serviceTrace = os.Getenv("RENDERER_SERVICE_TRACE") != ""
-
-// drainFrames drains and closes one frame-result batch, returning its
-// results. An empty queue is reported as (nil, nil).
-func (w *goWorker) drainFrames() ([]maplibre.RenderFrameResult, error) {
-	fb, err := w.sess.DrainFrameResults()
-	if err != nil {
-		return nil, err
-	}
-	if fb == nil {
-		// The binding reports an empty queue (MLN_STATUS_NOT_READY) as an
-		// absent batch.
-		return nil, nil
-	}
-	defer fb.Close()
-	view, err := fb.Get()
-	if err != nil {
-		return nil, err
-	}
-	// Copy out: the view's records belong to the batch handle.
-	results := make([]maplibre.RenderFrameResult, len(view.Results))
-	copy(results, view.Results)
-	return results, nil
-}
 
 // handleEvents is the runtime event handler. It runs on the runtime's
 // native thread, so it never blocks. A style failure is recorded, then
 // the wake is nudged so a parked await sees it. A render error is a
 // non-blocking send: one already pending is kept and later ones are
-// dropped, since the await fails on the first. The batch is the
+// dropped, since the await fails on the first. The events are the
 // binding's copy.
-func (w *goWorker) handleEvents(batch maplibre.EventBatchView) {
-	for _, ev := range batch.Events {
+func (w *goWorker) handleEvents(events []maplibre.RuntimeEvent) {
+	for _, ev := range events {
 		switch ev.Type {
 		case maplibre.RuntimeEventTypeMapLoadingFailed:
 			w.styleFailed.Store(&styleFailure{generation: ev.Generation, message: ev.Message})
@@ -1304,44 +1280,55 @@ func (w *goWorker) handleEvents(batch maplibre.EventBatchView) {
 	}
 }
 
-// awaitStill drives a still-image request to completion with one
-// waiting frame demand (IF_NEEDED | WAIT_FOR_UPDATE), parking on the
-// FrameWake channel and the map-failure channel. A static-mode map
-// renders only on demand; a waiting demand that finds nothing new parks
-// inside the binding and reruns on the map's next update, so the host
-// re-arms one demand per result and never hears about updates itself.
-// A newer demand with the same flags supersedes a waiting one instead
-// of queueing behind it. Still completion arrives via its Future.
-//
-// On completion a session barrier ends the demand left waiting and
-// returns once every earlier render has a terminal result. That keeps
-// a parked demand from drawing the next render's first frame before
-// its flush, and orders the readback after the frame that completed
-// the still.
-func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct{}], budget time.Duration) error {
-	deadline := time.Now().Add(budget)
-	start := time.Now()
-	iterations := 0
-	demands := 0
-	var totalWait time.Duration
-	var timeToFirst time.Duration
-	sawFirst := false
+// drainFrames drains the session's queued frame results, records them,
+// and reports how many arrived. Only still demands render on this
+// session, so every result belongs to a still. A TargetNotReady result
+// fails the render: the still would wait for a target change that never
+// comes.
+func (w *goWorker) drainFrames(start time.Time) (int, error) {
+	results, err := w.sess.DrainFrameResults()
+	if err != nil {
+		return 0, fmt.Errorf("renderer: still image: drain frame results: %w", err)
+	}
+	for _, res := range results {
+		if serviceTrace {
+			fmt.Fprintf(os.Stderr, "TRACE +%6dus frame disp=%d update=%d\n", time.Since(start).Microseconds(), res.Disposition, res.MapUpdateGeneration)
+		}
+		if services.GlobalMetrics != nil {
+			services.GlobalMetrics.IncRendererStillFrameResult(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, dispositionLabel(res.Disposition))
+		}
+		if res.Disposition == maplibre.RenderResultTargetNotReady {
+			return len(results), fmt.Errorf("renderer: still image: render target not ready")
+		}
+	}
+	return len(results), nil
+}
 
-	// Flush results from an earlier render. Its waiting demand was
-	// ended by that render's barrier, so everything drained after this
-	// point was produced with this render's map state.
+// awaitStill waits for a still-image request to complete. The request
+// submits its own frame demands on the session and resubmits after any
+// that ends before the image renders, so the host only waits: on the
+// still's Future, the FrameWake channel (frame results, drained for
+// metrics and to catch an unusable target), and the map-failure
+// signals. The readback may follow as soon as the Future completes.
+func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct{}], budget time.Duration) error {
+	start := time.Now()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+
+	// Results queued since the last render belong to an earlier still,
+	// typically an abandoned one that settled later. A wake latched by
+	// them is stale too, and so is a render error: the map renders only
+	// for a still, so one left over was raised by an earlier render,
+	// which has already failed on it.
 	for {
-		stale, err := w.drainFrames()
+		results, err := w.sess.DrainFrameResults()
 		if err != nil {
 			return fmt.Errorf("renderer: still image: flush frame results: %w", err)
 		}
-		if len(stale) == 0 {
+		if len(results) == 0 {
 			break
 		}
 	}
-	// A wake latched by pre-flush results is stale too, and so is a
-	// render error: the map renders only for a still, so one left over
-	// was raised by an earlier render, which has already failed on it.
 	select {
 	case <-w.wake:
 	default:
@@ -1350,151 +1337,67 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	case <-w.mapErr:
 	default:
 	}
-
-	outstanding := false
-	completed := false
-
-	arm := func() error {
-		w.frameToken++
-		demand := maplibre.FrameDemand{
-			Flags: maplibre.FrameDemandFlagIfNeeded | maplibre.FrameDemandFlagWaitForUpdate,
-			Token: w.frameToken,
-		}
-		if err := w.sess.RequestFrame(demand); err != nil {
-			return fmt.Errorf("renderer: still image: request frame: %w", err)
-		}
-		if serviceTrace {
-			fmt.Fprintf(os.Stderr, "TRACE +%6dus demand token=%d\n", time.Since(start).Microseconds(), demand.Token)
-		}
-		outstanding = true
-		demands++
-		return nil
-	}
-
-	if err := arm(); err != nil {
+	// The flushed wake may have carried a style failure that landed after
+	// renderOne checked; nothing would wake the loop for it again.
+	if err := w.styleErr(); err != nil {
 		return err
 	}
 
+	wakes, frames := 0, 0
+	var timeToFirst time.Duration
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("renderer: still image timed out after %s", budget)
-		}
-		iterations++
-
-		progressed := false
-		results, err := w.drainFrames()
-		if err != nil {
-			return fmt.Errorf("renderer: still image: drain frame results: %w", err)
-		}
-		for _, res := range results {
-			if serviceTrace {
-				fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d frame token=%d disp=%d\n", time.Since(start).Microseconds(), iterations, res.Token, res.Disposition)
-			}
-			progressed = true
-			if !sawFirst {
-				timeToFirst = time.Since(start)
-				sawFirst = true
-			}
-			if res.Token == w.frameToken {
-				outstanding = false
-			}
-			if services.GlobalMetrics != nil {
-				services.GlobalMetrics.IncRendererStillFrameResult(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, dispositionLabel(res.Disposition))
-			}
-			if res.Disposition == maplibre.RenderResultTargetNotReady {
-				return fmt.Errorf("renderer: still image: render target not ready")
-			}
-		}
-
 		select {
-		case err := <-w.mapErr:
-			return err
-		default:
-		}
-
-		if !completed {
-			select {
-			case <-still.Done():
-				if serviceTrace {
-					fmt.Fprintf(os.Stderr, "TRACE +%6dus it=%d still COMPLETED\n", time.Since(start).Microseconds(), iterations)
-				}
-				completed = true
-				if _, err := still.Await(ctx); err != nil {
-					return fmt.Errorf("renderer: still image: %w", err)
-				}
-			default:
+		case <-still.Done():
+			if _, err := still.Await(ctx); err != nil {
+				return fmt.Errorf("renderer: still image: %w", err)
 			}
-		}
-
-		if completed {
-			barrier, err := w.sess.Barrier()
-			if err != nil {
-				return fmt.Errorf("renderer: still image: barrier: %w", err)
+			// The completing frame's result can trail the Future.
+			n, _ := w.drainFrames(start)
+			if n > 0 && frames == 0 {
+				timeToFirst = time.Since(start)
 			}
-			barrierStart := time.Now()
-			if _, err := barrier.Await(ctx); err != nil {
-				return fmt.Errorf("renderer: still image: barrier: %w", err)
+			frames += n
+			if serviceTrace {
+				fmt.Fprintf(os.Stderr, "TRACE +%6dus still COMPLETED frames=%d\n", time.Since(start).Microseconds(), frames)
 			}
-			totalWait += time.Since(barrierStart)
 			if services.GlobalMetrics != nil {
 				services.GlobalMetrics.RecordRendererPumpBreakdown(
 					w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
-					iterations,
-					totalWait.Seconds(),
+					wakes,
+					time.Since(start).Seconds(),
 					timeToFirst.Seconds(),
 					0, // host performs no graphics work under the core-worker driver
-					demands,
+					frames,
 				)
 			}
 			return nil
-		}
-
-		// A style that failed after this still was requested leaves it
-		// pending for good: mbgl failed only a still already pending.
-		if err := w.styleErr(); err != nil {
-			return err
-		}
-
-		// Keep one waiting demand armed while the still is pending: a
-		// result means the previous demand is spent.
-		if !outstanding {
-			if err := arm(); err != nil {
+		case <-w.wake:
+			wakes++
+			n, err := w.drainFrames(start)
+			if n > 0 && frames == 0 {
+				timeToFirst = time.Since(start)
+			}
+			frames += n
+			if err != nil {
 				return err
 			}
-		}
-
-		if !progressed {
-			// Nothing drained this turn: park until a frame result
-			// lands, the map reports a failure, the still completes, or
-			// the safety cap passes — the cap is missed-wake insurance,
-			// not pacing, so it is generous.
-			waitStart := time.Now()
-			timer := time.NewTimer(50 * time.Millisecond)
-			select {
-			case <-w.wake:
-			case err := <-w.mapErr:
-				timer.Stop()
-				totalWait += time.Since(waitStart)
-				return err
-			case <-still.Done():
-			case <-timer.C:
-				if !outstanding {
-					// Unreachable while every result re-arms; counted
-					// so a regression in that invariant is visible.
-					if services.GlobalMetrics != nil {
-						services.GlobalMetrics.IncRendererStillKeepalive(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
-					}
+			// A style that failed after this still was requested leaves it
+			// pending for good: mbgl failed only a still already pending.
+			// A still it did fail is done; let that case report it.
+			if err := w.styleErr(); err != nil {
+				select {
+				case <-still.Done():
+					continue
+				default:
+					return err
 				}
-			case <-ctx.Done():
-				timer.Stop()
-				totalWait += time.Since(waitStart)
-				return ctx.Err()
 			}
-			timer.Stop()
-			totalWait += time.Since(waitStart)
+		case err := <-w.mapErr:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("renderer: still image timed out after %s", budget)
 		}
 	}
 }

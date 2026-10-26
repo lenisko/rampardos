@@ -54,21 +54,18 @@ visible in the code.
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
 - **Executor-binding still invariants** (`goWorker.awaitStill`, the
-  core-worker driver): a static-mode map renders only on demand. The
-  await keeps exactly one frame demand armed with
-  `IF_NEEDED | WAIT_FOR_UPDATE` and re-arms it on every result. A
-  demand that finds nothing new waits inside the binding and reruns on
-  the map's next update, so the host never subscribes to update events
-  and never sees NoUpdate churn; a newer demand with the same flags
-  supersedes a waiting one instead of queueing (FFI dropped the
-  explicit CoalescingBoundary for this rule in #760). When the still's
-  Future completes, a session `Barrier` is issued and awaited: it ends
-  the demand left waiting (else the next render's camera update wakes
-  it and its frame lands before that render's flush) and orders the
-  readback after the completing frame. TargetNotReady results fail the
-  render rather than re-arming into a spin. The park selects on the
-  FrameWake channel, the map-failure channel, the still, and a 50ms
-  timer that is missed-wake insurance only.
+  core-worker driver): a static-mode map renders only for a still.
+  `RequestStillImage` submits its own frame demands (token
+  `MLN_FRAME_DEMAND_TOKEN_STILL_IMAGE`) and resubmits after any that ends
+  before the image renders (FFI #1110), so the host submits no demands
+  and issues no `Barrier` — those existed only to drive and then end
+  host demands. The await only waits: on the still's Future, on
+  FrameWake (results are drained to record them and to fail fast on
+  TargetNotReady, after which the still would wait for a target change
+  that never comes), on `mapErr`, and on the style-failure wake.
+  Results queued at render start belong to an earlier still (usually an
+  abandoned one that settled later) and are flushed. The readback may
+  follow as soon as the Future completes.
 - **Map failures arrive by push.** The runtime event handler
   (`handleEvents`) runs on the runtime's native thread: it may only
   record state and do non-blocking sends — no blocking, no `Await`, no
@@ -86,6 +83,11 @@ visible in the code.
     which awaits the commit — commit precedes the load). A one-shot
     signal here meant a 15 s hang plus a poisoned worker on every
     render after the first.
+    The failure event can still land after that check and before the
+    still request runs, leaving a still that never completes: the await
+    rechecks after flushing its wake (which the event also uses), and
+    settling such a still reloads the same style, whose repeated
+    failure fails it.
   - A render error ends no still. It goes to `mapErr`, which is flushed
     at render start: the map renders only for a still, so a leftover
     belongs to a render that already failed on it.
@@ -98,13 +100,14 @@ visible in the code.
   *acceptance* (it applies even if that render fails), and any
   uncertainty zeroes them so the next render resizes. The camera
   command's completion is checked the same way — an uncommitted camera
-  would serve the previous view. `DrainFrameResults` returns a nil batch and
-  no error when the queue is empty (the binding maps NOT_READY to
-  absence) — check for nil before using the batch. There is no cancel
-  for a pending still and the map refuses a second one — an abandoned
-  still must be settled by driving the same await (bounded), else the
-  worker is poisoned. A still whose Future is already done (it failed)
-  needs no settling: don't poison for that.
+  would serve the previous view (a command's `Await` returns an error
+  when it fails or is cancelled; there is no disposition to check).
+  `DrainFrameResults` returns an empty slice when the queue is empty.
+  There is no cancel for a pending still and the map refuses a second
+  one, but an abandoned still keeps rendering itself: settling is a
+  bounded wait for its Future, else the worker is poisoned. A still
+  whose Future is already done (it failed) needs no settling: don't
+  poison for that.
   Blocking `Future.Await` is safe under the core-worker driver; the
   caller-graphics-thread driver self-deadlocks on it — do not
   reintroduce that driver without restoring a host service loop.
@@ -127,7 +130,10 @@ visible in the code.
 - The custom `rampardos://tile/` scheme is what routes tiles to the
   provider: mbgl only consults providers for network-path URLs, so
   styleprep inlines a TileJSON with that scheme instead of an
-  `mbtiles://` url. file:// glyphs/sprites never reach the provider.
+  `mbtiles://` url. The provider registers a route for that scheme
+  only, so other network requests pass through to native loading
+  without a callback, and file:// glyphs/sprites never reach it.
+  Answering (`Complete`/`PassThrough`) consumes the request handle.
 - The provider must return DECOMPRESSED tile bytes (mbgl's network path
   assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
   rows for the mbtiles query. maxzoom in the inline TileJSON is what

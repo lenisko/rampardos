@@ -28,12 +28,12 @@ DOCKER_PLATFORMS=linux/amd64
 
 # In-process Go renderer (RENDERER_BACKEND=go-pool) — see plan in
 # docs/superpowers/plans/2026-05-01-in-process-go-renderer.md.
-# MLN_FFI_REV is the upstream commit the published artifact was built
-# from. It MUST stay in sync with the ARG in the Dockerfile and with the
+# MLN_FFI_REV is the upstream commit the Docker build compiles the
+# library from. It MUST stay in sync with the ARG in the Dockerfile and with the
 # pseudo-version in rampardos/go.mod — both the artifact fetch and the Go
 # build assert it, so a drift fails the build rather than linking a
 # library the binding was not built against.
-MLN_FFI_REV ?= 2896a3570ba3df7e53ed98eaa2b72d7901be01f2
+MLN_FFI_REV ?= 6ff238cb0c2618342518715027a616c974f1fb70
 MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi
 
 # Default target

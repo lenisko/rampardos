@@ -15,23 +15,24 @@
 #   MLN_FFI_DIR_HOST  Where to extract. Default: ~/dev/maplibre-native-ffi
 #   MLN_FFI_REV       Expected upstream commit. KEEP IN SYNC with the ARG
 #                     at the top of the Dockerfile and with the pseudo-
-#                     version in rampardos/go.mod — the artifact records
-#                     the commit it was built from and this script checks it.
+#                     version in rampardos/go.mod. The artifact no longer
+#                     records its commit, so this script checks the commit
+#                     the release names instead.
 #   MLN_FFI_SNAPSHOT_TAG  Release tag. Default: unstable-native-snapshot.
 
 set -euo pipefail
 
-# NOTE: while MLN_FFI_REV points at a PR branch (maplibre-native-ffi#631)
-# there is NO published artifact for it — this script will fail the rev
-# check by design. Build in Docker (mln-ffi-build stage) or copy
-# /ffi/install out of that stage for host development.
+# NOTE: the Dockerfile builds the library from source at MLN_FFI_REV, and
+# the rolling snapshot matches that commit only on the day it was pinned —
+# after that this script fails the rev check by design. Copy /ffi/install
+# out of the mln-ffi-build stage for host development instead.
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi}"
-MLN_FFI_REV="${MLN_FFI_REV:-2896a3570ba3df7e53ed98eaa2b72d7901be01f2}"
+MLN_FFI_REV="${MLN_FFI_REV:-6ff238cb0c2618342518715027a616c974f1fb70}"
 MLN_FFI_SNAPSHOT_TAG="${MLN_FFI_SNAPSHOT_TAG:-unstable-native-snapshot}"
 
 case "$(uname -s)-$(uname -m)" in
-    Linux-aarch64|Linux-arm64) VARIANT=linux-arm64-egl ;;
-    Linux-x86_64)              VARIANT=linux-x64-egl ;;
+    Linux-aarch64|Linux-arm64) VARIANT=linux-gnu-arm64-egl ;;
+    Linux-x86_64)              VARIANT=linux-gnu-x64-egl ;;
     Darwin-*)
         echo "The renderer is Linux-only; build and test in Docker on macOS." >&2
         echo "  docker build --target rampardos-test ." >&2
@@ -54,7 +55,7 @@ rm -rf "$MLN_FFI_DIR_HOST/install"
 mkdir -p "$MLN_FFI_DIR_HOST/install"
 tar -xzf "$WORK/$ASSET" --strip-components=1 -C "$MLN_FFI_DIR_HOST/install"
 
-GOT="$(grep -o '[0-9a-f]\{40\}' "$MLN_FFI_DIR_HOST/install/share/maplibre-native-c/artifact.json" | head -1)"
+GOT="$(curl -fsSL "https://api.github.com/repos/maplibre/maplibre-native-ffi/releases/tags/${MLN_FFI_SNAPSHOT_TAG}" | grep -o '"target_commitish": *"[0-9a-f]\{40\}"' | grep -o '[0-9a-f]\{40\}')"
 if [ "$GOT" != "$MLN_FFI_REV" ]; then
     echo "" >&2
     echo "snapshot moved: artifact is $GOT, expected $MLN_FFI_REV" >&2

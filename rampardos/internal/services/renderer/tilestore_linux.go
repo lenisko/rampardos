@@ -32,7 +32,7 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 	"github.com/lenisko/rampardos/internal/services"
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go"
+	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -350,24 +350,35 @@ func parseTileURL(u string) (z, x, y uint32, ok bool) {
 	return vals[0], vals[1], vals[2], true
 }
 
-// Provide is the binding resource-provider callback, shared by every
-// worker runtime. Only provider-scheme tile URLs are handled; anything
-// else (file:// glyphs and sprites never get here, external HTTP does)
-// passes through to native networking.
-func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.ResourceRequestHandle) maplibre.ResourceProviderDecision {
-	u := ""
-	if req.RequestedUrl != nil {
-		u = *req.RequestedUrl
+// provider is the binding resource provider shared by every worker
+// runtime. Its route claims only provider-scheme tile URLs, so external
+// HTTP never reaches Provide (and file:// glyphs and sprites never reach
+// any provider).
+func (s *TileStore) provider() maplibre.ResourceProvider {
+	return maplibre.ResourceProvider{
+		Routes:   []maplibre.ResourceRoute{{Flags: maplibre.UrlMatchFlagGlob, Url: tileURLPrefix + "**"}},
+		Callback: s.Provide,
 	}
-	if !strings.HasPrefix(u, tileURLPrefix) && req.ResolvedUrl != nil {
-		u = *req.ResolvedUrl
+}
+
+// Provide is the binding resource-provider callback. Answering a request
+// consumes its handle.
+func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.ResourceRequestHandle) {
+	u := req.RequestedUrl
+	if !strings.HasPrefix(u, tileURLPrefix) {
+		u = req.ResolvedUrl
 	}
 	z, x, y, ok := parseTileURL(u)
 	if !ok {
+		// Matched the route but is not a tile path native loading could
+		// serve either; let it fail there rather than invent a response.
 		if services.GlobalMetrics != nil {
 			services.GlobalMetrics.RecordTileProviderRequest("passthrough", 0)
 		}
-		return maplibre.ResourceProviderDecisionPassThrough
+		if err := h.PassThrough(); err != nil {
+			_ = h.Close()
+		}
+		return
 	}
 
 	data, found, err := s.Get(z, x, y)
@@ -376,8 +387,7 @@ func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.Resour
 	case err != nil:
 		response.Status = maplibre.ResourceResponseStatusError
 		response.ErrorReason = maplibre.ResourceErrorReasonOther
-		msg := err.Error()
-		response.ErrorMessage = &msg
+		response.ErrorMessage = err.Error()
 	case !found:
 		response.Status = maplibre.ResourceResponseStatusNoContent
 	default:
@@ -386,11 +396,10 @@ func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.Resour
 		expires := time.Now().Add(tileExpiry).UnixMilli()
 		response.ExpiresUnixMs = &expires
 	}
-	if cerr := h.Complete(response); cerr != nil && services.GlobalMetrics != nil {
-		services.GlobalMetrics.RecordTileProviderRequest("error", 0)
+	if err := h.Complete(response); err != nil {
+		if services.GlobalMetrics != nil {
+			services.GlobalMetrics.RecordTileProviderRequest("error", 0)
+		}
+		_ = h.Close() // a refused answer leaves the handle ours to release
 	}
-	// A handled request's handle is ours to release once completed; the
-	// pass-through path above must not touch it.
-	_ = h.Close()
-	return maplibre.ResourceProviderDecisionHandle
 }

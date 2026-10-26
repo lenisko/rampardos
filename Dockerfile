@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=24d95bfb4e6ec7478adbf8861d742a899b1a5b4f
+ARG MLN_FFI_REV=6ff238cb0c2618342518715027a616c974f1fb70
 
 # ================================
 # Get Git commit SHA
@@ -87,10 +87,12 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 # maplibre-native-ffi — the C ABI shared library the in-process Go
 # renderer links against.
 #
-# TEMPORARILY building from source: MLN_FFI_REV is the merge of upstream
-# PR #760 (generated bindings) on main, which the published
-# unstable-native-snapshot tag does not include yet. Return to artifact
-# consumption once the snapshot tag passes it. See
+# Built from source at a pinned upstream main commit rather than from the
+# published unstable-native-snapshot. That tag is rolling (assets are
+# replaced nightly, so a pinned build breaks the next day), and its
+# artifact no longer records the commit it was built from, so nothing
+# could check it against the binding in go.mod. Return to the artifact
+# once upstream publishes versioned native packages we can pin. See
 # docs/superpowers/specs/2026-08-15-ffi-native-executor-conversion.md.
 #
 # The stage is the pre-artifact build resurrected against the PR-era
