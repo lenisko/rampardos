@@ -94,6 +94,20 @@ visible in the code.
     at render start: the map renders only for a still, so a leftover
     belongs to a render that already failed on it.
   `TestStyleFailureFailsStillFast` (integration tag) guards both.
+  Glyph and sprite load failures are also in the mask. Each fails the
+  pending still, but with a bare native error, so the handler records
+  the resource (`resourceFailed`) and the await names it in the render
+  error. It is style state scoped by generation like `styleFailed`,
+  but inclusive (`>= styleGen`: a sprite failing before the next
+  snapshot carries the commit generation itself), and never cleared in
+  `setStyle`: a fast load can fail before the commit's Await returns. A failed sprite fails every later
+  still promptly with no new event. A failed glyph
+  range is never re-requested, so a later still needing it hung to the
+  render timeout; the worker retires after a glyph failure instead, and
+  its replacement's fresh map fails fast. The event can trail the
+  still's Future, so a failed still waits up to 100 ms for it, and a
+  glyph failure found at the next render start retires the worker
+  then. Both are counted and warned once per resource per pool.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   completes once the map and driver apply the extent and the map

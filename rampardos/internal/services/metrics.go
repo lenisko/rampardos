@@ -133,7 +133,8 @@ type MetricsManager struct {
 	rendererStillFrameResults *prometheus.CounterVec
 	// Renders that changed a worker's target size, to show how often
 	// request sizes alternate on the same worker.
-	rendererResizes *prometheus.CounterVec
+	rendererResizes        *prometheus.CounterVec
+	rendererResourceErrors *prometheus.CounterVec
 
 	// Global concurrency semaphore (RENDERER_POOL_SIZE). Caps
 	// concurrent renders across all pools; complements the per-pool
@@ -415,6 +416,10 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_renderer_still_frame_results_total",
 			Help: "Frame results of still-image demands, by disposition (rendered, no_update, target_not_ready, superseded). The still resubmits a demand that ends before the image renders; target_not_ready fails the render.",
 		}, []string{"style", "scale", "disposition"}),
+		rendererResourceErrors: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rampardos_renderer_resource_errors_total",
+			Help: "Glyph and sprite loads that failed in a renderer map, by kind (glyphs, sprite). Each fails the render it happened in; the first failure of each resource per pool is logged.",
+		}, []string{"style", "scale", "kind"}),
 		rendererResizes: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_resizes_total",
 			Help: "Renders that resized the worker's render target because the requested logical size differed from that worker's previous render. Divide by rampardos_renderer_viewport_duration_seconds_count for the share of renders that paid for a resize.",
@@ -1052,6 +1057,10 @@ func (m *MetricsManager) GetTemplateRenderStats() []TemplateRenderStat {
 
 func (m *MetricsManager) IncRendererStillFrameResult(style, scale, disposition string) {
 	m.rendererStillFrameResults.WithLabelValues(bucketLabel(style), bucketLabel(scale), disposition).Inc()
+}
+
+func (m *MetricsManager) IncRendererResourceError(style, scale, kind string) {
+	m.rendererResourceErrors.WithLabelValues(bucketLabel(style), bucketLabel(scale), kind).Inc()
 }
 
 func (m *MetricsManager) IncRendererResize(style, scale string) {

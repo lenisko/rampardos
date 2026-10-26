@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -119,4 +120,87 @@ func TestStyleFailureFailsStillFast(t *testing.T) {
 		render(p, false, "after reload from a missing style")
 		render(p, false, "good style, second render")
 	})
+}
+
+// TestMissingResourcesReport pins how glyph and sprite load failures
+// behave. Each fails the still with a bare native error, so every render
+// error must name the resource, and each failing resource is recorded
+// once per pool for the warning log. Repeat renders must fail promptly
+// too: a failed glyph range is never re-requested, so a map that saw one
+// would leave the next still pending until the render timeout.
+func TestMissingResourcesReport(t *testing.T) {
+	cases := []struct {
+		kind, extra, layout string
+	}{
+		{"glyphs", `"glyphs":"file://DIR/fonts/{fontstack}/{range}.pbf",`, `"text-field":"London","text-font":["Missing Sans"]`},
+		{"sprite", `"sprite":"file://DIR/sprite/missing",`, `"icon-image":"nope"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			dir := t.TempDir()
+			style := filepath.Join(dir, "style.json")
+			body := `{"version":8,` + strings.ReplaceAll(tc.extra, "DIR", dir) + `
+			  "sources":{"pt":{"type":"geojson","data":{"type":"Point","coordinates":[-0.12,51.5]}}},
+			  "layers":[
+			    {"id":"bg","type":"background","paint":{"background-color":"#ff8800"}},
+			    {"id":"sym","type":"symbol","source":"pt","layout":{` + tc.layout + `}}
+			  ]}`
+			if err := os.WriteFile(style, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			p, err := newGoStylePool(goStylePoolConfig{
+				ambientCacheBytes: -1,
+				styleID:           "missing-" + tc.kind,
+				scaleLabel:        "1",
+				poolSize:          1,
+				minPoolSize:       1,
+				ratio:             1,
+				styleURL:          "file://" + style,
+				startupTimeout:    30 * time.Second,
+				renderTimeout:     10 * time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(p.close)
+
+			vp := ViewportRequest{StyleID: "missing-" + tc.kind, Latitude: 51.5, Longitude: -0.12, Zoom: 10, Width: 128, Height: 128, Scale: 1}
+			for i := 0; i < 3; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				start := time.Now()
+				_, err := p.dispatch(ctx, vp, 1)
+				cancel()
+				took := time.Since(start)
+				if err == nil {
+					t.Fatalf("render %d succeeded, want a failure", i)
+				}
+				if !strings.Contains(err.Error(), tc.kind+" ") {
+					t.Fatalf("render %d: error %q does not name the %s failure", i, err, tc.kind)
+				}
+				if took > 2500*time.Millisecond {
+					t.Fatalf("render %d took %s, want a prompt result (err=%v)", i, took, err)
+				}
+				t.Logf("render %d: %s err=%v", i, took, err)
+			}
+
+			// The events arrive on the runtime's thread; give them a moment.
+			found := func() (n int) {
+				p.resourceErrs.Range(func(k, _ any) bool {
+					if strings.HasPrefix(k.(string), tc.kind+" ") {
+						n++
+					}
+					return true
+				})
+				return n
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for found() == 0 && time.Now().Before(deadline) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			p.resourceErrs.Range(func(k, _ any) bool { t.Logf("reported: %s", k); return true })
+			if found() == 0 {
+				t.Fatalf("no %s failure reported", tc.kind)
+			}
+		})
+	}
 }
