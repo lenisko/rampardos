@@ -27,7 +27,7 @@ set -euo pipefail
 # after that this script fails the rev check by design. Copy /ffi/install
 # out of the mln-ffi-build stage for host development instead.
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi}"
-MLN_FFI_REV="${MLN_FFI_REV:-6ff238cb0c2618342518715027a616c974f1fb70}"
+MLN_FFI_REV="${MLN_FFI_REV:-7137a95a9f26a7e44103f5b13825df4198de15c3}"
 MLN_FFI_SNAPSHOT_TAG="${MLN_FFI_SNAPSHOT_TAG:-unstable-native-snapshot}"
 
 case "$(uname -s)-$(uname -m)" in

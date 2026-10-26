@@ -3,7 +3,7 @@
 # Global so both the FFI build and the Go build see the same value: the
 # native library and the Go binding pinned in go.mod must come from one
 # upstream commit, and the rampardos-build stage asserts that.
-ARG MLN_FFI_REV=6ff238cb0c2618342518715027a616c974f1fb70
+ARG MLN_FFI_REV=7137a95a9f26a7e44103f5b13825df4198de15c3
 
 # ================================
 # Get Git commit SHA
@@ -97,7 +97,7 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 #
 # The stage is the pre-artifact build resurrected against the PR-era
 # bootstrap: the FFI's own Linux bootstrap apt set, pinned
-# CMake/Zig/Rust/cargo-about matching its mise.toml [vars] (the Linux
+# CMake/Zig/Rust/cargo-about matching its mise.toml [tools] (the Linux
 # presets compile with `zig cc` against glibc 2.17 — same portability
 # as the published artifact), and .mise/bin/sync-submodules (the
 # submodule is `update = none`; their script checks out the filtered
@@ -110,7 +110,8 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 FROM ubuntu:24.04 AS mln-ffi-build
 ARG MLN_FFI_REPO=https://github.com/maplibre/maplibre-native-ffi
 ARG MLN_FFI_REV
-# Keep in sync with the FFI's mise.toml [vars] at MLN_FFI_REV.
+# Keep in sync with the tool versions in the FFI's mise.toml [tools]
+# (CMake, cargo-about, rust, zig) at MLN_FFI_REV.
 ARG MLN_CMAKE_VERSION=4.4.4
 ARG MLN_RUST_VERSION=1.99.1
 ARG MLN_CARGO_ABOUT_VERSION=0.9.2
@@ -163,15 +164,13 @@ RUN case "$TARGETARCH" in \
  && cargo-about --version
 
 # sync-submodules checks out the filtered vendor trees and applies the
-# carried maplibre-native patches; sync-rustls-platform-verifier stages
-# the patched Cargo path-dependency the workspace manifest references
-# (cargo metadata fails at configure time without it). Both are the
-# scripts mise's [deps.*] providers run.
+# carried maplibre-native patches. It is the script mise's
+# [deps.submodules] provider runs; the other [deps.*] providers (uv,
+# pnpm) serve tooling the native build doesn't use.
 WORKDIR /ffi/src
 RUN git clone "${MLN_FFI_REPO}" . \
  && git checkout ${MLN_FFI_REV} \
- && .mise/bin/sync-submodules \
- && .mise/bin/sync-rustls-platform-verifier
+ && .mise/bin/sync-submodules
 
 # Configure + build via the upstream workflow preset (backend/provider
 # cache vars: opengl + egl), then install. The generated .pc is
