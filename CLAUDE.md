@@ -63,8 +63,10 @@ visible in the code.
   FrameWake (results are drained to record them and to fail fast on
   TargetNotReady, after which the still would wait for a target change
   that never comes), on `mapErr`, and on the style-failure wake.
-  Results queued at render start belong to an earlier still (usually an
-  abandoned one that settled later) and are flushed. The readback may
+  Results queued at render start belong to an earlier still and are
+  flushed, but counted: the completing frame's result can trail the
+  Future past the final drain (~8% of renders in prod), so discarding
+  them uncounted undercut the frame-result metric. The readback may
   follow as soon as the Future completes.
 - **Map failures arrive by push.** The runtime event handler
   (`handleEvents`) runs on the runtime's native thread: it may only

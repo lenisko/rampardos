@@ -179,8 +179,9 @@ func main() {
 	}
 
 	// Skip the PNG decode on every base-map stitch — pprof showed
-	// image.Decode at 54% of CPU before this cache existed.
-	services.InitGlobalTileImageCache(cfg.TileImageCacheSize)
+	// image.Decode at 54% of CPU before this cache existed. Bounded by
+	// bytes; the entry count is a secondary cap.
+	services.InitGlobalTileImageCache(cfg.TileImageCacheSize, int64(cfg.TileImageCacheMB)<<20)
 
 	// Cross-request burst-sharing cache for base renders, final
 	// staticmap outputs and multistaticmap composites. Replaces the

@@ -362,9 +362,9 @@ ENV MALLOC_ARENA_MAX=2
 # The Go-side counterpart. With GOGC=100 the heap grows to ~2x the live
 # set before collecting, and freed spans return to the OS only slowly. A
 # soft limit makes the GC collect and scavenge as the heap nears it. Keep
-# it comfortably above COMPOSITE_IMAGE_CACHE_MB plus the count-bounded
-# tile and marker image caches, or the GC runs continuously. Override per
-# deployment; see #34.
+# it comfortably above COMPOSITE_IMAGE_CACHE_MB plus TILE_IMAGE_CACHE_MB
+# and the count-bounded marker image cache, or the GC runs continuously.
+# Override per deployment; see #34.
 ENV GOMEMLIMIT=1GiB
 EXPOSE 9000
 

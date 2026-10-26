@@ -1294,14 +1294,18 @@ func (w *goWorker) drainFrames(start time.Time) (int, error) {
 		if serviceTrace {
 			fmt.Fprintf(os.Stderr, "TRACE +%6dus frame disp=%d update=%d\n", time.Since(start).Microseconds(), res.Disposition, res.MapUpdateGeneration)
 		}
-		if services.GlobalMetrics != nil {
-			services.GlobalMetrics.IncRendererStillFrameResult(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, dispositionLabel(res.Disposition))
-		}
+		w.countFrameResult(res)
 		if res.Disposition == maplibre.RenderResultTargetNotReady {
 			return len(results), fmt.Errorf("renderer: still image: render target not ready")
 		}
 	}
 	return len(results), nil
+}
+
+func (w *goWorker) countFrameResult(res maplibre.RenderFrameResult) {
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.IncRendererStillFrameResult(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, dispositionLabel(res.Disposition))
+	}
 }
 
 // awaitStill waits for a still-image request to complete. The request
@@ -1315,11 +1319,14 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 
-	// Results queued since the last render belong to an earlier still,
-	// typically an abandoned one that settled later. A wake latched by
-	// them is stale too, and so is a render error: the map renders only
-	// for a still, so one left over was raised by an earlier render,
-	// which has already failed on it.
+	// Results queued since the last render belong to an earlier still:
+	// usually the completing frame of the previous one, whose result
+	// trailed its Future past that render's final drain, or an abandoned
+	// still that settled later. They are counted, so the frame-result
+	// metric stays whole, but not acted on. A wake latched by them is
+	// stale too, and so is a render error: the map renders only for a
+	// still, so one left over was raised by an earlier render, which has
+	// already failed on it.
 	for {
 		results, err := w.sess.DrainFrameResults()
 		if err != nil {
@@ -1327,6 +1334,9 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		}
 		if len(results) == 0 {
 			break
+		}
+		for _, res := range results {
+			w.countFrameResult(res)
 		}
 	}
 	select {
