@@ -28,12 +28,12 @@ DOCKER_PLATFORMS=linux/amd64
 
 # In-process Go renderer (RENDERER_BACKEND=go-pool) — see plan in
 # docs/superpowers/plans/2026-05-01-in-process-go-renderer.md.
-# MLN_FFI_REV is the upstream commit the Docker build compiles the
-# library from. It MUST stay in sync with the ARG in the Dockerfile and with the
-# pseudo-version in rampardos/go.mod — both the artifact fetch and the Go
-# build assert it, so a drift fails the build rather than linking a
-# library the binding was not built against.
-MLN_FFI_REV ?= 7137a95a9f26a7e44103f5b13825df4198de15c3
+# MLN_FFI_VERSION is the upstream release the native library comes from.
+# It MUST stay in sync with the ARG in the Dockerfile and with the binding
+# version in rampardos/go.mod — the Docker build asserts the go.mod side,
+# so a drift fails the build rather than linking a library the binding was
+# not built against.
+MLN_FFI_VERSION ?= 0.202610.3
 MLN_FFI_DIR_HOST ?= $(HOME)/dev/maplibre-native-ffi
 
 # Default target
@@ -90,7 +90,7 @@ clean:
 
 ## fetch-ffi: Download upstream's published libmaplibre-native-c.so (Linux only)
 fetch-ffi:
-	MLN_FFI_REV=$(MLN_FFI_REV) MLN_FFI_DIR_HOST=$(MLN_FFI_DIR_HOST) ./scripts/fetch-mln-ffi.sh
+	MLN_FFI_VERSION=$(MLN_FFI_VERSION) MLN_FFI_DIR_HOST=$(MLN_FFI_DIR_HOST) ./scripts/fetch-mln-ffi.sh
 
 ## build-go-renderer: Build rampardos against the fetched FFI (Linux only). Run fetch-ffi first.
 build-go-renderer:
