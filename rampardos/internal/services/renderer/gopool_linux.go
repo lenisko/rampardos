@@ -469,6 +469,11 @@ type goStylePool struct {
 	highWater  int // most workers this pool has held; guarded by mu
 	reaperDone chan struct{}
 
+	// waiting counts dispatches blocked until a worker is free. A worker
+	// that retires itself is replaced while any are, since they may have
+	// been counting on it.
+	waiting atomic.Int32
+
 	// startWorker is the worker constructor, swappable in tests so the
 	// grow/shrink policy can be exercised without standing up real EGL
 	// contexts. Nil means use the real one.
@@ -669,11 +674,18 @@ func (p *goStylePool) deregister(w *goWorker) {
 			break
 		}
 	}
+	below := len(p.workers) < p.cfg.minPoolSize
 	p.mu.Unlock()
 	if services.GlobalMetrics != nil {
 		services.GlobalMetrics.RecordRendererWorkerReplacement(p.cfg.styleID, p.cfg.scaleLabel, services.WorkerReplacementError)
 	}
 	p.reportSize()
+	// Replace it now if requests are waiting or the pool fell below its
+	// floor: a dispatch grows the pool only once, so with every other
+	// worker busy (or none left) nothing else would serve them.
+	if below || p.waiting.Load() > 0 {
+		p.grow()
+	}
 }
 
 // reapOnce retires at most one worker. Returns true if it did.
@@ -742,13 +754,26 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 	case <-p.done:
 		return nil, errPoolClosed
 	default:
+		p.waiting.Add(1)
 		p.grow()
+		// Bounded: static-map renders run on a context without a
+		// deadline, and a pool whose replacement worker cannot start
+		// would otherwise hold the request and its global slot forever.
+		timer := time.NewTimer(p.cfg.renderTimeout)
+		var err error
 		select {
 		case p.cmds <- cmd:
 		case <-p.done:
-			return nil, errPoolClosed
+			err = errPoolClosed
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			err = ctx.Err()
+		case <-timer.C:
+			err = fmt.Errorf("renderer: no %s worker free within %s", p.cfg.styleID, p.cfg.renderTimeout)
+		}
+		timer.Stop()
+		p.waiting.Add(-1)
+		if err != nil {
+			return nil, err
 		}
 	}
 

@@ -186,3 +186,66 @@ func TestMissingResourcesReport(t *testing.T) {
 		})
 	}
 }
+
+// TestGlyphRetirementDoesNotStrandWaitingRenders guards requests queued
+// on a pool whose worker retires. A glyph failure retires the worker
+// after its render; with one worker, renders already waiting had no one
+// left to take them, and on a context without a deadline (as static
+// maps use) they waited forever. The pool must replace the worker so
+// every waiting render runs and fails promptly.
+func TestGlyphRetirementDoesNotStrandWaitingRenders(t *testing.T) {
+	dir := t.TempDir()
+	style := filepath.Join(dir, "style.json")
+	body := `{"version":8,"glyphs":"file://` + dir + `/fonts/{fontstack}/{range}.pbf",
+	  "sources":{"pt":{"type":"geojson","data":{"type":"Point","coordinates":[-0.12,51.5]}}},
+	  "layers":[
+	    {"id":"bg","type":"background","paint":{"background-color":"#ff8800"}},
+	    {"id":"sym","type":"symbol","source":"pt","layout":{"text-field":"London","text-font":["Missing Sans"]}}
+	  ]}`
+	if err := os.WriteFile(style, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const renderTimeout = 10 * time.Second
+	p, err := newGoStylePool(goStylePoolConfig{
+		ambientCacheBytes: -1,
+		styleID:           "strand",
+		scaleLabel:        "1",
+		poolSize:          1,
+		minPoolSize:       1,
+		ratio:             1,
+		styleURL:          "file://" + style,
+		startupTimeout:    30 * time.Second,
+		renderTimeout:     renderTimeout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.close)
+
+	vp := ViewportRequest{StyleID: "strand", Latitude: 51.5, Longitude: -0.12, Zoom: 10, Width: 128, Height: 128, Scale: 1}
+	const renders = 3
+	errs := make(chan error, renders)
+	start := time.Now()
+	for range renders {
+		go func() {
+			_, err := p.dispatch(context.Background(), vp, 1)
+			errs <- err
+		}()
+	}
+	for i := range renders {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Fatalf("render %d succeeded, want a glyph failure", i)
+			}
+			t.Logf("render %d after %s: %v", i, time.Since(start), err)
+		case <-time.After(2 * renderTimeout):
+			t.Fatalf("render %d still waiting after %s: stranded by the retired worker", i, 2*renderTimeout)
+		}
+	}
+	// Each render gets a fresh worker in turn; none should have waited
+	// out the queue bound.
+	if took := time.Since(start); took > renderTimeout/2 {
+		t.Fatalf("renders took %s, want each served by a replacement worker", took)
+	}
+}

@@ -1,6 +1,7 @@
 package renderer
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -11,11 +12,12 @@ import (
 func newTestPool(min, max int) *goStylePool {
 	p := &goStylePool{
 		cfg: goStylePoolConfig{
-			styleID:     "s",
-			scaleLabel:  "1",
-			poolSize:    max,
-			minPoolSize: min,
-			idleTTL:     time.Hour, // reap is driven manually
+			styleID:       "s",
+			scaleLabel:    "1",
+			poolSize:      max,
+			minPoolSize:   min,
+			idleTTL:       time.Hour, // reap is driven manually
+			renderTimeout: time.Minute,
 		},
 		cmds:       make(chan goWorkerCommand),
 		done:       make(chan struct{}),
@@ -191,5 +193,57 @@ func TestPoolAtCeilingDoesNotGrowButRecordsSaturation(t *testing.T) {
 	p.mu.Unlock()
 	if !saturated {
 		t.Error("saturation must be recorded even when the pool cannot grow, so the reaper holds capacity")
+	}
+}
+
+// A dispatch grows the pool once and then waits. If the worker it was
+// waiting on retires itself (a glyph failure, an unsettled still), the
+// pool must replace it, or the request waits with nothing left to serve
+// it. Before the fix a pool with one worker kept none.
+func TestRetiredWorkerIsReplacedWhileRequestsWait(t *testing.T) {
+	p := newTestPool(1, 1)
+	p.mu.Lock()
+	victim := p.workers[0]
+	p.mu.Unlock()
+
+	p.waiting.Add(1) // a dispatch blocked on the queue
+	p.deregister(victim)
+	if got := p.size(); got != 1 {
+		t.Fatalf("size after the only worker retired with a request waiting = %d, want 1", got)
+	}
+}
+
+// Above the floor with nobody waiting, a retired worker is not replaced:
+// growth stays demand-driven.
+func TestRetiredWorkerAboveFloorIsNotReplacedWhenIdle(t *testing.T) {
+	p := newTestPool(1, 2)
+	p.grow()
+	p.mu.Lock()
+	victim := p.workers[1]
+	p.mu.Unlock()
+
+	p.deregister(victim)
+	if got := p.size(); got != 1 {
+		t.Fatalf("size = %d, want 1", got)
+	}
+}
+
+// A dispatch that no worker takes must give up after the render timeout
+// rather than hold its request and global slot indefinitely: static-map
+// renders run on a context without a deadline.
+func TestDispatchWaitIsBounded(t *testing.T) {
+	p := newTestPool(1, 1) // inert worker: never takes a render
+	p.cfg.renderTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	_, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1)
+	if err == nil {
+		t.Fatal("dispatch succeeded with no worker free")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("dispatch gave up after %s, want about the render timeout", took)
+	}
+	if n := p.waiting.Load(); n != 0 {
+		t.Errorf("waiting = %d after the dispatch returned, want 0", n)
 	}
 }
