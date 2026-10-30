@@ -135,8 +135,10 @@ centre. Full reference: `rampardos/internal/config/config.go`.
 | `COMPOSITE_IMAGE_CACHE_MB` | RAM budget (decoded pixels) for base, staticmap and multistaticmap images | `128` |
 | `COMPOSITE_IMAGE_CACHE_SIZE` | Secondary cap on the number of those images | `1000` |
 | `TILE_URL_<name>` | External XYZ tile URL template (e.g. `TILE_URL_MY_TILES=https://...`) | — |
-| `RENDERER_POOL_SIZE` | Renderer worker count per style (0 = NumCPU) | `0` |
-| `STYLE_POOL_SIZE` | Max styles kept live at once (0 = unbounded) | `0` |
+| `RENDERER_POOL_SIZE` | Global cap on concurrent renders across all styles and scales (0 = GOMAXPROCS) | `0` |
+| `STYLE_POOL_SIZE` | Max renderer workers per (style, scale) pool; each worker holds its own map, ~100 MB native (0 = `RENDERER_POOL_SIZE`) | `0` |
+| `STYLE_POOL_MIN` | Workers each pool keeps when idle | `1` |
+| `STYLE_POOL_IDLE_SECONDS` | Quiet interval after which a pool retires one worker above `STYLE_POOL_MIN` | `600` |
 | `EXPERIMENTAL_G_SAT` | Register a built-in Google Satellite external style | `true` |
 | `PPROF_ENABLED` | Mount `/debug/pprof` for live profiling | `false` |
 
