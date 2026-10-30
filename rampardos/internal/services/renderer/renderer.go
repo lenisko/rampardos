@@ -76,13 +76,8 @@ type ViewportRequest struct {
 	Format    models.ImageFormat
 }
 
-// Config selects and parameterises a Renderer backend.
+// Config parameterises the renderer.
 type Config struct {
-	// Backend selects the implementation. Only "go-pool" exists; retained
-	// so RENDERER_BACKEND stays a validated setting rather than silently
-	// ignored.
-	Backend string
-
 	// Two-level concurrency. PoolSize is a process-global semaphore
 	// capping concurrent renders across every (style, scale) pool;
 	// StylePoolSize caps the workers within one pool. Raising StylePoolSize

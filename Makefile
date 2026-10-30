@@ -26,7 +26,7 @@ DOCKER_TAG=latest
 # see comment in .github/workflows/docker-build.yml.
 DOCKER_PLATFORMS=linux/amd64
 
-# In-process Go renderer (RENDERER_BACKEND=go-pool) — see plan in
+# In-process Go renderer — see plan in
 # docs/superpowers/plans/2026-05-01-in-process-go-renderer.md.
 # MLN_FFI_VERSION is the upstream release the native library comes from.
 # It MUST stay in sync with the ARG in the Dockerfile and with the binding

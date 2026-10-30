@@ -24,7 +24,6 @@ import (
 //	  ./internal/services/renderer/ -v -run TestIntegrationGo
 func TestIntegrationGo(t *testing.T) {
 	cfg := setupIntegrationFixtures(t)
-	cfg.Backend = "go-pool"
 
 	r, err := NewGoPoolRenderer(cfg)
 	if err != nil {

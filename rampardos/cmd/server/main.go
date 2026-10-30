@@ -94,7 +94,6 @@ func main() {
 
 	// Initialize the renderer (lazily creates in-process worker pools).
 	rendererCfg := renderer.Config{
-		Backend:          cfg.RendererBackend,
 		PoolSize:         cfg.RendererPoolSize,
 		StylePoolSize:    cfg.RendererStylePoolSize,
 		StylePoolMin:     cfg.RendererStylePoolMin,
@@ -116,19 +115,9 @@ func main() {
 	// The in-process Go renderer is the only backend. It requires a
 	// Linux build with CGO and libmaplibre-native-c.so; elsewhere the
 	// stub returns a clear error rather than silently degrading.
-	var (
-		renderEngine renderer.Renderer
-		err          error
-	)
-	switch cfg.RendererBackend {
-	case "go-pool", "":
-		renderEngine, err = renderer.NewGoPoolRenderer(rendererCfg)
-	default:
-		slog.Error("Unknown RENDERER_BACKEND; only 'go-pool' is supported on this build", "backend", cfg.RendererBackend)
-		os.Exit(1)
-	}
+	renderEngine, err := renderer.NewGoPoolRenderer(rendererCfg)
 	if err != nil {
-		slog.Error("Failed to initialise renderer", "backend", cfg.RendererBackend, "error", err)
+		slog.Error("Failed to initialise renderer", "error", err)
 		os.Exit(1)
 	}
 	// renderEngine.Close() is called explicitly during shutdown (after the

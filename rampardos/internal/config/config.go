@@ -15,7 +15,6 @@ type Config struct {
 	RequestTimeout time.Duration
 
 	// Renderer settings
-	RendererBackend        string        // "go-pool" — the only backend
 	RendererPoolSize       int           // global cap on concurrent renders (semaphore size)
 	RendererStylePoolSize  int           // ceiling on workers per (style, scale) pool (default: RendererPoolSize)
 	RendererStylePoolMin   int           // workers a pool keeps when idle (default: 1)
@@ -85,7 +84,6 @@ func Load() *Config {
 		Hostname:       getEnv("HOSTNAME", "0.0.0.0"),
 		RequestTimeout: getEnvDuration("REQUEST_TIMEOUT", 10*time.Second),
 
-		RendererBackend:        getEnv("RENDERER_BACKEND", "go-pool"),
 		RendererPoolSize:       getEnvInt("RENDERER_POOL_SIZE", 0),
 		RendererStylePoolSize:  getEnvInt("STYLE_POOL_SIZE", 0),
 		RendererStylePoolMin:   getEnvInt("STYLE_POOL_MIN", 1),
