@@ -271,12 +271,14 @@ ENV MESA_GL_VERSION_OVERRIDE=3.3
 # why the image no longer needs Xvfb or DISPLAY: those existed only for
 # the Node binding, which required an X display for its GL context.
 ENV EGL_PLATFORM=surfaceless
-# Each renderer worker brings its own native threads, and glibc gives
-# threads their own malloc arenas that it rarely returns to the OS. With
-# workers retiring and regrowing, the default arena count let RSS climb
-# without bound (~3 MB per retired worker in a local churn probe); two
-# shared arenas held it flat.
-ENV MALLOC_ARENA_MAX=2
+# Every renderer thread (mbgl's, llvmpipe's, ~100 in all) allocates
+# through glibc malloc. Two arenas held RSS flat under worker churn but
+# made renders contend on malloc even one at a time: p50 ~11% and p99
+# ~15% slower than 64 on an 8-vCPU bench. The churn growth that cap was
+# added for (~10 MB per retired worker at 64) is handled instead by a
+# malloc_trim after each worker teardown (releaseNativeMemory). 64 is
+# glibc's own default on 8 cores; the fixed value bounds larger hosts.
+ENV MALLOC_ARENA_MAX=64
 # The Go-side counterpart. With GOGC=100 the heap grows to ~2x the live
 # set before collecting, and freed spans return to the OS only slowly. A
 # soft limit makes the GC collect and scavenge as the heap nears it. Keep

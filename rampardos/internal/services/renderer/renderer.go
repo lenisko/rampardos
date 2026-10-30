@@ -104,8 +104,8 @@ type Config struct {
 	// StylePoolIdleTTL is the quiet interval after which a pool retires
 	// one worker (default: 10m). Growth is immediate; shrink is one worker
 	// per interval so a brief lull doesn't collapse a hot pool. Each retire
-	// and regrow cycle costs a cold style load and, under glibc, leaves
-	// per-thread malloc arenas behind, so bursty traffic wants a long TTL.
+	// and regrow cycle costs a cold style load and a malloc_trim, so bursty
+	// traffic wants a long TTL.
 	StylePoolIdleTTL time.Duration
 
 	RenderTimeout  time.Duration // per-request deadline (default: 15s)

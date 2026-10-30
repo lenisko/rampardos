@@ -1096,6 +1096,7 @@ func (w *goWorker) cleanup() {
 		}
 	}
 	// w.egl is the process-wide display; it outlives every worker.
+	releaseNativeMemory()
 }
 
 // renderOne is the per-worker hot path. Resize only if extent changed
