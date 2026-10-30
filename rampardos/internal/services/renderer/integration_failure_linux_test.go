@@ -13,11 +13,10 @@ import (
 
 // TestStyleFailureFailsStillFast guards the decision to take load
 // failures from the still's own Future rather than from runtime events:
-// a style that fails to load, at startup or on reload, must fail the
-// render promptly (not by the render timeout), and once a good style is
-// loaded again no stale failure may fail the next render. A failed
-// still leaves the map with nothing pending, so it must not retire the
-// worker either.
+// a style that fails to load must fail every render promptly (not by
+// the render timeout). A reload builds new pools, so a pool's first
+// style is the only one it ever loads. A failed still leaves the map
+// with nothing pending, so it must not retire the worker either.
 func TestStyleFailureFailsStillFast(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.json")
@@ -85,39 +84,22 @@ func TestStyleFailureFailsStillFast(t *testing.T) {
 			t.Fatalf("worker retired by a style failure (workers=%d)", len(p.workers))
 		}
 	}
-	reload := func(p *goStylePool, styleFile string) {
-		t.Helper()
-		if err := p.setStyleAll(context.Background(), "file://"+styleFile); err != nil {
-			t.Fatalf("reload %s: %v", filepath.Base(styleFile), err)
-		}
+	for _, tc := range []struct{ name, file string }{
+		{"broken", bad},
+		{"missing", missing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPool(tc.file)
+			w := p.workers[0]
+			render(p, true, tc.name+" style")
+			render(p, true, tc.name+" style, second render")
+			sameWorker(p, w)
+		})
 	}
 
-	t.Run("startup", func(t *testing.T) {
-		p := newPool(bad)
-		w := p.workers[0]
-		render(p, true, "broken style at startup")
-		render(p, true, "broken style, second render")
-		sameWorker(p, w)
-		reload(p, good)
-		render(p, false, "after reload to a good style")
-	})
-
-	t.Run("reload", func(t *testing.T) {
+	t.Run("good", func(t *testing.T) {
 		p := newPool(good)
-		w := p.workers[0]
 		render(p, false, "good style")
-		reload(p, bad)
-		render(p, true, "after reload to a broken style")
-		render(p, true, "broken style after reload, second render")
-		sameWorker(p, w)
-		reload(p, good)
-		render(p, false, "after reload back to a good style")
-		reload(p, missing)
-		render(p, true, "after reload to a missing style")
-		render(p, true, "missing style, second render")
-		sameWorker(p, w)
-		reload(p, good)
-		render(p, false, "after reload from a missing style")
 		render(p, false, "good style, second render")
 	})
 }

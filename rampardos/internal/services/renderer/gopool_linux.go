@@ -13,6 +13,7 @@ package renderer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"log/slog"
@@ -57,9 +58,18 @@ type GoPoolRenderer struct {
 	// budget; negative leaves mbgl's default.
 	ambientCacheBytes int64
 
-	mu    sync.RWMutex
-	pools map[string]*goStylePool
+	mu     sync.RWMutex
+	pools  map[string]*goStylePool
+	closed bool // guarded by mu; set by Close
+
+	// reloadMu serialises ReloadStyles: SIGHUP and the admin dataset
+	// pipeline can both trigger one.
+	reloadMu sync.Mutex
 }
+
+// errPoolClosed is returned by dispatch on a pool that a reload has
+// replaced (or Close has shut down) before any worker took the render.
+var errPoolClosed = errors.New("renderer: pool closed")
 
 func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	if cfg.PoolSize <= 0 {
@@ -207,44 +217,55 @@ func (r *GoPoolRenderer) RenderViewportImage(ctx context.Context, req ViewportRe
 func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRequest, applyZoomAdj bool) (*image.NRGBA, error) {
 	scale := max(int(req.Scale), 1)
 
-	pool, err := r.getOrCreatePool(req.StyleID, req.Scale)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := r.acquireGlobal(ctx); err != nil {
 		return nil, err
 	}
 	defer r.releaseGlobal()
 
-	adjusted := req
-	if applyZoomAdj {
-		adjusted.Zoom = req.Zoom - pool.cfg.viewportZoomAdj
-		slog.Debug("renderer viewport dispatch",
-			"style", req.StyleID,
-			"scale", req.Scale,
-			"callerZoom", req.Zoom,
-			"maplibreZoom", adjusted.Zoom,
-			"zoomAdj", pool.cfg.viewportZoomAdj,
-		)
-	}
+	// A reload swaps in new pools and closes the old ones. A render that
+	// reached an old pool after its close is refused before any worker
+	// takes it, so it moves to the pool that replaced it.
+	for attempt := 0; ; attempt++ {
+		pool, err := r.getOrCreatePool(req.StyleID, req.Scale)
+		if err != nil {
+			return nil, err
+		}
 
-	return pool.dispatch(ctx, adjusted, scale)
+		adjusted := req
+		if applyZoomAdj {
+			adjusted.Zoom = req.Zoom - pool.cfg.viewportZoomAdj
+			slog.Debug("renderer viewport dispatch",
+				"style", req.StyleID,
+				"scale", req.Scale,
+				"callerZoom", req.Zoom,
+				"maplibreZoom", adjusted.Zoom,
+				"zoomAdj", pool.cfg.viewportZoomAdj,
+			)
+		}
+
+		img, err := pool.dispatch(ctx, adjusted, scale)
+		if errors.Is(err, errPoolClosed) && attempt < 2 {
+			continue
+		}
+		return img, err
+	}
 }
 
-func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
-	styleFile := filepath.Join(r.cfg.StylesDir, id, "style.json")
+// loadPool builds a pool from rcfg, a snapshot of r.cfg taken under mu
+// (ReloadStyles updates its TileJSON).
+func (r *GoPoolRenderer) loadPool(rcfg Config, id string, ratio int) (*goStylePool, error) {
+	styleFile := filepath.Join(rcfg.StylesDir, id, "style.json")
 	raw, err := os.ReadFile(styleFile)
 	if err != nil {
 		return nil, fmt.Errorf("read style.json: %w", err)
 	}
 
-	prepared, err := PrepareStyle(id, raw, r.cfg)
+	prepared, err := PrepareStyle(id, raw, rcfg)
 	if err != nil {
 		return nil, fmt.Errorf("prepare style: %w", err)
 	}
 
-	preparedPath := filepath.Join(r.cfg.StylesDir, id, "style.prepared.json")
+	preparedPath := filepath.Join(rcfg.StylesDir, id, "style.prepared.json")
 	if err := fileutil.AtomicWriteFile(preparedPath, prepared, 0o644); err != nil {
 		return nil, fmt.Errorf("write prepared style: %w", err)
 	}
@@ -257,13 +278,13 @@ func (r *GoPoolRenderer) loadPool(id string, ratio int) (*goStylePool, error) {
 		styleID:           id,
 		scaleLabel:        strconv.Itoa(ratio),
 		viewportZoomAdj:   zoomAdj,
-		poolSize:          r.cfg.StylePoolSize,
-		minPoolSize:       r.cfg.StylePoolMin,
-		idleTTL:           r.cfg.StylePoolIdleTTL,
+		poolSize:          rcfg.StylePoolSize,
+		minPoolSize:       rcfg.StylePoolMin,
+		idleTTL:           rcfg.StylePoolIdleTTL,
 		ratio:             ratio,
 		styleURL:          "file://" + preparedPath,
-		startupTimeout:    r.cfg.StartupTimeout,
-		renderTimeout:     r.cfg.RenderTimeout,
+		startupTimeout:    rcfg.StartupTimeout,
+		renderTimeout:     rcfg.RenderTimeout,
 	}
 	return newGoStylePool(cfg)
 }
@@ -284,6 +305,9 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.closed {
+		return nil, fmt.Errorf("renderer: closed")
+	}
 	if pool, ok := r.pools[key]; ok {
 		return pool, nil
 	}
@@ -295,7 +319,7 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 
 	ratio := int(scale)
 	slog.Info("Creating Go renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", r.cfg.StylePoolSize, "globalRenderCap", r.cfg.PoolSize)
-	pool, err := r.loadPool(styleID, ratio)
+	pool, err := r.loadPool(r.cfg, styleID, ratio)
 	if err != nil {
 		return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
 	}
@@ -303,14 +327,19 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 	return pool, nil
 }
 
-// ReloadStyles broadcasts a reload command to every worker in every
-// pool. Workers process commands serially, so reload queues behind any
-// in-flight render on each worker. Under sustained load this briefly
-// serialises reload — same as the previous implementation's setStyleAll
-// drain pattern.
+// ReloadStyles rebuilds every active pool from the current style files
+// and dataset and swaps the new pools in. Reloading in place is not
+// enough: a map keeps the tiles it has loaded across a style change, so
+// after a dataset switch an existing worker would go on rendering the
+// old data. Pools are built outside the lock so renders continue on the
+// old ones meanwhile; a render that reaches an old pool after the swap
+// is moved to its replacement (see renderViewportImage).
 func (r *GoPoolRenderer) ReloadStyles(ctx context.Context) error {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
 	// Dataset activate/combine retargets the mbtiles symlink; follow it
-	// before re-preparing styles so the inline TileJSON matches the new
+	// before preparing styles so the inline TileJSON matches the new
 	// dataset's zoom range and the tile cache drops stale blobs.
 	if r.store != nil {
 		if err := r.store.Reopen(); err != nil {
@@ -325,64 +354,70 @@ func (r *GoPoolRenderer) ReloadStyles(ctx context.Context) error {
 	}
 
 	r.mu.RLock()
+	rcfg := r.cfg
 	keys := make([]string, 0, len(r.pools))
 	for key := range r.pools {
 		keys = append(keys, key)
 	}
 	r.mu.RUnlock()
 
+	built := make(map[string]*goStylePool, len(keys))
 	for _, key := range keys {
 		if ctx.Err() != nil {
+			for _, p := range built {
+				p.close()
+			}
 			return ctx.Err()
 		}
-		r.mu.RLock()
-		pool, ok := r.pools[key]
-		r.mu.RUnlock()
-		if !ok {
-			continue
-		}
-
 		styleID, ratio := parsePoolKey(key)
-
-		styleFile := filepath.Join(r.cfg.StylesDir, styleID, "style.json")
-		raw, err := os.ReadFile(styleFile)
+		pool, err := r.loadPool(rcfg, styleID, ratio)
 		if err != nil {
-			slog.Error("Reload: read style.json failed; pool kept on previous style", "style", styleID, "ratio", ratio, "error", err)
+			slog.Error("Reload: pool rebuild failed; keeping the previous pool", "style", styleID, "ratio", ratio, "error", err)
 			continue
 		}
-		prepared, err := PrepareStyle(styleID, raw, r.cfg)
-		if err != nil {
-			slog.Error("Reload: prepare style failed; pool kept on previous style", "style", styleID, "ratio", ratio, "error", err)
-			continue
-		}
-		preparedPath := filepath.Join(r.cfg.StylesDir, styleID, "style.prepared.json")
-		if err := fileutil.AtomicWriteFile(preparedPath, prepared, 0o644); err != nil {
-			slog.Error("Reload: write prepared style failed; pool kept on previous style", "style", styleID, "ratio", ratio, "error", err)
-			continue
-		}
+		built[key] = pool
+	}
 
-		styleURL := "file://" + preparedPath
-		zoomAdj := styleZoomOffset(raw)
-
-		if err := pool.setStyleAll(ctx, styleURL); err != nil {
-			slog.Error("Reload: setStyleAll failed; pool may be partially swapped", "style", styleID, "ratio", ratio, "error", err)
-			continue
+	// Swap only the pools that were rebuilt. A pool that getOrCreatePool
+	// added meanwhile stays: it was built from the files as they are now.
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		for _, p := range built {
+			p.close()
 		}
-		pool.mu.Lock()
-		pool.cfg.viewportZoomAdj = zoomAdj
-		pool.cfg.styleURL = styleURL
-		pool.mu.Unlock()
+		return fmt.Errorf("renderer: closed")
+	}
+	old := make([]*goStylePool, 0, len(built))
+	for key, pool := range built {
+		if prev, ok := r.pools[key]; ok {
+			old = append(old, prev)
+		}
+		r.pools[key] = pool
+	}
+	r.mu.Unlock()
+
+	// Closing waits for each old worker's in-flight render to finish.
+	for _, p := range old {
+		p.close()
 	}
 	return nil
 }
 
 func (r *GoPoolRenderer) Close() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, pool := range r.pools {
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	pools := r.pools
+	r.pools = map[string]*goStylePool{}
+	r.mu.Unlock()
+
+	for _, pool := range pools {
 		pool.close()
 	}
-	r.pools = nil
 	if r.store != nil {
 		r.store.Close()
 	}
@@ -415,7 +450,11 @@ type goStylePoolConfig struct {
 type goStylePool struct {
 	cfg goStylePoolConfig
 
+	// cmds is never closed: a dispatch may be sending on it at any time.
+	// done is closed instead, which stops the workers and refuses
+	// dispatches that no worker has taken.
 	cmds chan goWorkerCommand
+	done chan struct{}
 	wg   sync.WaitGroup
 
 	mu      sync.Mutex
@@ -437,7 +476,7 @@ type goStylePool struct {
 
 	// resourceErrs holds the glyph and sprite failures already logged,
 	// so a resource that fails on every render warns once per pool (a
-	// style reload builds a new pool and warns again).
+	// reload builds a new pool and warns again).
 	resourceErrs sync.Map
 }
 
@@ -445,7 +484,6 @@ type goWorkerCmdKind int
 
 const (
 	goWorkerCmdRender goWorkerCmdKind = iota
-	goWorkerCmdReload
 	goWorkerCmdShutdown
 )
 
@@ -453,7 +491,6 @@ type goWorkerCommand struct {
 	kind   goWorkerCmdKind
 	ctx    context.Context
 	render *goRenderRequest // non-nil iff kind == goWorkerCmdRender
-	reload string           // styleURL, non-empty iff kind == goWorkerCmdReload
 	reply  chan goWorkerResult
 }
 
@@ -496,6 +533,7 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 	p := &goStylePool{
 		cfg:        cfg,
 		cmds:       make(chan goWorkerCommand),
+		done:       make(chan struct{}),
 		reaperDone: make(chan struct{}),
 	}
 
@@ -530,9 +568,9 @@ func newGoStylePool(cfg goStylePoolConfig) (*goStylePool, error) {
 		}
 	}
 	if firstErr != nil {
-		// Close the cmd channel so any already-running workers exit
-		// their loops and tear down their state. Wait for them.
-		close(p.cmds)
+		// Stop any already-running workers so they tear down their
+		// state. Wait for them.
+		close(p.done)
 		p.wg.Wait()
 		return nil, fmt.Errorf("renderer: build pool for style %q ratio=%d: %w", cfg.styleID, cfg.ratio, firstErr)
 	}
@@ -701,10 +739,14 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 	select {
 	case p.cmds <- cmd:
 		// picked up immediately
+	case <-p.done:
+		return nil, errPoolClosed
 	default:
 		p.grow()
 		select {
 		case p.cmds <- cmd:
+		case <-p.done:
+			return nil, errPoolClosed
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -722,52 +764,6 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 	}
 }
 
-// setStyleAll broadcasts a reload command to every worker. Workers
-// process commands serially so reload queues behind in-flight renders.
-// Returns the first error from any worker.
-func (p *goStylePool) setStyleAll(ctx context.Context, styleURL string) error {
-	p.mu.Lock()
-	workers := make([]*goWorker, len(p.workers))
-	copy(workers, p.workers)
-	p.mu.Unlock()
-
-	// Address each worker's own channel rather than the shared queue, so
-	// every worker reloads exactly once. Post to all of them first, then
-	// collect: the channels are buffered, so a worker busy rendering picks
-	// its reload up when it returns to the loop instead of blocking us.
-	replies := make([]chan goWorkerResult, len(workers))
-	for i, w := range workers {
-		replies[i] = make(chan goWorkerResult, 1)
-		cmd := goWorkerCommand{
-			kind:   goWorkerCmdReload,
-			ctx:    ctx,
-			reload: styleURL,
-			reply:  replies[i],
-		}
-		select {
-		case w.broadcast <- cmd:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	var firstErr error
-	for i := range workers {
-		select {
-		case res := <-replies[i]:
-			if res.err != nil && firstErr == nil {
-				firstErr = res.err
-			}
-		case <-ctx.Done():
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
-			return firstErr
-		}
-	}
-	return firstErr
-}
-
 func (p *goStylePool) close() {
 	p.mu.Lock()
 	if p.closed {
@@ -777,7 +773,7 @@ func (p *goStylePool) close() {
 	p.closed = true
 	p.mu.Unlock()
 	close(p.reaperDone)
-	close(p.cmds)
+	close(p.done)
 	p.wg.Wait()
 }
 
@@ -793,12 +789,9 @@ type goWorker struct {
 	startupErrs chan<- error
 
 	// broadcast receives commands addressed to THIS worker specifically,
-	// as opposed to pool.cmds which is a shared work-stealing queue. Style
-	// reloads must reach every worker exactly once, which a shared channel
-	// cannot guarantee: a worker that finishes one reload returns to the
-	// queue and can take a second, leaving a worker that was mid-render at
-	// broadcast time with a stale style. Buffered so setStyleAll can post
-	// to every worker without deadlocking against workers that are busy.
+	// as opposed to pool.cmds which is a shared work-stealing queue: the
+	// reaper's shutdown must reach the worker it picked. Buffered so the
+	// reaper never blocks on a worker that is mid-render.
 	broadcast chan goWorkerCommand
 
 	rt   *maplibre.RuntimeHandle
@@ -870,13 +863,12 @@ func (w *goWorker) loop() {
 	for {
 		var cmd goWorkerCommand
 		select {
-		case c, ok := <-w.pool.cmds:
-			if !ok {
-				return // pool closed
-			}
+		case c := <-w.pool.cmds:
 			cmd = c
 		case c := <-w.broadcast:
 			cmd = c
+		case <-w.pool.done:
+			return // pool closed
 		}
 
 		switch cmd.kind {
@@ -895,10 +887,6 @@ func (w *goWorker) loop() {
 				w.pool.deregister(w)
 				return
 			}
-		case goWorkerCmdReload:
-			// The load itself is not awaited: renders observe a failure
-			// through styleFailed.
-			cmd.reply <- goWorkerResult{err: w.setStyle(cmd.ctx, cmd.reload)}
 		}
 	}
 }

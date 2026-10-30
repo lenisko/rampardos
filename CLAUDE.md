@@ -237,11 +237,21 @@ visible in the code.
 
 ## ReloadStyles
 
+- Reload **rebuilds** every active pool; it never calls `SetStyleUrl`
+  on a running map. A map keeps the tiles it has loaded across a style
+  change, so after a dataset switch a reloaded-in-place worker went on
+  rendering the old dataset (provider on or off).
+  `TestReloadStylesFollowsDatasetSwitch` guards it.
 - `loadPool` runs outside the write lock so in-flight renders keep
-  going. At swap time, pools that a concurrent `getOrCreatePool`
-  inserted into `npr.pools` are merged into the new map — never
-  `npr.pools = newPools` wholesale.
-- `style.prepared.json` must be written via `atomicWritePrepared`
+  going. The swap replaces only the keys it rebuilt, never
+  `r.pools` wholesale: a pool a concurrent `getOrCreatePool` added
+  stays, and a pool whose rebuild failed keeps serving.
+- Old pools are closed after the swap, while requests may still be
+  dispatching to them. So `cmds` is never closed: `close` closes
+  `done`, which stops the workers and makes `dispatch` return
+  `errPoolClosed` for a render no worker took, and
+  `renderViewportImage` retries it on the replacement pool.
+- `style.prepared.json` must be written via `fileutil.AtomicWriteFile`
   (tempfile + rename). Workers spawned by one `loadPool` read this
   file; plain `os.WriteFile`'s truncate window exposes a zero-length
   file to them.

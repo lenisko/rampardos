@@ -41,8 +41,8 @@ type Renderer interface {
 	// ReloadStyles tears down and rebuilds backend state so that
 	// subsequent renders see the latest on-disk style/mbtiles content.
 	// Invoked from the dataset-refresh reload callback. Blocks until
-	// the rebuild is complete. In-flight renders finish against the
-	// old state; new renders queue until the rebuild is done.
+	// the rebuild is complete. Renders use the old state until the new
+	// state is swapped in; in-flight ones finish against it.
 	ReloadStyles(ctx context.Context) error
 
 	// Close releases all backend resources. Safe to call multiple times.

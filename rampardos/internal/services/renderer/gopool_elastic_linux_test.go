@@ -18,6 +18,7 @@ func newTestPool(min, max int) *goStylePool {
 			idleTTL:     time.Hour, // reap is driven manually
 		},
 		cmds:       make(chan goWorkerCommand),
+		done:       make(chan struct{}),
 		reaperDone: make(chan struct{}),
 	}
 	p.startWorker = func(startupErrs chan error) *goWorker {
