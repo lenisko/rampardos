@@ -254,22 +254,10 @@ func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRe
 // loadPool builds a pool from rcfg, a snapshot of r.cfg taken under mu
 // (ReloadStyles updates its TileJSON).
 func (r *GoPoolRenderer) loadPool(rcfg Config, id string, ratio int) (*goStylePool, error) {
-	styleFile := filepath.Join(rcfg.StylesDir, id, "style.json")
-	raw, err := os.ReadFile(styleFile)
+	raw, preparedPath, err := prepareStyleFiles(rcfg, id)
 	if err != nil {
-		return nil, fmt.Errorf("read style.json: %w", err)
+		return nil, err
 	}
-
-	prepared, err := PrepareStyle(id, raw, rcfg)
-	if err != nil {
-		return nil, fmt.Errorf("prepare style: %w", err)
-	}
-
-	preparedPath := filepath.Join(rcfg.StylesDir, id, "style.prepared.json")
-	if err := fileutil.AtomicWriteFile(preparedPath, prepared, 0o644); err != nil {
-		return nil, fmt.Errorf("write prepared style: %w", err)
-	}
-
 	zoomAdj := styleZoomOffset(raw)
 
 	cfg := goStylePoolConfig{
@@ -287,6 +275,34 @@ func (r *GoPoolRenderer) loadPool(rcfg Config, id string, ratio int) (*goStylePo
 		renderTimeout:     rcfg.RenderTimeout,
 	}
 	return newGoStylePool(cfg)
+}
+
+// prepareStyleFiles writes the style's prepared copy, and the composite
+// font directories it needs, for a pool to load. It returns the original
+// style and the prepared file's path.
+func prepareStyleFiles(rcfg Config, id string) (raw []byte, preparedPath string, err error) {
+	raw, err = os.ReadFile(filepath.Join(rcfg.StylesDir, id, "style.json"))
+	if err != nil {
+		return nil, "", fmt.Errorf("read style.json: %w", err)
+	}
+
+	prepared, err := PrepareStyle(id, raw, rcfg)
+	if err != nil {
+		return nil, "", fmt.Errorf("prepare style: %w", err)
+	}
+
+	// Glyph URLs resolve to <fontsDir>/<fontstack>/<range>.pbf verbatim,
+	// so a stack like ["Metropolis Regular","Noto Sans Regular"] needs a
+	// real directory of that name, composed from its constituents.
+	if err := EnsureCompositeFontstacks(raw, rcfg.FontsDir); err != nil {
+		return nil, "", fmt.Errorf("compose fontstacks: %w", err)
+	}
+
+	preparedPath = filepath.Join(rcfg.StylesDir, id, "style.prepared.json")
+	if err := fileutil.AtomicWriteFile(preparedPath, prepared, 0o644); err != nil {
+		return nil, "", fmt.Errorf("write prepared style: %w", err)
+	}
+	return raw, preparedPath, nil
 }
 
 func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStylePool, error) {
