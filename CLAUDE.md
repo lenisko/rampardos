@@ -14,12 +14,8 @@ visible in the code.
   the per-pool worker count. Without the global cap, N styles × M scales ×
   PoolSize workers could oversubscribe CPU; the semaphore keeps the ceiling
   at PoolSize regardless of how many pools exist.
-- For local styles: default is native viewport render for all zooms
-  (`LOCAL_STYLES_USE_VIEWPORT=true` by default). Set to `false` to route
-  integer-zoom requests through tile stitching; fractional zoom is
-  always viewport-rendered regardless. The dispatcher
-  (`generateBaseStaticMap`) picks the branch on
-  `isFractional(zoom) || h.localUseViewport`.
+- Local styles always render the static map as one native viewport, at
+  any zoom (`generateBaseStaticMap`); they never tile-stitch.
 - External styles can't use viewport render — they always tile-stitch,
   with fractional zoom approximated to the nearest integer.
   `logExternalViewportApprox` logs this so it's observable.
