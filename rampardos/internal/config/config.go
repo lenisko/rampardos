@@ -52,7 +52,7 @@ type Config struct {
 	MarkerImageCacheSize    int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
 	TileImageCacheSize      int    // Secondary cap on decoded tile images cached in memory (default: 500, 0 disables).
 	TileImageCacheMB        int    // Byte budget for decoded tile images, in MB of pixels (default: 128, 0 disables). A 256 px tile is 256 KB, a 512 px or @2x tile 1 MB, so this is the real bound.
-	CompositeImageCacheMB   int    // Byte budget for base/staticmap/multistaticmap images cached in memory, in MB of decoded pixels (default: 256, 0 disables). Entries vary ~0.5 MB (scale=1 staticmap) to tens of MB (scale=2 multistaticmap), so this is the real bound.
+	CompositeImageCacheMB   int    // Byte budget for base/staticmap/multistaticmap images cached in memory, in MB of decoded pixels (default: 128, 0 disables). Entries vary ~0.5 MB (scale=1 staticmap) to tens of MB (scale=2 multistaticmap), so this is the real bound.
 	CompositeImageCacheSize int    // Secondary cap on composite cache entry count (default: 1000, 0 disables).
 
 	// Experimental features
@@ -119,7 +119,7 @@ func Load() *Config {
 		MarkerImageCacheSize:    getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
 		TileImageCacheSize:      getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
 		TileImageCacheMB:        getEnvInt("TILE_IMAGE_CACHE_MB", 128),
-		CompositeImageCacheMB:   getEnvInt("COMPOSITE_IMAGE_CACHE_MB", 256),
+		CompositeImageCacheMB:   getEnvInt("COMPOSITE_IMAGE_CACHE_MB", 128),
 		CompositeImageCacheSize: getEnvInt("COMPOSITE_IMAGE_CACHE_SIZE", 1000),
 
 		ExperimentalGSat: getEnvBool("EXPERIMENTAL_G_SAT", true),

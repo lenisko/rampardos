@@ -187,9 +187,12 @@ visible in the code.
   the cross-request burst-sharing mechanism. Keyed by path. Holds
   base renders, final staticmaps and multistaticmap composites as
   `image.Image`. **Bounded by decoded-pixel bytes**
-  (`COMPOSITE_IMAGE_CACHE_MB`, default 256), not entry count: a
+  (`COMPOSITE_IMAGE_CACHE_MB`, default 128), not entry count: a
   scale=2 multi composite is tens of times a scale=1 staticmap, and
   the old count bound (200) reached ~1 GB of heap in prod (#34).
+  Reuse is burst-only: a large install saw 0.2% final-staticmap hits
+  over 12 h, base ~6%. A bigger budget buys almost nothing and costs
+  twice its size in heap under GOGC=100.
   `COMPOSITE_IMAGE_CACHE_SIZE` (default 1000) is only a secondary
   cap. An image bigger than the whole budget is not cached.
 - Count a lookup once: the fast-path `Get` records hit/miss; the
