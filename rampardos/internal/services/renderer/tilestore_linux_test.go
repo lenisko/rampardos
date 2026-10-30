@@ -14,6 +14,12 @@ import (
 // XYZ z=2 x=1 y=1 (TMS row 2) and metadata for TileJSON synthesis.
 func buildTestMbtiles(t *testing.T) (path string, tileBody []byte) {
 	t.Helper()
+	return buildTestMbtilesWith(t, []byte("not-really-mvt-but-recognizable-payload"))
+}
+
+// buildTestMbtilesWith is buildTestMbtiles with a chosen tile body.
+func buildTestMbtilesWith(t *testing.T, tileBody []byte) (path string, _ []byte) {
+	t.Helper()
 	dir := t.TempDir()
 	path = filepath.Join(dir, "test.mbtiles")
 
@@ -23,7 +29,6 @@ func buildTestMbtiles(t *testing.T) (path string, tileBody []byte) {
 	}
 	defer db.Close()
 
-	tileBody = []byte("not-really-mvt-but-recognizable-payload")
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
 	if _, err := zw.Write(tileBody); err != nil {
@@ -149,6 +154,87 @@ func TestTileStoreReopenFollowsSymlink(t *testing.T) {
 	}
 	if _, found, _ := s.Get(2, 1, 1); !found {
 		t.Fatal("tile missing after reopen")
+	}
+}
+
+// A Reopen that fails, say because the symlink briefly points at a file
+// that is not there, must leave the store on the previous dataset.
+// Closing the old handles before opening the new ones left every later
+// uncached read failing with "sql: statement is closed".
+func TestTileStoreFailedReopenKeepsPreviousDataset(t *testing.T) {
+	pathA, want := buildTestMbtiles(t)
+	link := filepath.Join(t.TempDir(), "Combined.mbtiles")
+	if err := os.Symlink(pathA, link); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newTileStore(link, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing.mbtiles"), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reopen(); err == nil {
+		t.Fatal("Reopen onto a missing file succeeded")
+	}
+
+	got, found, err := s.Get(2, 1, 1)
+	if err != nil || !found {
+		t.Fatalf("Get after a failed Reopen: found=%v err=%v, want the previous dataset's tile", found, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("Get after a failed Reopen = %q, want %q", got, want)
+	}
+}
+
+// A read that queried the old dataset and finishes after a Reopen must
+// not land in the new dataset's cache, or renders would be served the
+// old tile until it was evicted.
+func TestTileStoreReadFromBeforeReopenIsNotCached(t *testing.T) {
+	pathA, oldBody := buildTestMbtiles(t)
+	pathB, newBody := buildTestMbtilesWith(t, []byte("the-new-dataset-tile"))
+	link := filepath.Join(t.TempDir(), "Combined.mbtiles")
+	if err := os.Symlink(pathA, link); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newTileStore(link, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// The first Get has queried dataset A when the dataset switches.
+	s.afterQuery = func() {
+		s.afterQuery = nil
+		if err := os.Remove(link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(pathB, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Reopen(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _, err := s.Get(2, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, oldBody) {
+		t.Fatalf("in-flight Get = %q, want the old tile it queried", got)
+	}
+
+	got, _, err = s.Get(2, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newBody) {
+		t.Fatalf("Get after Reopen = %q, want the new dataset's %q", got, newBody)
 	}
 }
 

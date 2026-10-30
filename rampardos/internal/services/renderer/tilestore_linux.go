@@ -62,6 +62,16 @@ type TileStore struct {
 	index     map[uint64]*list.Element
 	sizeBytes int64
 	maxBytes  int64
+
+	// gen counts Reopens. Written holding both mu and cmu, so it can be
+	// read under either: Get reads it with the statement it queries and
+	// inserts only if it is unchanged, or a read from the old dataset
+	// that finishes after a Reopen would land in the new dataset's cache.
+	gen uint64
+
+	// afterQuery, when set by a test, runs between Get's query and its
+	// cache insert.
+	afterQuery func()
 }
 
 type tileEntry struct {
@@ -106,51 +116,59 @@ func newTileStore(path string, maxBytes int64) (*TileStore, error) {
 		index:    make(map[uint64]*list.Element),
 		maxBytes: maxBytes,
 	}
-	if err := s.open(); err != nil {
+	db, stmt, err := s.open()
+	if err != nil {
 		return nil, err
 	}
+	s.db, s.stmt = db, stmt
 	return s, nil
 }
 
-func (s *TileStore) open() error {
+func (s *TileStore) open() (*sql.DB, *sql.Stmt, error) {
 	// mode=ro: the store never writes; the admin dataset pipeline owns
 	// the file. _query_only hardens that at the connection level.
 	db, err := sql.Open("sqlite3", "file:"+s.path+"?mode=ro&_query_only=1")
 	if err != nil {
-		return fmt.Errorf("renderer: open mbtiles %q: %w", s.path, err)
+		return nil, nil, fmt.Errorf("renderer: open mbtiles %q: %w", s.path, err)
 	}
 	// A handful of connections serves every worker: queries are
 	// point-lookups on the tiles index and take microseconds warm.
 	db.SetMaxOpenConns(4)
+	// Preparing connects, so a missing or unreadable file fails here.
 	stmt, err := db.Prepare("SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?")
 	if err != nil {
 		_ = db.Close()
-		return fmt.Errorf("renderer: prepare tile query on %q: %w", s.path, err)
+		return nil, nil, fmt.Errorf("renderer: prepare tile query on %q: %w", s.path, err)
 	}
-	s.db = db
-	s.stmt = stmt
-	return nil
+	return db, stmt, nil
 }
 
 // Reopen swaps to the current dataset file (the mbtiles path is a
-// symlink the admin pipeline retargets) and drops the tile cache.
+// symlink the admin pipeline retargets) and drops the tile cache. The
+// new file is opened before the old one is closed, so a failure leaves
+// the store serving the previous dataset.
 func (s *TileStore) Reopen() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.stmt != nil {
-		_ = s.stmt.Close()
-	}
-	if s.db != nil {
-		_ = s.db.Close()
-	}
-	if err := s.open(); err != nil {
+	db, stmt, err := s.open()
+	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	oldDB, oldStmt := s.db, s.stmt
+	s.db, s.stmt = db, stmt
 	s.cmu.Lock()
+	s.gen++
 	s.lru.Init()
 	s.index = make(map[uint64]*list.Element)
 	s.sizeBytes = 0
 	s.cmu.Unlock()
+	s.mu.Unlock()
+
+	if oldStmt != nil {
+		_ = oldStmt.Close()
+	}
+	if oldDB != nil {
+		_ = oldDB.Close()
+	}
 	s.reportCacheSize()
 	return nil
 }
@@ -257,7 +275,7 @@ func (s *TileStore) Get(z, x, y uint32) ([]byte, bool, error) {
 
 	start := time.Now()
 	s.mu.RLock()
-	stmt := s.stmt
+	stmt, gen := s.stmt, s.gen
 	if stmt == nil {
 		s.mu.RUnlock()
 		return nil, false, fmt.Errorf("renderer: tile store is closed")
@@ -293,8 +311,12 @@ func (s *TileStore) Get(z, x, y uint32) ([]byte, bool, error) {
 		services.GlobalMetrics.RecordTileProviderRequest("sqlite_hit", time.Since(start).Seconds())
 	}
 
+	if s.afterQuery != nil {
+		s.afterQuery()
+	}
+
 	s.cmu.Lock()
-	if _, ok := s.index[key]; !ok {
+	if _, ok := s.index[key]; !ok && s.gen == gen {
 		el := s.lru.PushFront(&tileEntry{key: key, data: blob})
 		s.index[key] = el
 		s.sizeBytes += int64(len(blob))
