@@ -439,22 +439,23 @@ func main() {
 	signal.Stop(hupCh)
 	cancelHup()
 	<-hupDone
-	if err := renderEngine.Close(); err != nil {
-		slog.Error("Renderer shutdown", "error", err)
-	}
 
-	// Stop background services first to drain goroutines.
-	if pyroscopeProfiler != nil {
-		if err := pyroscopeProfiler.Stop(); err != nil {
-			slog.Warn("Pyroscope stop error", "error", err)
-		}
-	}
-
-	// Drain in-flight HTTP requests with a bounded grace period.
+	// Drain in-flight HTTP requests with a bounded grace period before
+	// closing the renderer, so the requests finish their renders rather
+	// than fail against a closed one.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Warn("Server shutdown error", "error", err)
+	}
+	if err := renderEngine.Close(); err != nil {
+		slog.Error("Renderer shutdown", "error", err)
+	}
+
+	if pyroscopeProfiler != nil {
+		if err := pyroscopeProfiler.Stop(); err != nil {
+			slog.Warn("Pyroscope stop error", "error", err)
+		}
 	}
 	slog.Info("Server stopped")
 }
