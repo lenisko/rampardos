@@ -22,6 +22,7 @@ require (
 	github.com/ebitengine/purego v0.9.1 // indirect
 	github.com/golang/freetype v0.0.0-20170609003504-e2365dfdc4a0 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.9 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/tetratelabs/wazero v1.10.1 // indirect
 )
 

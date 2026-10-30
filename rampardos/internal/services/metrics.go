@@ -585,13 +585,11 @@ func (m *MetricsManager) DecrementInFlight(reqType string) {
 	m.requestsInFlight.WithLabelValues(reqType).Dec()
 }
 
-// RecordTileRequest records a tile request
+// RecordTileRequest records a tile served from cache or generated, including
+// tiles fetched to stitch a static map. It counts cache hits and misses
+// only: rampardos_requests_total is counted once per HTTP request by
+// RecordRequest, and counting it here too doubled it.
 func (m *MetricsManager) RecordTileRequest(style string, cached bool) {
-	cachedStr := "false"
-	if cached {
-		cachedStr = "true"
-	}
-	m.requestsTotal.WithLabelValues("tile", bucketLabel(style), cachedStr).Inc()
 	if cached {
 		m.cacheHitsTotal.WithLabelValues("tile").Inc()
 	} else {
@@ -599,13 +597,10 @@ func (m *MetricsManager) RecordTileRequest(style string, cached bool) {
 	}
 }
 
-// RecordStaticMapRequest records a static map request
+// RecordStaticMapRequest records a static or multi static map served from
+// cache or generated. Like RecordTileRequest it counts cache hits and
+// misses only.
 func (m *MetricsManager) RecordStaticMapRequest(style string, cached bool) {
-	cachedStr := "false"
-	if cached {
-		cachedStr = "true"
-	}
-	m.requestsTotal.WithLabelValues("staticmap", bucketLabel(style), cachedStr).Inc()
 	if cached {
 		m.cacheHitsTotal.WithLabelValues("staticmap").Inc()
 	} else {
