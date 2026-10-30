@@ -711,7 +711,7 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 	}
 
 	if services.GlobalMetrics != nil {
-		services.GlobalMetrics.RecordRendererPoolAcquire(p.cfg.styleID, p.cfg.scaleLabel, time.Since(acquireStart).Seconds(), 0)
+		services.GlobalMetrics.RecordRendererPoolAcquire(p.cfg.styleID, p.cfg.scaleLabel, time.Since(acquireStart).Seconds())
 	}
 
 	select {
@@ -1133,9 +1133,6 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		// render fails would let the next request at the old size skip its
 		// resize and read back a frame at the size the session now has.
 		w.curW, w.curH, w.curScale = wantW, wantH, wantScale
-		if services.GlobalMetrics != nil {
-			services.GlobalMetrics.IncRendererResize(w.pool.cfg.styleID, w.pool.cfg.scaleLabel)
-		}
 	}
 
 	zoom, bearing, pitch := vp.Zoom, vp.Bearing, vp.Pitch
@@ -1183,7 +1180,6 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	physW := vp.Width * scale
 	physH := vp.Height * scale
 
-	readStart := time.Now()
 	rb, err := w.sess.ReadTexture()
 	if err != nil {
 		return nil, fmt.Errorf("renderer: read pixels: %w", err)
@@ -1191,7 +1187,6 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	readCtx, cancel := context.WithTimeout(ctx, w.pool.cfg.renderTimeout)
 	tr, err := rb.Await(readCtx)
 	cancel()
-	readDur := time.Since(readStart)
 	if err != nil {
 		return nil, fmt.Errorf("renderer: read pixels: %w", err)
 	}
@@ -1206,10 +1201,6 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	if len(tr.Data) != physW*physH*4 {
 		return nil, fmt.Errorf("renderer: readback length mismatch: got %d bytes (stride %d), want %d", len(tr.Data), tr.Info.Stride, physW*physH*4)
 	}
-	if services.GlobalMetrics != nil {
-		services.GlobalMetrics.RecordRendererReadback(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, readDur.Seconds())
-	}
-
 	// The binding hands back a Go-owned copy of the pixels, so convert
 	// it in place and use it as the image rather than allocating a
 	// second frame-sized buffer.
@@ -1461,8 +1452,7 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 		return fmt.Errorf("renderer: still image: %s failed to load", r.what)
 	}
 
-	wakes, frames := 0, 0
-	var timeToFirst time.Duration
+	frames := 0
 	for {
 		select {
 		case <-still.Done():
@@ -1475,30 +1465,13 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			}
 			// The completing frame's result can trail the Future.
 			n, _ := w.drainFrames(start)
-			if n > 0 && frames == 0 {
-				timeToFirst = time.Since(start)
-			}
 			frames += n
 			if serviceTrace {
 				fmt.Fprintf(os.Stderr, "TRACE +%6dus still COMPLETED frames=%d\n", time.Since(start).Microseconds(), frames)
 			}
-			if services.GlobalMetrics != nil {
-				services.GlobalMetrics.RecordRendererPumpBreakdown(
-					w.pool.cfg.styleID, w.pool.cfg.scaleLabel,
-					wakes,
-					time.Since(start).Seconds(),
-					timeToFirst.Seconds(),
-					0, // host performs no graphics work under the core-worker driver
-					frames,
-				)
-			}
 			return nil
 		case <-w.wake:
-			wakes++
 			n, err := w.drainFrames(start)
-			if n > 0 && frames == 0 {
-				timeToFirst = time.Since(start)
-			}
 			frames += n
 			if err != nil {
 				return err
