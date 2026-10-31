@@ -246,6 +246,10 @@ visible in the code.
   going. The swap replaces only the keys it rebuilt, never
   `r.pools` wholesale: a pool a concurrent `getOrCreatePool` added
   stays, and a pool whose rebuild failed keeps serving.
+- `getOrCreatePool` builds outside `mu` too (singleflight per key):
+  holding the write lock for a pool's startup stalled every warm pool.
+  A pool whose build overlapped a reload (`r.gen` moved) is discarded
+  and rebuilt, since it may hold the previous dataset's TileJSON.
 - Old pools are closed after the swap, while requests may still be
   dispatching to them. So `cmds` is never closed: `close` closes
   `done`, which stops the workers and makes `dispatch` return

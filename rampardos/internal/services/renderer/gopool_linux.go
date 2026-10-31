@@ -31,6 +31,7 @@ import (
 	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 // Ensure GoPoolRenderer satisfies the Renderer interface.
@@ -61,6 +62,13 @@ type GoPoolRenderer struct {
 	mu     sync.RWMutex
 	pools  map[string]*goStylePool
 	closed bool // guarded by mu; set by Close
+	// gen counts reloads (guarded by mu). A pool built from a config a
+	// reload has since replaced is discarded rather than installed.
+	gen uint64
+
+	// sfg dedupes concurrent creation of the same pool, which runs
+	// outside mu so other pools keep rendering meanwhile.
+	sfg singleflight.Group
 
 	// reloadMu serialises ReloadStyles: SIGHUP and the admin dataset
 	// pipeline can both trigger one.
@@ -318,29 +326,61 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 		return pool, nil
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// Building a pool takes up to the startup timeout (EGL, runtime, map,
+	// style load). Holding mu for it stalled every other pool's renders
+	// on the fast path above, so it runs outside the lock, deduplicated
+	// per key; the lock is taken only to install the result.
+	v, err, _ := r.sfg.Do(key, func() (any, error) {
+		for attempt := 0; ; attempt++ {
+			r.mu.RLock()
+			closed, existing, rcfg, gen := r.closed, r.pools[key], r.cfg, r.gen
+			r.mu.RUnlock()
+			if closed {
+				return nil, fmt.Errorf("renderer: closed")
+			}
+			if existing != nil {
+				return existing, nil
+			}
 
-	if r.closed {
-		return nil, fmt.Errorf("renderer: closed")
-	}
-	if pool, ok := r.pools[key]; ok {
-		return pool, nil
-	}
+			stylePath := filepath.Join(rcfg.StylesDir, styleID, "style.json")
+			if _, err := os.Stat(stylePath); err != nil {
+				return nil, fmt.Errorf("renderer: unknown style %q (no style.json at %s)", styleID, stylePath)
+			}
 
-	stylePath := filepath.Join(r.cfg.StylesDir, styleID, "style.json")
-	if _, err := os.Stat(stylePath); err != nil {
-		return nil, fmt.Errorf("renderer: unknown style %q (no style.json at %s)", styleID, stylePath)
-	}
+			ratio := int(scale)
+			slog.Info("Creating Go renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", rcfg.StylePoolSize, "globalRenderCap", rcfg.PoolSize)
+			p, err := r.loadPool(rcfg, styleID, ratio)
+			if err != nil {
+				return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
+			}
 
-	ratio := int(scale)
-	slog.Info("Creating Go renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", r.cfg.StylePoolSize, "globalRenderCap", r.cfg.PoolSize)
-	pool, err := r.loadPool(r.cfg, styleID, ratio)
+			r.mu.Lock()
+			switch {
+			case r.closed:
+				r.mu.Unlock()
+				p.close()
+				return nil, fmt.Errorf("renderer: closed")
+			case r.gen != gen && attempt < 2:
+				// A reload ran while this pool was building, so it may hold
+				// the previous dataset. Build again from the new config.
+				r.mu.Unlock()
+				p.close()
+				continue
+			}
+			if existing := r.pools[key]; existing != nil {
+				r.mu.Unlock()
+				p.close()
+				return existing, nil
+			}
+			r.pools[key] = p
+			r.mu.Unlock()
+			return p, nil
+		}
+	})
 	if err != nil {
-		return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
+		return nil, err
 	}
-	r.pools[key] = pool
-	return pool, nil
+	return v.(*goStylePool), nil
 }
 
 // ReloadStyles rebuilds every active pool from the current style files
@@ -357,17 +397,22 @@ func (r *GoPoolRenderer) ReloadStyles(ctx context.Context) error {
 	// Dataset activate/combine retargets the mbtiles symlink; follow it
 	// before preparing styles so the inline TileJSON matches the new
 	// dataset's zoom range and the tile cache drops stale blobs.
+	var tileJSON map[string]any
 	if r.store != nil {
 		if err := r.store.Reopen(); err != nil {
 			slog.Error("Reload: tile store reopen failed; keeping previous dataset handle", "error", err)
 		} else if tj, err := r.store.TileJSON(); err != nil {
 			slog.Error("Reload: dataset metadata unusable; keeping previous TileJSON", "error", err)
 		} else {
-			r.mu.Lock()
-			r.cfg.TileJSON = tj
-			r.mu.Unlock()
+			tileJSON = tj
 		}
 	}
+	r.mu.Lock()
+	if tileJSON != nil {
+		r.cfg.TileJSON = tileJSON
+	}
+	r.gen++
+	r.mu.Unlock()
 
 	r.mu.RLock()
 	rcfg := r.cfg
