@@ -19,7 +19,7 @@ func TestCloseRefusesWaitingDispatches(t *testing.T) {
 	errs := make(chan error, waiting)
 	for range waiting {
 		go func() {
-			_, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1)
+			_, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1, nil)
 			errs <- err
 		}()
 	}
@@ -37,7 +37,7 @@ func TestCloseRefusesWaitingDispatches(t *testing.T) {
 		}
 	}
 
-	if _, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1); !errors.Is(err, errPoolClosed) {
+	if _, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1, nil); !errors.Is(err, errPoolClosed) {
 		t.Errorf("dispatch after close: got %v, want errPoolClosed", err)
 	}
 }

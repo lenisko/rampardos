@@ -225,17 +225,16 @@ func (r *GoPoolRenderer) RenderViewportImage(ctx context.Context, req ViewportRe
 func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRequest, applyZoomAdj bool) (*image.NRGBA, error) {
 	scale := max(int(req.Scale), 1)
 
-	if err := r.acquireGlobal(ctx); err != nil {
-		return nil, err
-	}
-	defer r.releaseGlobal()
-
 	// A reload swaps in new pools and closes the old ones. A render that
 	// reached an old pool after its close is refused before any worker
 	// takes it, so it moves to the pool that replaced it.
 	for attempt := 0; ; attempt++ {
+		if err := r.acquireGlobal(ctx); err != nil {
+			return nil, err
+		}
 		pool, err := r.getOrCreatePool(req.StyleID, req.Scale)
 		if err != nil {
+			r.releaseGlobal()
 			return nil, err
 		}
 
@@ -251,7 +250,11 @@ func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRe
 			)
 		}
 
-		img, err := pool.dispatch(ctx, adjusted, scale)
+		// The slot is held until the render ends, not until this caller
+		// gives up: a worker keeps rendering after its request's context
+		// is cancelled, and freeing the slot then let more renders run
+		// than RENDERER_POOL_SIZE allows.
+		img, err := pool.dispatch(ctx, adjusted, scale, sync.OnceFunc(r.releaseGlobal))
 		if errors.Is(err, errPoolClosed) && attempt < 2 {
 			continue
 		}
@@ -563,6 +566,8 @@ type goWorkerCommand struct {
 type goRenderRequest struct {
 	vp    ViewportRequest
 	scale int
+	// release, if set, is called once the render has ended.
+	release func()
 }
 
 type goWorkerResult struct {
@@ -795,14 +800,24 @@ func (p *goStylePool) reportSize() {
 // blocks until one is). The unbuffered cmds channel + per-worker
 // single-flight processing means we never queue more renders than
 // workers — backpressure is natural.
-func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale int) (*image.NRGBA, error) {
+//
+// release, if non-nil, is called exactly once when the render no longer
+// needs its global slot: by the worker when the render ends, or here if
+// no worker took it.
+func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale int, release func()) (*image.NRGBA, error) {
 	acquireStart := time.Now()
 	reply := make(chan goWorkerResult, 1)
 	cmd := goWorkerCommand{
 		kind:   goWorkerCmdRender,
 		ctx:    ctx,
-		render: &goRenderRequest{vp: vp, scale: scale},
+		render: &goRenderRequest{vp: vp, scale: scale, release: release},
 		reply:  reply,
+	}
+	refused := func(err error) (*image.NRGBA, error) {
+		if release != nil {
+			release()
+		}
+		return nil, err
 	}
 
 	// Try to hand the work to an already-idle worker. A failed non-blocking
@@ -813,7 +828,7 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 	case p.cmds <- cmd:
 		// picked up immediately
 	case <-p.done:
-		return nil, errPoolClosed
+		return refused(errPoolClosed)
 	default:
 		p.waiting.Add(1)
 		p.grow()
@@ -834,7 +849,7 @@ func (p *goStylePool) dispatch(ctx context.Context, vp ViewportRequest, scale in
 		timer.Stop()
 		p.waiting.Add(-1)
 		if err != nil {
-			return nil, err
+			return refused(err)
 		}
 	}
 
@@ -968,6 +983,9 @@ func (w *goWorker) loop() {
 			return
 		case goWorkerCmdRender:
 			img, err := w.renderOne(cmd.ctx, cmd.render.vp, cmd.render.scale)
+			if cmd.render.release != nil {
+				cmd.render.release()
+			}
 			cmd.reply <- goWorkerResult{img: img, err: err}
 			if w.poisoned {
 				w.pool.deregister(w)

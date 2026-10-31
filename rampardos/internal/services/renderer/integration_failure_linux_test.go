@@ -59,7 +59,7 @@ func TestStyleFailureFailsStillFast(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*renderTimeout)
 		defer cancel()
 		start := time.Now()
-		img, err := p.dispatch(ctx, vp, 1)
+		img, err := p.dispatch(ctx, vp, 1, nil)
 		took := time.Since(start)
 		switch {
 		case wantErr && err == nil:
@@ -150,7 +150,7 @@ func TestMissingResourcesReport(t *testing.T) {
 			for i := 0; i < 3; i++ {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				start := time.Now()
-				_, err := p.dispatch(ctx, vp, 1)
+				_, err := p.dispatch(ctx, vp, 1, nil)
 				cancel()
 				took := time.Since(start)
 				if err == nil {
@@ -228,7 +228,7 @@ func TestGlyphRetirementDoesNotStrandWaitingRenders(t *testing.T) {
 	start := time.Now()
 	for range renders {
 		go func() {
-			_, err := p.dispatch(context.Background(), vp, 1)
+			_, err := p.dispatch(context.Background(), vp, 1, nil)
 			errs <- err
 		}()
 	}

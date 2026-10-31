@@ -236,7 +236,7 @@ func TestDispatchWaitIsBounded(t *testing.T) {
 	p.cfg.renderTimeout = 50 * time.Millisecond
 
 	start := time.Now()
-	_, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1)
+	_, err := p.dispatch(context.Background(), ViewportRequest{Width: 1, Height: 1}, 1, nil)
 	if err == nil {
 		t.Fatal("dispatch succeeded with no worker free")
 	}
