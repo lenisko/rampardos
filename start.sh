@@ -6,16 +6,17 @@
 # Usage:
 #   ./start.sh                          # defaults
 #   ./start.sh --port 8080              # custom port
-#   ./start.sh --pool-size 4            # custom worker pool size
+#   ./start.sh --pool-size 4            # cap concurrent renders at 4
 #   PORT=8080 ./start.sh                # env var override
 #
-# Environment variables (take precedence over flags):
-#   PORT, HOSTNAME, RENDERER_POOL_SIZE, STYLE_POOL_SIZE,
-#   RENDERER_TIMEOUT_SECONDS, ADMIN_USERNAME, ADMIN_PASSWORD
+# Environment variables (flags override them):
+#   PORT, HOSTNAME, RENDERER_POOL_SIZE, RENDERER_TIMEOUT_SECONDS,
+#   ADMIN_USERNAME, ADMIN_PASSWORD
+# Other settings in README.md pass through from the environment as-is.
 #
-# The renderer is in-process (RENDERER_BACKEND=go-pool) and needs a binary
-# built with -tags mln_ffi against libmaplibre-native-c.so:
-#   make build-ffi && make build-go-renderer
+# The renderer is in-process and Linux-only; build the binary against the
+# maplibre-native-ffi release first:
+#   make fetch-ffi && make build-go-renderer
 #
 set -euo pipefail
 
@@ -45,9 +46,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --port N              HTTP port (default: 9000)"
             echo "  --host ADDR           Bind address (default: 0.0.0.0)"
-            echo "  --pool-size N         Renderer workers per style (default: 2)"
+            echo "  --pool-size N         Max concurrent renders across all styles (default: 2)"
             echo "  --timeout N           Render timeout in seconds (default: 15)"
-            echo "  --worker-lifetime N   Renders per worker before recycle (default: 500)"
             echo "  --admin-user USER     Admin UI username"
             echo "  --admin-pass PASS     Admin UI password"
             echo ""
@@ -64,7 +64,7 @@ done
 
 # Check prerequisites
 if [ ! -f "$BINARY" ]; then
-    echo "Binary not found at $BINARY — run 'make build' first."
+    echo "Binary not found at $BINARY — run 'make fetch-ffi && make build-go-renderer' first."
     exit 1
 fi
 
