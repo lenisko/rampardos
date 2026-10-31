@@ -352,7 +352,7 @@ func newMetricsManager() *MetricsManager {
 
 		rendererWorkerStartup: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_worker_startup_seconds",
-			Help:    "Time from starting a worker to its ready signal (EGL context, runtime, map, style load), for every worker start: pool creation, growth, replacement and reload. Pool sizing grows only when a backlog would outlast this.",
+			Help:    "Time from starting a worker to its ready signal (EGL context, runtime, map, style URL committed), for every worker start: pool creation, growth, replacement and reload. The style load itself happens after ready and is paid by the worker's first render; see worker_first_render_seconds.",
 			Buckets: rendererStartupBuckets,
 		}, []string{"style", "scale"}),
 

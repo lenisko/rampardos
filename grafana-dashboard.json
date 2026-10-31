@@ -1630,20 +1630,20 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.50, sum(rate(rampardos_renderer_worker_startup_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le, style, scale))",
+          "expr": "histogram_quantile(0.50, sum(rate(rampardos_renderer_worker_startup_seconds_bucket{instance=~\"$instance\"}[1h])) by (le, style, scale))",
           "legendFormat": "p50 {{style}} x{{scale}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.95, sum(rate(rampardos_renderer_worker_startup_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le, style, scale))",
+          "expr": "histogram_quantile(0.95, sum(rate(rampardos_renderer_worker_startup_seconds_bucket{instance=~\"$instance\"}[1h])) by (le, style, scale))",
           "legendFormat": "p95 {{style}} x{{scale}}",
           "refId": "B"
         }
       ],
       "title": "Worker Startup Time (start to ready)",
       "type": "timeseries",
-      "description": "Time from starting a worker to its ready signal, for every start: creation, growth, replacement, reload. Pool sizing grows only when a backlog would outlast this."
+      "description": "Time from starting a worker to its ready signal (style URL committed; the style load itself is paid by the first render), for every start: creation, growth, replacement, reload. One sample per start, so it uses a 1h window."
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
