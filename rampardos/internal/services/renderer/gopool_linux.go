@@ -695,6 +695,7 @@ func (p *goStylePool) startWorkerLocked(startupErrs chan error) *goWorker {
 		pool:        p,
 		startupErrs: startupErrs,
 		broadcast:   make(chan goWorkerCommand, 1),
+		started:     time.Now(),
 	}
 	p.workers = append(p.workers, w)
 	p.wg.Add(1)
@@ -979,6 +980,12 @@ type goWorker struct {
 	// or finish another render.
 	poisoned bool
 
+	// started is when the worker was started, for its startup time.
+	// rendered is set once it has taken a render: only its first is a
+	// cold-render sample. Worker goroutine only, after construction.
+	started  time.Time
+	rendered bool
+
 	// heldSlot is the global render slot of the render that poisoned the
 	// worker. Its still may be pending in the map and could still render,
 	// so the slot is freed only once cleanup has torn the map down.
@@ -992,6 +999,9 @@ func (w *goWorker) loop() {
 		w.startupErrs <- err
 		w.cleanup()
 		return
+	}
+	if services.GlobalMetrics != nil {
+		services.GlobalMetrics.RecordRendererWorkerStartup(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, time.Since(w.started).Seconds())
 	}
 	w.startupErrs <- nil
 	defer w.cleanup()
@@ -1017,7 +1027,12 @@ func (w *goWorker) loop() {
 			}
 			return
 		case goWorkerCmdRender:
+			start := time.Now()
 			img, err := w.renderOne(cmd.ctx, cmd.render.vp, cmd.render.scale)
+			if err == nil && services.GlobalMetrics != nil {
+				services.GlobalMetrics.RecordRendererWorkerRender(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, time.Since(start).Seconds(), !w.rendered)
+			}
+			w.rendered = true
 			if w.poisoned {
 				w.heldSlot = cmd.render.release
 			} else if cmd.render.release != nil {
