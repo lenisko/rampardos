@@ -104,6 +104,9 @@ type MetricsManager struct {
 	rendererPoolGrow           *prometheus.CounterVec   // workers added on demand
 	rendererPoolShrink         *prometheus.CounterVec   // workers retired when idle
 	rendererWorkerReplacements *prometheus.CounterVec   // poisoned workers retired (reason=error)
+	rendererWorkerStartup      *prometheus.HistogramVec // worker start to ready signal
+	rendererWorkerRender       *prometheus.HistogramVec // worker-side duration of every render
+	rendererWorkerFirstRender  *prometheus.HistogramVec // worker-side duration of each worker's first render
 
 	// Shared tile provider (renderer resource provider backed by SQLite
 	// + an in-process LRU of decompressed tile blobs). outcome: lru_hit,
@@ -135,6 +138,15 @@ type MetricsManager struct {
 	// Dataset size metrics
 	datasetSizeBytes *prometheus.GaugeVec
 }
+
+// Renderer latency buckets. Pool sizing compares acquire waits with a
+// worker's startup time, tens to hundreds of milliseconds, so the waits
+// resolve to the millisecond there; 10µs keeps "did not wait" visible.
+var (
+	rendererWaitBuckets    = []float64{0.00001, 0.001, 0.002, 0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0}
+	rendererStartupBuckets = []float64{0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.0, 5.0}
+	rendererRenderBuckets  = []float64{0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1.0, 2.5, 5.0}
+)
 
 // Low-cardinality label values used across metric recordings.
 // Keeping them as constants prevents typos silently splitting a
@@ -310,7 +322,7 @@ func newMetricsManager() *MetricsManager {
 		rendererPoolAcquireWait: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_pool_acquire_wait_seconds",
 			Help:    "Time a dispatch call spent waiting for an idle worker in its (style, scale) pool. Sustained high percentiles indicate the pool is saturated; under healthy load this should be dominated by the sub-ms bucket.",
-			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
+			Buckets: rendererWaitBuckets,
 		}, []string{"style", "scale"}),
 
 		rendererPoolWorkers: promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -337,6 +349,24 @@ func newMetricsManager() *MetricsManager {
 			Name: "rampardos_renderer_worker_replacements_total",
 			Help: "Workers retired because a render left them unusable (a failed map, a still that would not settle, a glyph load failure). The pool grows a replacement on demand.",
 		}, []string{"style", "scale", "reason"}),
+
+		rendererWorkerStartup: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_worker_startup_seconds",
+			Help:    "Time from starting a worker to its ready signal (EGL context, runtime, map, style load), for every worker start: pool creation, growth, replacement and reload. Pool sizing grows only when a backlog would outlast this.",
+			Buckets: rendererStartupBuckets,
+		}, []string{"style", "scale"}),
+
+		rendererWorkerRender: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_worker_render_seconds",
+			Help:    "Worker-side duration of each successful render, excluding queueing and encode. The warm-render reference for worker_first_render_seconds.",
+			Buckets: rendererRenderBuckets,
+		}, []string{"style", "scale"}),
+
+		rendererWorkerFirstRender: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "rampardos_renderer_worker_first_render_seconds",
+			Help:    "Worker-side duration of each worker's first render, when it succeeds. Compare with worker_render_seconds to see the cold cost a newly started worker pays.",
+			Buckets: rendererRenderBuckets,
+		}, []string{"style", "scale"}),
 
 		tileProviderRequests: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_tileprovider_requests_total",
@@ -384,7 +414,7 @@ func newMetricsManager() *MetricsManager {
 		rendererGlobalAcquireWait: promauto.NewHistogram(prometheus.HistogramOpts{
 			Name:    "rampardos_renderer_global_acquire_wait_seconds",
 			Help:    "Time a dispatch spent waiting for the global concurrency semaphore before even attempting the per-pool acquire. Non-zero percentiles indicate the global cap is the limiting factor, not a specific pool.",
-			Buckets: []float64{0.00001, 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0},
+			Buckets: rendererWaitBuckets,
 		}),
 
 		datasetSizeBytes: promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -578,6 +608,20 @@ func (m *MetricsManager) RecordRendererPoolShrink(style, scale string) {
 
 func (m *MetricsManager) RecordRendererWorkerReplacement(style, scale, reason string) {
 	m.rendererWorkerReplacements.WithLabelValues(bucketLabel(style), bucketLabel(scale), reason).Inc()
+}
+
+// RecordRendererWorkerStartup observes one worker's start-to-ready time.
+func (m *MetricsManager) RecordRendererWorkerStartup(style, scale string, seconds float64) {
+	m.rendererWorkerStartup.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(seconds)
+}
+
+// RecordRendererWorkerRender observes one successful render on a worker,
+// and also as a cold render when it was the worker's first.
+func (m *MetricsManager) RecordRendererWorkerRender(style, scale string, seconds float64, first bool) {
+	m.rendererWorkerRender.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(seconds)
+	if first {
+		m.rendererWorkerFirstRender.WithLabelValues(bucketLabel(style), bucketLabel(scale)).Observe(seconds)
+	}
 }
 
 // RecordTileProviderRequest counts one provider request by outcome and,
