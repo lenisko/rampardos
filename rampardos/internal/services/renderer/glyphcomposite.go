@@ -327,7 +327,6 @@ func composeOneFontstack(fontsDir string, fonts []string) error {
 	g := new(errgroup.Group)
 	g.SetLimit(composeWorkers)
 	for rangeFile := range rangeSet {
-		rangeFile := rangeFile
 		g.Go(func() error {
 			return composeOneRange(fontsDir, fonts, compound, rangeFile, tmpDir)
 		})

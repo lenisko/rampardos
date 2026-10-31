@@ -1,7 +1,5 @@
 {
-  "annotations": {
-    "list": []
-  },
+  "annotations": { "list": [] },
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
@@ -87,7 +85,10 @@
         "defaults": {
           "color": { "mode": "thresholds" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 50 }] },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 50 }]
+          },
           "unit": "short"
         },
         "overrides": []
@@ -651,25 +652,25 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "rampardos_memory_rss_bytes{instance=~\"$instance\"}",
-          "legendFormat": "RSS (Go)",
+          "legendFormat": "RSS (process, incl. renderer)",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "go_memstats_heap_inuse_bytes{instance=~\"$instance\"}",
+          "legendFormat": "Go heap in use",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rampardos_memory_rss_bytes{instance=~\"$instance\"} - on(instance) (go_memstats_sys_bytes{instance=~\"$instance\"} - go_memstats_heap_released_bytes{instance=~\"$instance\"})",
+          "legendFormat": "Native (renderer, ≈ RSS − Go)",
+          "refId": "C"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "rampardos_memory_vss_bytes{instance=~\"$instance\"}",
           "legendFormat": "VSS",
-          "refId": "B"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rampardos_renderer_node_workers_rss_bytes{instance=~\"$instance\"}",
-          "legendFormat": "RSS (Node workers sum)",
-          "refId": "C"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rampardos_memory_rss_bytes{instance=~\"$instance\"} + rampardos_renderer_node_workers_rss_bytes{instance=~\"$instance\"}",
-          "legendFormat": "RSS (total)",
           "refId": "D"
         }
       ],
@@ -786,7 +787,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
       "id": 105,
       "panels": [],
       "title": "Errors",
@@ -822,7 +823,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 42 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 50 },
       "id": 50,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true },
@@ -842,7 +843,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
       "id": 106,
       "panels": [],
       "title": "By Style",
@@ -878,7 +879,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
       "id": 60,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -926,7 +927,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
       "id": 61,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -946,7 +947,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
       "id": 107,
       "panels": [],
       "title": "Templates",
@@ -982,7 +983,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
       "id": 70,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1030,7 +1031,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
       "id": 71,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1078,7 +1079,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 68 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 76 },
       "id": 72,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true },
@@ -1098,7 +1099,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 76 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 84 },
       "id": 200,
       "panels": [],
       "title": "Renderer Performance",
@@ -1134,7 +1135,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 85 },
       "id": 201,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1194,7 +1195,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 77 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
       "id": 202,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1219,6 +1220,12 @@
           "expr": "histogram_quantile(0.99, sum(rate(rampardos_renderer_pool_acquire_wait_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le, style, scale))",
           "legendFormat": "p99 {{style}} x{{scale}}",
           "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(rampardos_renderer_pool_acquire_wait_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) by (style, scale) / sum(rate(rampardos_renderer_pool_acquire_wait_seconds_count{instance=~\"$instance\"}[$__rate_interval])) by (style, scale)",
+          "legendFormat": "mean {{style}} x{{scale}}",
+          "refId": "D"
         }
       ],
       "title": "Pool Acquire Wait (saturation signal)",
@@ -1254,22 +1261,28 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 85 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 93 },
       "id": 203,
       "options": {
-        "legend": { "calcs": ["mean", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "pluginVersion": "10.0.0",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rampardos_renderer_pool_idle_workers{instance=~\"$instance\"}",
+          "expr": "rampardos_renderer_pool_workers{instance=~\"$instance\"}",
           "legendFormat": "{{style}} x{{scale}}",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rampardos_renderer_pool_workers{instance=~\"$instance\"})",
+          "legendFormat": "total",
+          "refId": "B"
         }
       ],
-      "title": "Idle Workers per Pool (0 = pool was busy)",
+      "title": "Workers per Pool (each holds a map, ~100 MB native)",
       "type": "timeseries"
     },
     {
@@ -1307,7 +1320,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 93 },
       "id": 204,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1317,17 +1330,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(rampardos_renderer_worker_replacements_total{instance=~\"$instance\"}[$__rate_interval])) by (style, scale, reason)",
-          "legendFormat": "{{reason}} {{style}} x{{scale}}",
+          "expr": "sum(rate(rampardos_renderer_worker_replacements_total{instance=~\"$instance\"}[$__rate_interval])) by (style, scale)",
+          "legendFormat": "{{style}} x{{scale}}",
           "refId": "A"
         }
       ],
-      "title": "Worker Replacements (error vs lifetime rotation)",
+      "title": "Worker Retirements (render left the worker unusable)",
       "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 93 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 101 },
       "id": 205,
       "panels": [],
       "title": "Renderer Global Concurrency",
@@ -1371,7 +1384,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 94 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 102 },
       "id": 206,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1425,7 +1438,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 94 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 102 },
       "id": 207,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1450,6 +1463,12 @@
           "expr": "histogram_quantile(0.99, sum(rate(rampardos_renderer_global_acquire_wait_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le))",
           "legendFormat": "p99",
           "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(rampardos_renderer_global_acquire_wait_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / sum(rate(rampardos_renderer_global_acquire_wait_seconds_count{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "mean",
+          "refId": "D"
         }
       ],
       "title": "Global Semaphore Acquire Wait",
@@ -1457,10 +1476,10 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
-      "id": 208,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 110 },
+      "id": 230,
       "panels": [],
-      "title": "Node.js Worker Processes",
+      "title": "Renderer Health",
       "type": "row"
     },
     {
@@ -1493,22 +1512,28 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 103 },
-      "id": 209,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 111 },
+      "id": 231,
       "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "pluginVersion": "10.0.0",
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rampardos_renderer_node_workers_total{instance=~\"$instance\"}",
-          "legendFormat": "node workers",
+          "expr": "sum(increase(rampardos_renderer_pool_grow_total{instance=~\"$instance\"}[$__rate_interval])) by (style, scale)",
+          "legendFormat": "grow {{style}} x{{scale}}",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "-sum(increase(rampardos_renderer_pool_shrink_total{instance=~\"$instance\"}[$__rate_interval])) by (style, scale)",
+          "legendFormat": "shrink {{style}} x{{scale}}",
+          "refId": "B"
         }
       ],
-      "title": "Node Worker Count (climbing = rotation broken)",
+      "title": "Pool Grow / Shrink",
       "type": "timeseries"
     },
     {
@@ -1537,12 +1562,66 @@
           },
           "mappings": [],
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "bytes"
+          "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 103 },
-      "id": 210,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 111 },
+      "id": 232,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(increase(rampardos_renderer_still_frame_results_total{instance=~\"$instance\", disposition!=\"rendered\"}[$__rate_interval])) by (disposition)",
+          "legendFormat": "frame {{disposition}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(increase(rampardos_renderer_resource_errors_total{instance=~\"$instance\"}[$__rate_interval])) by (style, kind)",
+          "legendFormat": "{{kind}} {{style}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Failed Stills & Resource Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 119 },
+      "id": 254,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
@@ -1551,23 +1630,79 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rampardos_renderer_node_workers_rss_bytes{instance=~\"$instance\"}",
-          "legendFormat": "node workers RSS",
+          "expr": "histogram_quantile(0.50, sum(rate(rampardos_renderer_worker_startup_seconds_bucket{instance=~\"$instance\"}[1h])) by (le, style, scale))",
+          "legendFormat": "p50 {{style}} x{{scale}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rampardos_renderer_node_workers_rss_bytes{instance=~\"$instance\"} / ignoring() rampardos_renderer_node_workers_total{instance=~\"$instance\"}",
-          "legendFormat": "avg per worker",
+          "expr": "histogram_quantile(0.95, sum(rate(rampardos_renderer_worker_startup_seconds_bucket{instance=~\"$instance\"}[1h])) by (le, style, scale))",
+          "legendFormat": "p95 {{style}} x{{scale}}",
           "refId": "B"
         }
       ],
-      "title": "Node Worker Memory (summed RSS + avg)",
-      "type": "timeseries"
+      "title": "Worker Startup Time (start to ready)",
+      "type": "timeseries",
+      "description": "Time from starting a worker to its ready signal (style URL committed; the style load itself is paid by the first render), for every start: creation, growth, replacement, reload. One sample per start, so it uses a 1h window."
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 119 },
+      "id": 255,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum(rate(rampardos_renderer_worker_first_render_seconds_bucket{instance=~\"$instance\"}[1h])) by (le, style, scale))",
+          "legendFormat": "first {{style}} x{{scale}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum(rate(rampardos_renderer_worker_render_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le, style, scale))",
+          "legendFormat": "warm {{style}} x{{scale}}",
+          "refId": "B"
+        }
+      ],
+      "title": "First Render vs Warm Render",
+      "type": "timeseries",
+      "description": "Worker-side p50 of each worker's first render against all renders. A gap is the cold cost a newly started worker pays. First renders are sparse, so they use a 1h window."
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 127 },
       "id": 211,
       "panels": [],
       "title": "Tile Pipeline",
@@ -1603,7 +1738,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 112 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 128 },
       "id": 212,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1663,7 +1798,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 112 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 128 },
       "id": 213,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1711,7 +1846,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 120 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 136 },
       "id": 214,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1771,7 +1906,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 120 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 136 },
       "id": 215,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1791,7 +1926,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 128 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 144 },
       "id": 216,
       "panels": [],
       "title": "In-Memory Image Cache",
@@ -1827,7 +1962,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 129 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 145 },
       "id": 217,
       "options": {
         "legend": { "calcs": ["mean", "last"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1884,7 +2019,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 129 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 145 },
       "id": 218,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1909,8 +2044,110 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 153 },
+      "id": 240,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rampardos_image_cache_bytes{instance=~\"$instance\"}",
+          "legendFormat": "{{cache}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rampardos_composite_cache_kind_bytes{instance=~\"$instance\"}",
+          "legendFormat": "composite: {{kind}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Image Cache Bytes (byte-bounded LRUs)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 153 },
+      "id": 241,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(rampardos_composite_cache_lookups_total{instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) by (kind) / sum(rate(rampardos_composite_cache_lookups_total{instance=~\"$instance\"}[$__rate_interval])) by (kind)",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Composite Cache Hit Rate by Kind",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 137 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 161 },
       "id": 219,
       "panels": [],
       "title": "Datasets",
@@ -1946,7 +2183,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 138 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 162 },
       "id": 220,
       "options": {
         "legend": { "calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true },
@@ -1966,7 +2203,165 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 146 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 170 },
+      "id": 250,
+      "panels": [],
+      "title": "Renderer Tile Provider (mbtiles)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 171 },
+      "id": 251,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(rampardos_tileprovider_requests_total{instance=~\"$instance\"}[$__rate_interval])) by (outcome)",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Provider Requests by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 171 },
+      "id": 252,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum(rate(rampardos_tileprovider_fetch_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum(rate(rampardos_tileprovider_fetch_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "title": "Provider SQLite Fetch Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 171 },
+      "id": 253,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rampardos_tileprovider_cache_bytes{instance=~\"$instance\"}",
+          "legendFormat": "cached",
+          "refId": "A"
+        }
+      ],
+      "title": "Provider Tile LRU Bytes",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 179 },
       "id": 221,
       "panels": [],
       "title": "Render Throughput",
@@ -1984,7 +2379,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 147 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 180 },
       "id": 222,
       "options": {
         "colorMode": "value",
@@ -2035,7 +2430,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 18, "x": 6, "y": 147 },
+      "gridPos": { "h": 4, "w": 18, "x": 6, "y": 180 },
       "id": 223,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
@@ -2112,6 +2507,6 @@
   "timezone": "",
   "title": "Rampardos",
   "uid": "rampardos",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

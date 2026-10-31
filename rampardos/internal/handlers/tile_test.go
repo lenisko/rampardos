@@ -38,7 +38,7 @@ func TestTileHandlerGenerateTileUsesRendererForLocalStyle(t *testing.T) {
 		stylesController: stubStylesController{ext: nil},
 	}
 
-	result, err := h.GenerateTile(context.Background(), "local", 14, 8188, 5448, 1, models.ImageFormatPNG)
+	result, err := h.GenerateTile(context.Background(), "local", 14, 8188, 5448, 1, models.ImageFormatPNG, renderer.TileSizePx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,8 +72,53 @@ func TestTileHandlerGenerateTileReturnsRenderErrors(t *testing.T) {
 		stylesController: stubStylesController{ext: nil},
 	}
 
-	_, err := h.GenerateTile(context.Background(), "local", 0, 0, 0, 1, models.ImageFormatPNG)
+	_, err := h.GenerateTile(context.Background(), "local", 0, 0, 0, 1, models.ImageFormatPNG, renderer.TileSizePx)
 	if err == nil {
 		t.Errorf("expected render failure error, got nil")
+	}
+}
+
+func TestTileHandlerGenerateSmallTileUsesSeparateCacheFile(t *testing.T) {
+	fake := &renderer.Fake{
+		Canned: []byte{0x89, 'P', 'N', 'G', 0, 0, 0, 0},
+	}
+	os.Remove("Cache/Tile/local-14-8188-5448-1-256.png")
+
+	h := &TileHandler{
+		renderer:         fake,
+		statsController:  newTestStatsController(),
+		stylesController: stubStylesController{ext: nil},
+	}
+
+	result, err := h.GenerateTile(context.Background(), "local", 14, 8188, 5448, 1, models.ImageFormatPNG, renderer.SmallTileSizePx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Path != "Cache/Tile/local-14-8188-5448-1-256.png" {
+		t.Errorf("path: got %q", result.Path)
+	}
+	if len(fake.Calls) != 1 || fake.Calls[0].Request.TileSize != renderer.SmallTileSizePx {
+		t.Fatalf("expected one Render call with TileSize=256, got %+v", fake.Calls)
+	}
+}
+
+func TestTileCachePathKeepsLegacyNameFor512(t *testing.T) {
+	got := tileCachePath("hday", 14, 1, 2, 2, models.ImageFormatPNG, renderer.TileSizePx)
+	if got != "Cache/Tile/hday-14-1-2-2.png" {
+		t.Errorf("512 path changed: %q", got)
+	}
+}
+
+func TestParseTileSize(t *testing.T) {
+	for in, want := range map[string]int{"": 512, "512": 512, "256": 256} {
+		got, err := parseTileSize(in)
+		if err != nil || got != want {
+			t.Errorf("parseTileSize(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"128", "1024", "abc"} {
+		if _, err := parseTileSize(in); err == nil {
+			t.Errorf("parseTileSize(%q): expected error", in)
+		}
 	}
 }

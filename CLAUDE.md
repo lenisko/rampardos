@@ -14,12 +14,8 @@ visible in the code.
   the per-pool worker count. Without the global cap, N styles × M scales ×
   PoolSize workers could oversubscribe CPU; the semaphore keeps the ceiling
   at PoolSize regardless of how many pools exist.
-- For local styles: default is native viewport render for all zooms
-  (`LOCAL_STYLES_USE_VIEWPORT=true` by default). Set to `false` to route
-  integer-zoom requests through tile stitching; fractional zoom is
-  always viewport-rendered regardless. The dispatcher
-  (`generateBaseStaticMap`) picks the branch on
-  `isFractional(zoom) || h.localUseViewport`.
+- Local styles always render the static map as one native viewport, at
+  any zoom (`generateBaseStaticMap`); they never tile-stitch.
 - External styles can't use viewport render — they always tile-stitch,
   with fractional zoom approximated to the nearest integer.
   `logExternalViewportApprox` logs this so it's observable.
@@ -33,12 +29,130 @@ visible in the code.
   `log2(tileSize/256)` from the user's zoom before dispatching, so a
   512-tileSize style sees `zoom-1` internally. See `styleZoomOffset`.
   The adjustment is only applied on the viewport path; `TileToViewport`
-  already produces a 512-pixel frame that matches MapLibre's native
-  units for the common 512-tileSize case, so tile rendering is already
-  correct.
+  already produces a frame in MapLibre's native units (512 px at `z`,
+  or 256 px at `z-1` for `?tileSize=256`) for the common 512-tileSize
+  case, so tile rendering is already correct.
+- **`/tile` output size.** Tiles are 512 logical px by default, which
+  256-px clients (Leaflet, OpenLayers) squeeze into a 256 slot, halving
+  label size. `?tileSize=256` renders a 256-px frame one MapLibre zoom
+  lower: same extent, labels sized for 256. Local styles only — external
+  styles are proxied and return 400. At `z=0` the `z-1` frame would be
+  clamped to MapLibre's minimum zoom and show part of the world, so
+  `Render` downsamples the 512 world tile instead.
+- **Tile cache filenames.** 512 tiles keep `style-z-x-y-scale.format`
+  so existing caches survive upgrades, and because `static_map.go`
+  (redownload) and `image_utils_native.go` (stitch grid) parse that
+  shape by splitting on `-`. Other sizes append `-<size>`
+  (`tileCachePath`). Static maps only stitch 512 tiles, so the parsers
+  never see a suffixed name — keep it that way or teach them the
+  suffix.
 - Regression hotspot. `77e68a8` reverted a scale>1 viewport bypass;
   `3f345cd` added per-scale pools. Exercise scale=1 **and** scale=2
   whenever you touch viewport/tile math.
+- **Executor-binding still invariants** (`goWorker.awaitStill`, the
+  core-worker driver): a static-mode map renders only for a still.
+  `RequestStillImage` submits its own frame demands (token
+  `MLN_FRAME_DEMAND_TOKEN_STILL_IMAGE`) and resubmits after any that ends
+  before the image renders (FFI #1110), so the host submits no demands
+  and issues no `Barrier` — those existed only to drive and then end
+  host demands. The await only waits: on the still's Future, on
+  FrameWake (results are drained to record them and to fail fast on
+  TargetNotReady, after which the still would wait for a target change
+  that never comes), on `mapErr`, and on the style-failure wake.
+  Results queued at render start belong to an earlier still and are
+  flushed, but counted: the completing frame's result can trail the
+  Future past the final drain (~8% of renders in prod), so discarding
+  them uncounted undercut the frame-result metric. The readback may
+  follow as soon as the Future completes.
+- **Map failures arrive by push.** The runtime event handler
+  (`handleEvents`) runs on the runtime's native thread: it may only
+  record state and do non-blocking sends — no blocking, no `Await`, no
+  runtime calls that wait. Events are dropped until a handler is set,
+  so it is set before `CreateMap`. The mask carries the two failures no
+  still reports by itself:
+  - A style that fails to load (parse error, missing file) fails only
+    the still pending at that moment; mbgl's `lastError` covers source
+    and sprite errors, not the style, so a still requested afterwards
+    never completes. The failure is therefore worker *state*
+    (`styleFailed`), not a one-shot signal: every render refuses
+    before requesting a still while it stands. It belongs to the
+    current style only if its event generation is past the generation
+    the style command committed at (`styleGen`, set by `setStyle`,
+    which awaits the commit — commit precedes the load). A one-shot
+    signal here meant a 15 s hang plus a poisoned worker on every
+    render after the first.
+    The failure event can still land after that check and before the
+    still request runs, leaving a still that never completes: the await
+    rechecks after flushing its wake (which the event also uses), and
+    settling such a still reloads the same style, whose repeated
+    failure fails it.
+  - A render error ends no still. It goes to `mapErr`, which is flushed
+    at render start: the map renders only for a still, so a leftover
+    belongs to a render that already failed on it.
+  `TestStyleFailureFailsStillFast` (integration tag) guards both.
+  Glyph and sprite load failures are also in the mask. Each fails the
+  pending still, but with a bare native error, so the handler records
+  the resource (`resourceFailed`) and the await names it in the render
+  error. It is style state scoped by generation like `styleFailed`,
+  but inclusive (`>= styleGen`: a sprite failing before the next
+  snapshot carries the commit generation itself), and never cleared in
+  `setStyle`: a fast load can fail before the commit's Await returns. A failed sprite fails every later
+  still promptly with no new event. A failed glyph
+  range is never re-requested, so a later still needing it hung to the
+  render timeout; the worker retires after a glyph failure instead, and
+  its replacement's fresh map fails fast. The event can trail the
+  still's Future, so a failed still waits up to 100 ms for it, and a
+  glyph failure found at the next render start retires the worker
+  then. Both are counted and warned once per resource per pool.
+  `RenderFrameFinished` events do not exist in static mode (mbgl gates
+  them to Continuous) — don't build logic on them. A session `Resize`
+  completes once the map and driver apply the extent and the map
+  publishes its snapshot. The worker starts it, runs the still, then
+  checks its completion; `curW/curH` track the extent from the resize's
+  *acceptance* (it applies even if that render fails), and any
+  uncertainty zeroes them so the next render resizes. The camera
+  command's completion is checked the same way — an uncommitted camera
+  would serve the previous view (a command's `Await` returns an error
+  when it fails or is cancelled; there is no disposition to check).
+  `DrainFrameResults` returns an empty slice when the queue is empty.
+  There is no cancel for a pending still and the map refuses a second
+  one, but an abandoned still keeps rendering itself: settling is a
+  bounded wait for its Future, else the worker is poisoned. A still
+  whose Future is already done (it failed) needs no settling: don't
+  poison for that.
+  Blocking `Future.Await` is safe under the core-worker driver; the
+  caller-graphics-thread driver self-deadlocks on it — do not
+  reintroduce that driver without restoring a host service loop.
+
+## Tile provider (shared renderer resource provider)
+
+- One process-wide `TileStore` (SQLite pool + byte-bounded LRU of
+  decompressed tiles) serves every worker via the binding's resource
+  provider; `RENDERER_TILE_PROVIDER=off` is the kill switch back to the
+  native mbtiles source, and any store-open failure degrades the same
+  way. `RENDERER_TILE_CACHE_MB` bounds the LRU (default 64).
+- With the provider active, each worker runtime's mbgl ambient cache
+  is set to 0 (`RENDERER_AMBIENT_CACHE_MB` overrides). mbgl otherwise
+  keeps a per-worker copy of every tile and, before using it, asks the
+  provider to revalidate — which the provider answers by resending the
+  tile, so half the provider calls were duplicate deliveries. Off was
+  ~25% faster per render and ~20–130 MB lighter on the real-data smoke,
+  with identical PNGs. Raise it only for a local style with remote
+  (non-provider) sources, which would otherwise refetch every render.
+- The custom `rampardos://tile/` scheme is what routes tiles to the
+  provider: mbgl only consults providers for network-path URLs, so
+  styleprep inlines a TileJSON with that scheme instead of an
+  `mbtiles://` url. The provider registers a route for that scheme
+  only, so other network requests pass through to native loading
+  without a callback, and file:// glyphs/sprites never reach it.
+  Answering (`Complete`/`PassThrough`) consumes the request handle.
+- The provider must return DECOMPRESSED tile bytes (mbgl's network path
+  assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
+  rows for the mbtiles query. maxzoom in the inline TileJSON is what
+  makes overzoom work.
+- Dataset activate/combine retargets the mbtiles symlink; ReloadStyles
+  reopens the store, drops the tile LRU, and rebuilds the inline
+  TileJSON before re-preparing styles.
 
 ## Cache intent: nocache, TTL, owned
 
@@ -69,9 +183,12 @@ visible in the code.
   the cross-request burst-sharing mechanism. Keyed by path. Holds
   base renders, final staticmaps and multistaticmap composites as
   `image.Image`. **Bounded by decoded-pixel bytes**
-  (`COMPOSITE_IMAGE_CACHE_MB`, default 256), not entry count: a
+  (`COMPOSITE_IMAGE_CACHE_MB`, default 128), not entry count: a
   scale=2 multi composite is tens of times a scale=1 staticmap, and
   the old count bound (200) reached ~1 GB of heap in prod (#34).
+  Reuse is burst-only: a large install saw 0.2% final-staticmap hits
+  over 12 h, base ~6%. A bigger budget buys almost nothing and costs
+  twice its size in heap under GOGC=100.
   `COMPOSITE_IMAGE_CACHE_SIZE` (default 1000) is only a secondary
   cap. An image bigger than the whole budget is not cached.
 - Count a lookup once: the fast-path `Get` records hit/miss; the
@@ -120,11 +237,33 @@ visible in the code.
 
 ## ReloadStyles
 
+- Reload **rebuilds** every active pool; it never calls `SetStyleUrl`
+  on a running map. A map keeps the tiles it has loaded across a style
+  change, so after a dataset switch a reloaded-in-place worker went on
+  rendering the old dataset (provider on or off).
+  `TestReloadStylesFollowsDatasetSwitch` guards it.
 - `loadPool` runs outside the write lock so in-flight renders keep
-  going. At swap time, pools that a concurrent `getOrCreatePool`
-  inserted into `npr.pools` are merged into the new map — never
-  `npr.pools = newPools` wholesale.
-- `style.prepared.json` must be written via `atomicWritePrepared`
+  going. The swap replaces only the keys it rebuilt, never
+  `r.pools` wholesale: a pool a concurrent `getOrCreatePool` added
+  stays, and a pool whose rebuild failed keeps serving.
+- `getOrCreatePool` builds outside `mu` too (singleflight per key):
+  holding the write lock for a pool's startup stalled every warm pool.
+  A pool whose build overlapped a reload (`r.gen` moved) is discarded
+  and rebuilt, since it may hold the previous dataset's TileJSON; it is
+  never installed, even when the retries run out. The render slot is
+  taken only after the pool resolves, so a cold build holds no slot.
+- Old pools are closed after the swap, while requests may still be
+  dispatching to them. So `cmds` is never closed: `close` closes
+  `done`, which stops the workers and makes `dispatch` return
+  `errPoolClosed` for a render no worker took, and
+  `renderViewportImage` retries it on the replacement pool.
+- `style.prepared.json` must be written via `fileutil.AtomicWriteFile`
   (tempfile + rename). Workers spawned by one `loadPool` read this
   file; plain `os.WriteFile`'s truncate window exposes a zero-length
   file to them.
+- Every pool of a style (each scale) shares that file, and a worker
+  reads it whenever it starts, including ones grown later. So
+  `loadPool` writes it under `prepMu` only while its config's `gen` is
+  current: a stale build overwrote the new dataset's TileJSON.
+- `TileStore.Close` is terminal: `Close` does not take `reloadMu`, so a
+  reload can `Reopen` after it, and must not revive the store.
