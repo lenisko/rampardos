@@ -173,3 +173,16 @@ func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 func isHTTP(url string) bool {
 	return strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")
 }
+
+// usesLocalGlyphs reports whether PrepareStyle points the style's glyphs
+// at the local fonts directory: it rewrites every glyphs URL but an
+// http(s) one.
+func usesLocalGlyphs(styleJSON []byte) bool {
+	var style struct {
+		Glyphs string `json:"glyphs"`
+	}
+	if err := json.Unmarshal(styleJSON, &style); err != nil {
+		return false
+	}
+	return style.Glyphs != "" && !isHTTP(style.Glyphs)
+}

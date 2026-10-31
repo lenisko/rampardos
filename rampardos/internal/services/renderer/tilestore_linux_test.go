@@ -259,3 +259,20 @@ func TestParseTileURL(t *testing.T) {
 		}
 	}
 }
+
+// A reload racing shutdown may reopen after Close. The store must stay
+// closed rather than install fresh handles nothing will close.
+func TestTileStoreReopenAfterCloseStaysClosed(t *testing.T) {
+	path, _ := buildTestMbtiles(t)
+	s, err := newTileStore(path, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if err := s.Reopen(); err == nil {
+		t.Fatal("Reopen after Close succeeded")
+	}
+	if s.db != nil || s.stmt != nil {
+		t.Fatal("Reopen after Close installed new handles")
+	}
+}

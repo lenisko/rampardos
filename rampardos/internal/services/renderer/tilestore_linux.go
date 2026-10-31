@@ -51,9 +51,12 @@ type TileStore struct {
 
 	// mu guards db/stmt against Reopen (dataset activate/combine swaps
 	// the mbtiles symlink); readers hold RLock for the query.
-	mu   sync.RWMutex
-	db   *sql.DB
-	stmt *sql.Stmt
+	mu sync.RWMutex
+	// closed (guarded by mu) is terminal: a Reopen racing Close discards
+	// the handles it opened instead of reviving the store.
+	closed bool
+	db     *sql.DB
+	stmt   *sql.Stmt
 
 	// cmu guards the LRU. Entries hold decompressed tile bytes; the
 	// cache is bounded by total bytes, not entry count.
@@ -153,6 +156,12 @@ func (s *TileStore) Reopen() error {
 		return err
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = stmt.Close()
+		_ = db.Close()
+		return fmt.Errorf("renderer: tile store is closed")
+	}
 	oldDB, oldStmt := s.db, s.stmt
 	s.db, s.stmt = db, stmt
 	s.cmu.Lock()
@@ -176,6 +185,7 @@ func (s *TileStore) Reopen() error {
 func (s *TileStore) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	if s.stmt != nil {
 		_ = s.stmt.Close()
 		s.stmt = nil

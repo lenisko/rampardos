@@ -213,6 +213,23 @@ func TestRetiredWorkerIsReplacedWhileRequestsWait(t *testing.T) {
 	}
 }
 
+// The same holds above the floor: with two workers busy, a third request
+// waiting and one worker retiring, the pool must not shrink below what
+// the waiting request needs.
+func TestRetiredWorkerAboveFloorIsReplacedWhileRequestsWait(t *testing.T) {
+	p := newTestPool(1, 3)
+	p.grow()
+	p.mu.Lock()
+	victim := p.workers[1]
+	p.mu.Unlock()
+
+	p.waiting.Add(1)
+	p.deregister(victim)
+	if got := p.size(); got != 2 {
+		t.Fatalf("size after a worker above the floor retired with a request waiting = %d, want 2", got)
+	}
+}
+
 // Above the floor with nobody waiting, a retired worker is not replaced:
 // growth stays demand-driven.
 func TestRetiredWorkerAboveFloorIsNotReplacedWhenIdle(t *testing.T) {

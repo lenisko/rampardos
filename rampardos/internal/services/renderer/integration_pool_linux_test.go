@@ -16,7 +16,8 @@ import (
 // run under the renderer's write lock, so every render of every warm pool
 // waited behind the first request for a new style or scale. Here the new
 // style's style.json is a named pipe, so its creation blocks reading it
-// until the test writes the style.
+// until the test writes the style. With a single global slot it also
+// guards against the build holding that slot.
 func TestPoolCreationDoesNotStallOtherPools(t *testing.T) {
 	cfg := setupIntegrationFixtures(t)
 	slowDir := filepath.Join(cfg.StylesDir, "slow")
@@ -27,7 +28,8 @@ func TestPoolCreationDoesNotStallOtherPools(t *testing.T) {
 	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg.PoolSize = 2
+	// One global slot: a cold build holding it would starve the warm pool.
+	cfg.PoolSize = 1
 	cfg.DiscoverStyles = func() ([]string, error) { return []string{"bg", "slow"}, nil }
 
 	r, err := NewGoPoolRenderer(cfg)

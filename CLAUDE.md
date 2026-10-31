@@ -249,7 +249,9 @@ visible in the code.
 - `getOrCreatePool` builds outside `mu` too (singleflight per key):
   holding the write lock for a pool's startup stalled every warm pool.
   A pool whose build overlapped a reload (`r.gen` moved) is discarded
-  and rebuilt, since it may hold the previous dataset's TileJSON.
+  and rebuilt, since it may hold the previous dataset's TileJSON; it is
+  never installed, even when the retries run out. The render slot is
+  taken only after the pool resolves, so a cold build holds no slot.
 - Old pools are closed after the swap, while requests may still be
   dispatching to them. So `cmds` is never closed: `close` closes
   `done`, which stops the workers and makes `dispatch` return
@@ -259,3 +261,9 @@ visible in the code.
   (tempfile + rename). Workers spawned by one `loadPool` read this
   file; plain `os.WriteFile`'s truncate window exposes a zero-length
   file to them.
+- Every pool of a style (each scale) shares that file, and a worker
+  reads it whenever it starts, including ones grown later. So
+  `loadPool` writes it under `prepMu` only while its config's `gen` is
+  current: a stale build overwrote the new dataset's TileJSON.
+- `TileStore.Close` is terminal: `Close` does not take `reloadMu`, so a
+  reload can `Reopen` after it, and must not revive the store.

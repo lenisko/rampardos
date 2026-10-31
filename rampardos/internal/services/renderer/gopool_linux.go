@@ -73,11 +73,20 @@ type GoPoolRenderer struct {
 	// reloadMu serialises ReloadStyles: SIGHUP and the admin dataset
 	// pipeline can both trigger one.
 	reloadMu sync.Mutex
+
+	// prepMu serialises writing style.prepared.json, which every pool of
+	// a style shares and whose workers read it whenever they start. A
+	// build only writes it while its config is current (see loadPool).
+	prepMu sync.Mutex
 }
 
 // errPoolClosed is returned by dispatch on a pool that a reload has
 // replaced (or Close has shut down) before any worker took the render.
 var errPoolClosed = errors.New("renderer: pool closed")
+
+// errStaleConfig is returned by loadPool when a reload has replaced the
+// config it was given.
+var errStaleConfig = errors.New("renderer: config superseded by a reload")
 
 func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	if cfg.PoolSize <= 0 {
@@ -229,12 +238,14 @@ func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRe
 	// reached an old pool after its close is refused before any worker
 	// takes it, so it moves to the pool that replaced it.
 	for attempt := 0; ; attempt++ {
-		if err := r.acquireGlobal(ctx); err != nil {
-			return nil, err
-		}
+		// Resolve the pool before taking a slot: creating one takes up to
+		// the startup timeout, and holding a slot for it starved warm
+		// pools of slots.
 		pool, err := r.getOrCreatePool(req.StyleID, req.Scale)
 		if err != nil {
-			r.releaseGlobal()
+			return nil, err
+		}
+		if err := r.acquireGlobal(ctx); err != nil {
 			return nil, err
 		}
 
@@ -263,9 +274,22 @@ func (r *GoPoolRenderer) renderViewportImage(ctx context.Context, req ViewportRe
 }
 
 // loadPool builds a pool from rcfg, a snapshot of r.cfg taken under mu
-// (ReloadStyles updates its TileJSON).
-func (r *GoPoolRenderer) loadPool(rcfg Config, id string, ratio int) (*goStylePool, error) {
+// at reload generation gen (ReloadStyles updates its TileJSON).
+func (r *GoPoolRenderer) loadPool(rcfg Config, gen uint64, id string, ratio int) (*goStylePool, error) {
+	// The prepared file is shared by every pool of the style, and a worker
+	// reads it whenever it starts, including workers a pool grows later.
+	// A build from a superseded config would overwrite the current
+	// dataset's TileJSON with the previous one, so it does not write.
+	r.prepMu.Lock()
+	r.mu.RLock()
+	stale := r.gen != gen
+	r.mu.RUnlock()
+	if stale {
+		r.prepMu.Unlock()
+		return nil, errStaleConfig
+	}
 	raw, preparedPath, err := prepareStyleFiles(rcfg, id)
+	r.prepMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -302,11 +326,14 @@ func prepareStyleFiles(rcfg Config, id string) (raw []byte, preparedPath string,
 		return nil, "", fmt.Errorf("prepare style: %w", err)
 	}
 
-	// Glyph URLs resolve to <fontsDir>/<fontstack>/<range>.pbf verbatim,
-	// so a stack like ["Metropolis Regular","Noto Sans Regular"] needs a
-	// real directory of that name, composed from its constituents.
-	if err := EnsureCompositeFontstacks(raw, rcfg.FontsDir); err != nil {
-		return nil, "", fmt.Errorf("compose fontstacks: %w", err)
+	// Local glyph URLs resolve to <fontsDir>/<fontstack>/<range>.pbf
+	// verbatim, so a stack like ["Metropolis Regular","Noto Sans Regular"]
+	// needs a real directory of that name, composed from its constituents.
+	// Remote glyphs are served per stack by their host.
+	if usesLocalGlyphs(raw) {
+		if err := EnsureCompositeFontstacks(raw, rcfg.FontsDir); err != nil {
+			return nil, "", fmt.Errorf("compose fontstacks: %w", err)
+		}
 	}
 
 	preparedPath = filepath.Join(rcfg.StylesDir, id, "style.prepared.json")
@@ -352,7 +379,10 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 
 			ratio := int(scale)
 			slog.Info("Creating Go renderer pool on first use", "style", styleID, "ratio", ratio, "stylePoolSize", rcfg.StylePoolSize, "globalRenderCap", rcfg.PoolSize)
-			p, err := r.loadPool(rcfg, styleID, ratio)
+			p, err := r.loadPool(rcfg, gen, styleID, ratio)
+			if errors.Is(err, errStaleConfig) && attempt < 2 {
+				continue
+			}
 			if err != nil {
 				return nil, fmt.Errorf("renderer: create pool %q ratio=%d: %w", styleID, ratio, err)
 			}
@@ -363,11 +393,14 @@ func (r *GoPoolRenderer) getOrCreatePool(styleID string, scale uint8) (*goStyleP
 				r.mu.Unlock()
 				p.close()
 				return nil, fmt.Errorf("renderer: closed")
-			case r.gen != gen && attempt < 2:
+			case r.gen != gen:
 				// A reload ran while this pool was building, so it may hold
 				// the previous dataset. Build again from the new config.
 				r.mu.Unlock()
 				p.close()
+				if attempt == 2 {
+					return nil, fmt.Errorf("renderer: create pool %q ratio=%d: reloads kept superseding the build", styleID, ratio)
+				}
 				continue
 			}
 			if existing := r.pools[key]; existing != nil {
@@ -415,15 +448,12 @@ func (r *GoPoolRenderer) ReloadStyles(ctx context.Context) error {
 		r.cfg.TileJSON = tileJSON
 	}
 	r.gen++
-	r.mu.Unlock()
-
-	r.mu.RLock()
-	rcfg := r.cfg
+	rcfg, gen := r.cfg, r.gen
 	keys := make([]string, 0, len(r.pools))
 	for key := range r.pools {
 		keys = append(keys, key)
 	}
-	r.mu.RUnlock()
+	r.mu.Unlock()
 
 	built := make(map[string]*goStylePool, len(keys))
 	for _, key := range keys {
@@ -434,7 +464,7 @@ func (r *GoPoolRenderer) ReloadStyles(ctx context.Context) error {
 			return ctx.Err()
 		}
 		styleID, ratio := parsePoolKey(key)
-		pool, err := r.loadPool(rcfg, styleID, ratio)
+		pool, err := r.loadPool(rcfg, gen, styleID, ratio)
 		if err != nil {
 			slog.Error("Reload: pool rebuild failed; keeping the previous pool", "style", styleID, "ratio", ratio, "error", err)
 			continue
@@ -948,6 +978,11 @@ type goWorker struct {
 	// the worker rather than dispatching to a map that may never start
 	// or finish another render.
 	poisoned bool
+
+	// heldSlot is the global render slot of the render that poisoned the
+	// worker. Its still may be pending in the map and could still render,
+	// so the slot is freed only once cleanup has torn the map down.
+	heldSlot func()
 }
 
 func (w *goWorker) loop() {
@@ -983,7 +1018,9 @@ func (w *goWorker) loop() {
 			return
 		case goWorkerCmdRender:
 			img, err := w.renderOne(cmd.ctx, cmd.render.vp, cmd.render.scale)
-			if cmd.render.release != nil {
+			if w.poisoned {
+				w.heldSlot = cmd.render.release
+			} else if cmd.render.release != nil {
 				cmd.render.release()
 			}
 			cmd.reply <- goWorkerResult{img: img, err: err}
@@ -1189,6 +1226,9 @@ func (w *goWorker) cleanup() {
 	}
 	// w.egl is the process-wide display; it outlives every worker.
 	releaseNativeMemory()
+	if w.heldSlot != nil {
+		w.heldSlot()
+	}
 }
 
 // renderOne is the per-worker hot path. Resize only if extent changed
