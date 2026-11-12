@@ -101,7 +101,8 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 # The release also publishes the library as static archives in preset Go
 # modules, but Go rejects them: libmln_ffi_platform.a carries LLVM bitcode
 # (.llvmbc), and since 1.26.11/1.27.4 cmd/go refuses any cgo linker input
-# with an LTO section, with no override. The binding's mln_pkgconfig tag
+# with an LTO section, with no override (maplibre-native-ffi#1800; move
+# to the presets once it is fixed). The binding's mln_pkgconfig tag
 # links the release's library through pkg-config instead, which Go does
 # not inspect. Every go build, vet and test of the renderer needs the tag:
 # GOFLAGS below carries it, and a command that passes its own -tags

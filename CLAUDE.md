@@ -123,7 +123,8 @@ visible in the code.
   `newTestDevice(t)`, or each session makes its own GLES device.
 - **Link model.** The release's preset Go modules link static archives,
   but Go (1.26.11+, 1.27.4+) rejects `libmln_ffi_platform.a` for its
-  `.llvmbc` section, with no override. So the Dockerfile downloads the
+  `.llvmbc` section, with no override (maplibre-native-ffi#1800). So
+  the Dockerfile downloads the
   release's shared library (SHA-256 pinned) and every build, vet and
   test uses the binding's `mln_pkgconfig` tag (`GOFLAGS` in the build
   stage). An explicit `-tags` replaces `GOFLAGS`', so integration runs
