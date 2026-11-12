@@ -57,64 +57,53 @@ visible in the code.
   and issues no `Barrier` — those existed only to drive and then end
   host demands. The await only waits: on the still's Future, on
   FrameWake (results are drained to record them and to fail fast on
-  TargetNotReady, after which the still would wait for a target change
-  that never comes), on `mapErr`, and on the style-failure wake.
+  TargetNotReady or Failed, after which the still would never render),
+  and on `mapErr`.
   Results queued at render start belong to an earlier still and are
   flushed, but counted: the completing frame's result can trail the
   Future past the final drain (~8% of renders in prod), so discarding
   them uncounted undercut the frame-result metric. The readback may
   follow as soon as the Future completes.
-- **Map failures arrive by push.** The runtime event handler
-  (`handleEvents`) runs on the runtime's native thread: it may only
-  record state and do non-blocking sends — no blocking, no `Await`, no
-  runtime calls that wait. Events are dropped until a handler is set,
-  so it is set before `CreateMap`. The mask carries the two failures no
-  still reports by itself:
-  - A style that fails to load (parse error, missing file) fails only
-    the still pending at that moment; mbgl's `lastError` covers source
-    and sprite errors, not the style, so a still requested afterwards
-    never completes. The failure is therefore worker *state*
-    (`styleFailed`), not a one-shot signal: every render refuses
-    before requesting a still while it stands. It belongs to the
-    current style only if its event generation is past the generation
-    the style command committed at (`styleGen`, set by `setStyle`,
-    which awaits the commit — commit precedes the load). A one-shot
-    signal here meant a 15 s hang plus a poisoned worker on every
-    render after the first.
-    The failure event can still land after that check and before the
-    still request runs, leaving a still that never completes: the await
-    rechecks after flushing its wake (which the event also uses), and
-    settling such a still reloads the same style, whose repeated
-    failure fails it.
+- **Map failures.** The runtime event handler (`handleEvents`) runs on
+  the runtime's native thread: it may only record state and do
+  non-blocking sends — no blocking, no `Await`, no runtime calls that
+  wait. Events are dropped until a handler is set, so it is set before
+  `CreateMap`.
+  - A style is set once per worker, in `init` (a reload builds new
+    pools, never restyles a map). Since FFI 0.202611 the style command
+    completes only after the style document loads and parses, and fails
+    on a parse error or missing file, so a bad style fails worker start
+    and the pool build reports it at once; a failed rebuild on reload
+    leaves the old pool serving. No style-failure event or state is
+    needed. `TestBadStyleFailsFast` and
+    `TestReloadWithBrokenStyleKeepsServing` guard it.
   - A render error ends no still. It goes to `mapErr`, which is flushed
     at render start: the map renders only for a still, so a leftover
     belongs to a render that already failed on it.
-  `TestStyleFailureFailsStillFast` (integration tag) guards both.
-  Glyph and sprite load failures are also in the mask. Each fails the
-  pending still, but with a bare native error, so the handler records
-  the resource (`resourceFailed`) and the await names it in the render
-  error. It is style state scoped by generation like `styleFailed`,
-  but inclusive (`>= styleGen`: a sprite failing before the next
-  snapshot carries the commit generation itself), and never cleared in
-  `setStyle`: a fast load can fail before the commit's Await returns. A failed sprite fails every later
-  still promptly with no new event. A failed glyph
-  range is never re-requested, so a later still needing it hung to the
-  render timeout; the worker retires after a glyph failure instead, and
-  its replacement's fresh map fails fast. The event can trail the
-  still's Future, so a failed still waits up to 100 ms for it, and a
-  glyph failure found at the next render start retires the worker
-  then. Both are counted and warned once per resource per pool.
+  - Glyph and sprite load failures fail the pending still with a bare
+    native error, so the handler records the resource
+    (`resourceFailed`) and the await names it in the render error. The
+    event can trail the still's Future, so a failed still waits up to
+    100 ms for it. The record is cleared when a still completes, never
+    at render start: a failed sprite fails every later still with no
+    new event, and must keep its name. Each still re-requests glyph
+    ranges that failed earlier (FFI 0.202611), so a glyph failure no
+    longer retires the worker, and glyphs that appear later render
+    (`TestGlyphFailureRecoversWithoutRetirement`). Failures are counted
+    and warned once per resource per pool.
   `RenderFrameFinished` events do not exist in static mode (mbgl gates
   them to Continuous) — don't build logic on them. A session `Resize`
   completes once the map and driver apply the extent and the map
   publishes its snapshot. The worker starts it, runs the still, then
   checks its completion; `curW/curH` track the extent from the resize's
   *acceptance* (it applies even if that render fails), and any
-  uncertainty zeroes them so the next render resizes. The camera
-  command's completion is checked the same way — an uncommitted camera
-  would serve the previous view (a command's `Await` returns an error
-  when it fails or is cancelled; there is no disposition to check).
-  `DrainFrameResults` returns an empty slice when the queue is empty.
+  uncertainty zeroes them so the next render resizes. The scale is the
+  map's, fixed per pool. The camera command's completion is checked the
+  same way — an uncommitted camera would serve the previous view (a
+  command's `Await` returns an error when it fails or is cancelled;
+  there is no disposition to check). `DrainFrameResults` returns an
+  empty slice when the queue is empty; a `Failed` result means the
+  session failed, and fails the render with `GetFailure()`.
   There is no cancel for a pending still and the map refuses a second
   one, but an abandoned still keeps rendering itself: settling is a
   bounded wait for its Future, else the worker is poisoned. A still
@@ -123,6 +112,22 @@ visible in the code.
   Blocking `Future.Await` is safe under the core-worker driver; the
   caller-graphics-thread driver self-deadlocks on it — do not
   reintroduce that driver without restoring a host service loop.
+- **One offscreen device.** `NewGoPoolRenderer` creates one
+  `OffscreenDeviceHandle` (desktop GL; the EGL default is GLES, slower
+  under llvmpipe) and every worker attaches its session to it with
+  `AttachOffscreen`. The library opens Mesa's surfaceless EGL platform
+  itself, so the image needs no `EGL_PLATFORM`. Only `Close` releases
+  it. Teardown releases session, map, runtime in that order, each
+  awaited within the settle budget; once one fails or overruns, it and
+  the rest are `Dispose`d. Tests that build a pool directly pass
+  `newTestDevice(t)`, or each session makes its own GLES device.
+- **Link model.** The release's preset Go modules link static archives,
+  but Go (1.26.11+, 1.27.4+) rejects `libmln_ffi_platform.a` for its
+  `.llvmbc` section, with no override. So the Dockerfile downloads the
+  release's shared library (SHA-256 pinned) and every build, vet and
+  test uses the binding's `mln_pkgconfig` tag (`GOFLAGS` in the build
+  stage). An explicit `-tags` replaces `GOFLAGS`', so integration runs
+  pass `-tags renderer_integration,mln_pkgconfig` (`scripts/rtest.sh`).
 
 ## Tile provider (shared renderer resource provider)
 
@@ -145,7 +150,8 @@ visible in the code.
   `mbtiles://` url. The provider registers a route for that scheme
   only, so other network requests pass through to native loading
   without a callback, and file:// glyphs/sprites never reach it.
-  Answering (`Complete`/`PassThrough`) consumes the request handle.
+  Answering (`Complete`/`PassThrough`) ends the request handle whatever
+  it returns; a refused answer fails the request.
 - The provider must return DECOMPRESSED tile bytes (mbgl's network path
   assumes HTTP already undid Content-Encoding) and must flip XYZ→TMS
   rows for the mbtiles query. maxzoom in the inline TileJSON is what

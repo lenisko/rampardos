@@ -1643,7 +1643,7 @@
       ],
       "title": "Worker Startup Time (start to ready)",
       "type": "timeseries",
-      "description": "Time from starting a worker to its ready signal (style URL committed; the style load itself is paid by the first render), for every start: creation, growth, replacement, reload. One sample per start, so it uses a 1h window."
+      "description": "Time from starting a worker to its ready signal (style document loaded and parsed; sprites, glyphs and tiles are paid by the first render), for every start: creation, growth, replacement, reload. One sample per start, so it uses a 1h window."
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },

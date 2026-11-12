@@ -160,7 +160,9 @@ mtime) variable; see the config source for the full set.
 For development. Production users should pull the docker image.
 
 The renderer is Linux-only: it links upstream's prebuilt
-`libmaplibre-native-c.so` through cgo. On Linux:
+`libmaplibre-native-c.so` through cgo and pkg-config (the binding's
+`mln_pkgconfig` build tag; Go rejects the release's static preset
+modules for the LLVM bitcode they carry). On Linux:
 
 ```bash
 make fetch-ffi          # download the maplibre-native-ffi release
@@ -169,7 +171,9 @@ make build-go-renderer  # build rampardos against it
 
 On other platforms `go build ./cmd/server` compiles but cannot
 render; build and test in Docker instead
-(`docker build --target rampardos-test .`).
+(`docker build --target rampardos-test .`, or
+`scripts/rtest.sh <tag> -tags renderer_integration,mln_pkgconfig ./internal/services/renderer/`
+for the renderer integration tests).
 
 Runtime dependencies (bundled inside the docker image):
 

@@ -197,7 +197,7 @@ func TestPoolAtCeilingDoesNotGrowButRecordsSaturation(t *testing.T) {
 }
 
 // A dispatch grows the pool once and then waits. If the worker it was
-// waiting on retires itself (a glyph failure, an unsettled still), the
+// waiting on retires itself (an unsettled still), the
 // pool must replace it, or the request waits with nothing left to serve
 // it. Before the fix a pool with one worker kept none.
 func TestRetiredWorkerIsReplacedWhileRequestsWait(t *testing.T) {

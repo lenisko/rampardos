@@ -72,9 +72,10 @@ run: build
 test:
 	cd $(GO_DIR) && $(GOTEST) ./...
 
-## test-integration: Run integration tests (needs the FFI; see fetch-ffi)
+## test-integration: Run integration tests (needs the FFI and Mesa; see fetch-ffi, or scripts/rtest.sh for Docker)
 test-integration:
-	cd $(GO_DIR) && $(GOTEST) -tags renderer_integration ./internal/services/renderer/ -v -timeout 60s
+	cd $(GO_DIR) && PKG_CONFIG_PATH=$(MLN_FFI_DIR_HOST)/install/share/pkgconfig CGO_ENABLED=1 \
+	  $(GOTEST) -tags renderer_integration,mln_pkgconfig ./internal/services/renderer/ -v -timeout 60s
 
 ## test-coverage: Run tests with coverage report
 test-coverage:
