@@ -347,7 +347,7 @@ func newMetricsManager() *MetricsManager {
 
 		rendererWorkerReplacements: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "rampardos_renderer_worker_replacements_total",
-			Help: "Workers retired because a render left them unusable (a failed map, a still that would not settle, a glyph load failure). The pool grows a replacement on demand.",
+			Help: "Workers retired because a render left them unusable (a still that would not settle). The pool grows a replacement on demand.",
 		}, []string{"style", "scale", "reason"}),
 
 		rendererWorkerStartup: promauto.NewHistogramVec(prometheus.HistogramOpts{

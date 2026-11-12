@@ -132,8 +132,7 @@ func TestReloadWithBrokenStyleKeepsServing(t *testing.T) {
 // behave. Each fails the still with a bare native error, so every render
 // error must name the resource, and each failing resource is recorded
 // once per pool for the warning log. Repeat renders must fail promptly
-// too: a failed glyph range is never re-requested, so a map that saw one
-// would leave the next still pending until the render timeout.
+// and name the resource again: each still re-requests the failed range.
 func TestMissingResourcesReport(t *testing.T) {
 	cases := []struct {
 		kind, extra, layout string
@@ -212,66 +211,72 @@ func TestMissingResourcesReport(t *testing.T) {
 	}
 }
 
-// TestGlyphRetirementDoesNotStrandWaitingRenders guards requests queued
-// on a pool whose worker retires. A glyph failure retires the worker
-// after its render; with one worker, renders already waiting had no one
-// left to take them, and on a context without a deadline (as static
-// maps use) they waited forever. The pool must replace the worker so
-// every waiting render runs and fails promptly.
-func TestGlyphRetirementDoesNotStrandWaitingRenders(t *testing.T) {
+// TestGlyphFailureRecoversWithoutRetirement: a still re-requests glyph
+// ranges that failed earlier, so a glyph failure no longer leaves the map
+// unable to finish a later still. The worker that saw it keeps serving,
+// and once the glyphs exist it renders them, with no stale failure
+// refusing or mislabelling the renders after it.
+func TestGlyphFailureRecoversWithoutRetirement(t *testing.T) {
 	dir := t.TempDir()
 	style := filepath.Join(dir, "style.json")
 	body := `{"version":8,"glyphs":"file://` + dir + `/fonts/{fontstack}/{range}.pbf",
 	  "sources":{"pt":{"type":"geojson","data":{"type":"Point","coordinates":[-0.12,51.5]}}},
 	  "layers":[
 	    {"id":"bg","type":"background","paint":{"background-color":"#ff8800"}},
-	    {"id":"sym","type":"symbol","source":"pt","layout":{"text-field":"London","text-font":["Missing Sans"]}}
+	    {"id":"sym","type":"symbol","source":"pt","layout":{"text-field":"London","text-font":["Late Sans"]}}
 	  ]}`
 	if err := os.WriteFile(style, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	const renderTimeout = 10 * time.Second
 	p, err := newGoStylePool(goStylePoolConfig{
 		device:            newTestDevice(t),
 		ambientCacheBytes: -1,
-		styleID:           "strand",
+		styleID:           "late-glyphs",
 		scaleLabel:        "1",
 		poolSize:          1,
 		minPoolSize:       1,
 		ratio:             1,
 		styleURL:          "file://" + style,
 		startupTimeout:    30 * time.Second,
-		renderTimeout:     renderTimeout,
+		renderTimeout:     10 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(p.close)
+	p.mu.Lock()
+	worker := p.workers[0]
+	p.mu.Unlock()
 
-	vp := ViewportRequest{StyleID: "strand", Latitude: 51.5, Longitude: -0.12, Zoom: 10, Width: 128, Height: 128, Scale: 1}
-	const renders = 3
-	errs := make(chan error, renders)
-	start := time.Now()
-	for range renders {
-		go func() {
-			_, err := p.dispatch(context.Background(), vp, 1, nil)
-			errs <- err
-		}()
+	vp := ViewportRequest{StyleID: "late-glyphs", Latitude: 51.5, Longitude: -0.12, Zoom: 10, Width: 128, Height: 128, Scale: 1}
+	render := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err := p.dispatch(ctx, vp, 1, nil)
+		return err
 	}
-	for i := range renders {
-		select {
-		case err := <-errs:
-			if err == nil {
-				t.Fatalf("render %d succeeded, want a glyph failure", i)
-			}
-			t.Logf("render %d after %s: %v", i, time.Since(start), err)
-		case <-time.After(2 * renderTimeout):
-			t.Fatalf("render %d still waiting after %s: stranded by the retired worker", i, 2*renderTimeout)
+
+	if err := render(); err == nil || !strings.Contains(err.Error(), "glyphs Late Sans") {
+		t.Fatalf("render with the glyphs missing: err=%v, want a failure naming glyphs Late Sans", err)
+	}
+
+	// An empty file is a valid glyph range with no glyphs in it.
+	fontDir := filepath.Join(dir, "fonts", "Late Sans")
+	if err := os.MkdirAll(fontDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fontDir, "0-255.pbf"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if err := render(); err != nil {
+			t.Fatalf("render %d after the glyphs appeared: %v", i, err)
 		}
 	}
-	// Each render gets a fresh worker in turn; none should have waited
-	// out the queue bound.
-	if took := time.Since(start); took > renderTimeout/2 {
-		t.Fatalf("renders took %s, want each served by a replacement worker", took)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.workers) != 1 || p.workers[0] != worker {
+		t.Fatalf("the glyph failure retired the worker (workers=%d)", len(p.workers))
 	}
 }

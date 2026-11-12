@@ -968,28 +968,19 @@ type goWorker struct {
 
 	// resourceFailed is the latest glyph or sprite load failure. Such a
 	// failure fails the pending still with a bare native error, so the
-	// await adds this to say which resource. It is style state: a failed
-	// sprite fails every later still without a new event. It belongs to
-	// the current style when reported at or after the generation that
-	// style's command committed at (generation >= styleGen: a sprite that
-	// fails before the map publishes another snapshot carries the commit
-	// generation itself, while an earlier style's failure is always
-	// below it). A fast load can fail before setStyle returns, so it is
-	// never cleared there. A failed glyph range is never requested
-	// again, so a later still that needs it never completes: the worker
-	// retires after the render it failed, and its replacement's fresh map
-	// fails fast again.
+	// await adds this to say which resource. It is state, not a signal: a
+	// failed sprite fails every later still without a new event. A still
+	// that completes clears it, since everything it needed loaded: each
+	// still re-requests failed glyph ranges, so glyphs that appear later
+	// render, and their old failure must not name a later, unrelated one.
+	// A map has one style for its life, so no generation scoping is needed.
 	resourceFailed atomic.Pointer[resourceFailure]
-	// styleGen is the map generation at which the style command
-	// completed. Worker goroutine only.
-	styleGen uint64
 
 	curW uint32
 	curH uint32
 
 	// poisoned is set when an abandoned still-image request could not be
-	// settled, or a glyph range failed (see resourceFailed). The map
-	// refuses a second still while one is pending, so the pool retires
+	// settled. The map refuses a second still while one is pending, so the pool retires
 	// the worker rather than dispatching to a map that may never start
 	// or finish another render.
 	poisoned bool
@@ -1183,13 +1174,8 @@ func (w *goWorker) setStyle(ctx context.Context, url string) error {
 	if err != nil {
 		return fmt.Errorf("renderer: set style url: %w", err)
 	}
-	cc, err := f.Await(ctx)
-	if err != nil {
+	if _, err := f.Await(ctx); err != nil {
 		return fmt.Errorf("renderer: set style url: %w", err)
-	}
-	w.styleGen = cc.Generation
-	if serviceTrace {
-		fmt.Fprintf(os.Stderr, "TRACE style committed gen=%d\n", cc.Generation)
 	}
 	return nil
 }
@@ -1399,18 +1385,12 @@ func (w *goWorker) handleEvents(events []maplibre.RuntimeEvent) {
 }
 
 type resourceFailure struct {
-	generation uint64
-	glyphs     bool
-	what       string // kind and resource, e.g. "glyphs Noto Sans 0-255"
+	what string // kind and resource, e.g. "glyphs Noto Sans 0-255"
 }
 
-// resourceErr returns the current style's glyph or sprite failure, if
-// any. Worker goroutine only (it reads styleGen).
+// resourceErr returns the recorded glyph or sprite failure, if any.
 func (w *goWorker) resourceErr() *resourceFailure {
-	if r := w.resourceFailed.Load(); r != nil && r.generation >= w.styleGen {
-		return r
-	}
-	return nil
+	return w.resourceFailed.Load()
 }
 
 // reportResourceError records a glyph or sprite load failure for the
@@ -1434,7 +1414,7 @@ func (w *goWorker) reportResourceError(ev maplibre.RuntimeEvent) {
 		}
 	}
 	what := kind + " " + detail
-	w.resourceFailed.Store(&resourceFailure{generation: ev.Generation, glyphs: kind == "glyphs", what: what})
+	w.resourceFailed.Store(&resourceFailure{what: what})
 	select {
 	case w.wake <- struct{}{}:
 	default:
@@ -1446,7 +1426,7 @@ func (w *goWorker) reportResourceError(ev maplibre.RuntimeEvent) {
 		return
 	}
 	style, scale, msg := w.pool.cfg.styleID, w.pool.cfg.scaleLabel, ev.Message
-	go slog.Warn("renderer: style resource failed to load; renders with this style fail",
+	go slog.Warn("renderer: style resource failed to load; renders that need it fail until it loads",
 		"style", style, "scale", scale, "kind", kind, "resource", detail, "error", msg)
 }
 
@@ -1543,24 +1523,17 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	case <-w.mapErr:
 	default:
 	}
-	// A glyph failure whose event trailed the render it failed: this map
-	// will never finish a still that needs the range.
-	if r := w.resourceErr(); r != nil && r.glyphs {
-		w.poisoned = true
-		return fmt.Errorf("renderer: still image: %s failed to load", r.what)
-	}
-
 	frames := 0
 	for {
 		select {
 		case <-still.Done():
 			if _, err := still.Await(ctx); err != nil {
 				if r := w.awaitResourceFailure(); r != nil {
-					w.poisoned = w.poisoned || r.glyphs
 					return fmt.Errorf("renderer: still image: %s failed to load: %w", r.what, err)
 				}
 				return fmt.Errorf("renderer: still image: %w", err)
 			}
+			w.resourceFailed.Store(nil)
 			// The completing frame's result can trail the Future.
 			n, _ := w.drainFrames(start)
 			frames += n
