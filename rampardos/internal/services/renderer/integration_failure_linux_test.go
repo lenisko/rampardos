@@ -280,3 +280,56 @@ func TestGlyphFailureRecoversWithoutRetirement(t *testing.T) {
 		t.Fatalf("the glyph failure retired the worker (workers=%d)", len(p.workers))
 	}
 }
+
+// TestFailedGlyphsFailLaterStillsOnTheSameMap pins why a recorded glyph
+// failure is kept until a still completes rather than dropped at the next
+// render: each still on the map re-requests the failed range, even with
+// the label out of view, so while the glyphs stay missing every later
+// still fails on them and the recorded name is the right one.
+func TestFailedGlyphsFailLaterStillsOnTheSameMap(t *testing.T) {
+	dir := t.TempDir()
+	style := filepath.Join(dir, "style.json")
+	body := `{"version":8,"glyphs":"file://` + dir + `/fonts/{fontstack}/{range}.pbf",
+	  "sources":{"pt":{"type":"geojson","data":{"type":"Point","coordinates":[-0.12,51.5]}}},
+	  "layers":[
+	    {"id":"bg","type":"background","paint":{"background-color":"#ff8800"}},
+	    {"id":"sym","type":"symbol","source":"pt","layout":{"text-field":"London","text-font":["Gone Sans"]}}
+	  ]}`
+	if err := os.WriteFile(style, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := newGoStylePool(goStylePoolConfig{
+		device:            newTestDevice(t),
+		ambientCacheBytes: -1,
+		styleID:           "gone-glyphs",
+		scaleLabel:        "1",
+		poolSize:          1,
+		minPoolSize:       1,
+		ratio:             1,
+		styleURL:          "file://" + style,
+		startupTimeout:    30 * time.Second,
+		renderTimeout:     10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.close)
+	render := func(vp ViewportRequest) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err := p.dispatch(ctx, vp, 1, nil)
+		return err
+	}
+
+	london := ViewportRequest{StyleID: "gone-glyphs", Latitude: 51.5, Longitude: -0.12, Zoom: 10, Width: 128, Height: 128, Scale: 1}
+	if err := render(london); err == nil || !strings.Contains(err.Error(), "glyphs Gone Sans") {
+		t.Fatalf("label render: err=%v, want a failure naming glyphs Gone Sans", err)
+	}
+	// Far from the label: the still fails on the retried range itself,
+	// and its own native error says so.
+	elsewhere := ViewportRequest{StyleID: "gone-glyphs", Latitude: 55.9, Longitude: -3.2, Zoom: 12, Width: 128, Height: 128, Scale: 1}
+	err = render(elsewhere)
+	if err == nil || !strings.Contains(err.Error(), "glyphs Gone Sans") || !strings.Contains(err.Error(), "Gone Sans/0-255.pbf") {
+		t.Fatalf("render away from the label: err=%v, want the retried glyph range to fail it", err)
+	}
+}

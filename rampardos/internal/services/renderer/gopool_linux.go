@@ -980,7 +980,8 @@ type goWorker struct {
 	curH uint32
 
 	// poisoned is set when an abandoned still-image request could not be
-	// settled. The map refuses a second still while one is pending, so the pool retires
+	// settled, or the render session failed (see sessionFailed). The map
+	// refuses a second still while one is pending, so the pool retires
 	// the worker rather than dispatching to a map that may never start
 	// or finish another render.
 	poisoned bool
@@ -1038,6 +1039,9 @@ func (w *goWorker) loop() {
 				services.GlobalMetrics.RecordRendererWorkerRender(w.pool.cfg.styleID, w.pool.cfg.scaleLabel, time.Since(start).Seconds(), !w.rendered)
 			}
 			w.rendered = true
+			if err != nil && !w.poisoned && w.sessionFailed() {
+				w.poisoned = true
+			}
 			if w.poisoned {
 				w.heldSlot = cmd.render.release
 			} else if cmd.render.release != nil {
@@ -1470,12 +1474,29 @@ func (w *goWorker) drainFrames(start time.Time) (int, error) {
 		case maplibre.RenderResultTargetNotReady:
 			return len(results), fmt.Errorf("renderer: still image: render target not ready")
 		case maplibre.RenderResultFailed:
-			// The session failed; no still on it will render.
+			// The session failed for good; no still on it will render.
+			w.poisoned = true
 			reason, _ := w.sess.GetFailure()
 			return len(results), fmt.Errorf("renderer: still image: render session failed: %s", reason)
 		}
 	}
 	return len(results), nil
+}
+
+// sessionFailed reports whether the worker's render session has failed.
+// A failed session renders nothing again (only a new session would), so
+// a render that failed on it must retire the worker, or the worker would
+// fail every render the pool hands it. The still can report the failure
+// before any Failed frame result is drained, so a failed render asks.
+func (w *goWorker) sessionFailed() bool {
+	snap, err := w.sess.Snapshot()
+	if err != nil || snap.FailureStatus == maplibre.StatusOk {
+		return false
+	}
+	reason, _ := w.sess.GetFailure()
+	slog.Warn("renderer worker retired: render session failed",
+		"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "status", snap.FailureStatus, "reason", reason)
+	return true
 }
 
 func (w *goWorker) countFrameResult(res maplibre.RenderFrameResult) {

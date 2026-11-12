@@ -70,7 +70,7 @@ run: build
 
 ## test: Run Go tests (no Node/maplibre required)
 test:
-	cd $(GO_DIR) && $(GOTEST) ./...
+	cd $(GO_DIR) && $(GOTEST) -tags mln_pkgconfig ./...
 
 ## test-integration: Run integration tests (needs the FFI and Mesa; see fetch-ffi, or scripts/rtest.sh for Docker)
 test-integration:
@@ -79,7 +79,7 @@ test-integration:
 
 ## test-coverage: Run tests with coverage report
 test-coverage:
-	cd $(GO_DIR) && $(GOTEST) -coverprofile=coverage.out ./...
+	cd $(GO_DIR) && $(GOTEST) -tags mln_pkgconfig -coverprofile=coverage.out ./...
 	cd $(GO_DIR) && $(GOCMD) tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: $(GO_DIR)/coverage.html"
 

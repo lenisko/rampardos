@@ -54,6 +54,6 @@ cat <<MSG
  Or directly:
    cd rampardos
    PKG_CONFIG_PATH=$MLN_FFI_DIR_HOST/install/share/pkgconfig \\
-   CGO_ENABLED=1 go build -tags nodynamic ./cmd/server
+   CGO_ENABLED=1 go build -tags nodynamic,mln_pkgconfig ./cmd/server
 ================================================================
 MSG
