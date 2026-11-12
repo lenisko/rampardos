@@ -11,13 +11,13 @@ import (
 	"time"
 )
 
-// TestStyleFailureFailsStillFast guards the decision to take load
-// failures from the still's own Future rather than from runtime events:
-// a style that fails to load must fail every render promptly (not by
-// the render timeout). A reload builds new pools, so a pool's first
-// style is the only one it ever loads. A failed still leaves the map
-// with nothing pending, so it must not retire the worker either.
-func TestStyleFailureFailsStillFast(t *testing.T) {
+// TestBadStyleFailsFast pins where a bad style fails: its style command
+// fails once the style document is loaded and parsed, so the worker never
+// starts and the pool build reports it at once. The map used to accept
+// the style and fail only the still pending at the time, which took a
+// state machine of style failures and generations to keep every later
+// render from hanging to the timeout.
+func TestBadStyleFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.json")
 	bad := filepath.Join(dir, "bad.json")
@@ -28,13 +28,12 @@ func TestStyleFailureFailsStillFast(t *testing.T) {
 		}
 	}
 	write(good, `{"version":8,"sources":{},"layers":[{"id":"bg","type":"background","paint":{"background-color":"#ff8800"}}]}`)
-	// A truncated file: mbgl fails it at parse. A path with no file
-	// fails it at load.
+	// A truncated file fails at parse; a path with no file fails at load.
 	write(bad, `{"version":8,"sources":{},"layers":[`)
 	missing := filepath.Join(dir, "missing.json")
 
-	const renderTimeout = 10 * time.Second
-	newPool := func(styleFile string) *goStylePool {
+	const startupTimeout = 30 * time.Second
+	newPool := func(styleFile string) (*goStylePool, error) {
 		t.Helper()
 		p, err := newGoStylePool(goStylePoolConfig{
 			device:            newTestDevice(t),
@@ -45,64 +44,88 @@ func TestStyleFailureFailsStillFast(t *testing.T) {
 			minPoolSize:       1,
 			ratio:             1,
 			styleURL:          "file://" + styleFile,
-			startupTimeout:    30 * time.Second,
-			renderTimeout:     renderTimeout,
+			startupTimeout:    startupTimeout,
+			renderTimeout:     10 * time.Second,
 		})
-		if err != nil {
-			t.Fatal(err)
+		if err == nil {
+			t.Cleanup(p.close)
 		}
-		t.Cleanup(p.close)
-		return p
+		return p, err
 	}
-	vp := ViewportRequest{StyleID: "fail", Latitude: 51.5, Longitude: -0.12, Zoom: 3, Width: 64, Height: 64, Scale: 1}
-	render := func(p *goStylePool, wantErr bool, what string) {
-		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*renderTimeout)
-		defer cancel()
-		start := time.Now()
-		img, err := p.dispatch(ctx, vp, 1, nil)
-		took := time.Since(start)
-		switch {
-		case wantErr && err == nil:
-			t.Fatalf("%s: render succeeded, want a failure", what)
-		case !wantErr && err != nil:
-			t.Fatalf("%s: render failed: %v", what, err)
-		case !wantErr && img == nil:
-			t.Fatalf("%s: no image", what)
-		}
-		// Well under the render timeout: the failure came from the
-		// still, not from the await giving up.
-		if took > renderTimeout/4 {
-			t.Fatalf("%s: took %s, want a prompt result (err=%v)", what, took, err)
-		}
-		t.Logf("%s: %s err=%v", what, took, err)
-	}
-	sameWorker := func(p *goStylePool, want *goWorker) {
-		t.Helper()
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if len(p.workers) != 1 || p.workers[0] != want {
-			t.Fatalf("worker retired by a style failure (workers=%d)", len(p.workers))
-		}
-	}
+
 	for _, tc := range []struct{ name, file string }{
 		{"broken", bad},
 		{"missing", missing},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := newPool(tc.file)
-			w := p.workers[0]
-			render(p, true, tc.name+" style")
-			render(p, true, tc.name+" style, second render")
-			sameWorker(p, w)
+			start := time.Now()
+			p, err := newPool(tc.file)
+			took := time.Since(start)
+			if err == nil {
+				p.close()
+				t.Fatal("pool built on a bad style")
+			}
+			if !strings.Contains(err.Error(), `"fail"`) {
+				t.Errorf("error does not name the style: %v", err)
+			}
+			if took > 3*time.Second {
+				t.Errorf("bad style took %s to fail, want well under the startup timeout", took)
+			}
+			t.Logf("%s: %s err=%v", tc.name, took, err)
 		})
 	}
 
 	t.Run("good", func(t *testing.T) {
-		p := newPool(good)
-		render(p, false, "good style")
-		render(p, false, "good style, second render")
+		p, err := newPool(good)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vp := ViewportRequest{StyleID: "fail", Latitude: 51.5, Longitude: -0.12, Zoom: 3, Width: 64, Height: 64, Scale: 1}
+		for i := range 2 {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			img, err := p.dispatch(ctx, vp, 1, nil)
+			cancel()
+			if err != nil || img == nil {
+				t.Fatalf("render %d: img=%v err=%v", i, img != nil, err)
+			}
+		}
 	})
+}
+
+// TestReloadWithBrokenStyleKeepsServing: a style edited into a broken
+// state now fails the rebuild's worker start, and a failed rebuild must
+// leave the previous pool installed and serving.
+func TestReloadWithBrokenStyleKeepsServing(t *testing.T) {
+	cfg := setupIntegrationFixtures(t)
+	ri, err := NewGoPoolRenderer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ri.Close()
+	r := ri.(*GoPoolRenderer)
+
+	runRenderAssertions(t, r)
+	before, err := r.getOrCreatePool("bg", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stylePath := filepath.Join(cfg.StylesDir, "bg", "style.json")
+	if err := os.WriteFile(stylePath, []byte(`{"version":8,"sources":{},"layers":[`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReloadStyles(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := r.getOrCreatePool("bg", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatal("a failed rebuild replaced the serving pool")
+	}
+	runRenderAssertions(t, r)
 }
 
 // TestMissingResourcesReport pins how glyph and sprite load failures

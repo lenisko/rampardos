@@ -957,7 +957,7 @@ type goWorker struct {
 
 	// wake is fed by the session's FrameWake callback, which native
 	// invokes (from any thread, calls may coalesce) whenever a frame result
-	// becomes drainable, and by the event handler on a style failure.
+	// becomes drainable.
 	// Buffered-1 + non-blocking send turns bursts into one pending token.
 	wake chan struct{}
 
@@ -966,14 +966,6 @@ type goWorker struct {
 	// the await consumes it.
 	mapErr chan error
 
-	// styleFailed is the latest style load failure the event handler
-	// saw. It is state, not a signal: mbgl fails only the still pending
-	// when a style fails to load, and a still requested afterwards waits
-	// for a style that never loads, so every render must refuse while it
-	// stands. It belongs to the current style only when reported after
-	// that style's command committed (generation > styleGen); a new style
-	// command clears it by moving styleGen past it.
-	styleFailed atomic.Pointer[styleFailure]
 	// resourceFailed is the latest glyph or sprite load failure. Such a
 	// failure fails the pending still with a bare native error, so the
 	// await adds this to say which resource. It is style state: a failed
@@ -988,10 +980,9 @@ type goWorker struct {
 	// retires after the render it failed, and its replacement's fresh map
 	// fails fast again.
 	resourceFailed atomic.Pointer[resourceFailure]
-	// styleGen is the map generation at which the current style command
-	// committed, and styleURL the URL it set. Worker goroutine only.
+	// styleGen is the map generation at which the style command
+	// completed. Worker goroutine only.
 	styleGen uint64
-	styleURL string
 
 	curW uint32
 	curH uint32
@@ -1085,8 +1076,8 @@ func (w *goWorker) init() error {
 
 	// Events are dropped until a handler is set, so it is set before the
 	// map exists. The handler runs on the runtime's native thread and
-	// must not block: it only records style failures and forwards
-	// render errors.
+	// must not block: it only forwards render errors and records glyph
+	// and sprite failures.
 	f, err := w.rt.SetEventHandler(maplibre.RuntimeEventHandler{Callback: w.handleEvents})
 	if err != nil {
 		return fmt.Errorf("renderer: set event handler: %w", err)
@@ -1117,13 +1108,12 @@ func (w *goWorker) init() error {
 
 	// MapModeStatic is the render-once mode; the executor disables the
 	// animation tick and aligns with our request/reply pattern. The event
-	// mask carries the two failures no still reports by itself: a style
-	// that fails to load fails only the still pending at that moment (see
-	// styleFailed), and a render error ends no still. Glyph and sprite
-	// failures do fail the still, but with no reason; their events name
-	// the resource (see resourceFailed).
+	// mask carries a render error, which ends no still, and glyph and
+	// sprite failures, which fail the still with no reason; their events
+	// name the resource (see resourceFailed). A style failure needs no
+	// event: the style command itself fails (see setStyle).
 	w.curW, w.curH = 256, 256
-	events := maplibre.RuntimeEventFlagMapLoadingFailed | maplibre.RuntimeEventFlagMapRenderError |
+	events := maplibre.RuntimeEventFlagMapRenderError |
 		maplibre.RuntimeEventFlagMapGlyphsError | maplibre.RuntimeEventFlagMapSpriteError
 	m, ready, err := w.rt.CreateMap(maplibre.MapOptions{
 		InitialExtent: maplibre.LogicalExtent{
@@ -1178,33 +1168,16 @@ func (w *goWorker) init() error {
 		return fmt.Errorf("renderer: attached session does not grant readback; cannot render stills")
 	}
 
-	// Style loading proceeds on the native executor; a failure reaches
-	// renders through styleFailed. Worker reports ready once the map
-	// adopts the URL.
+	// A worker's style is set once: a reload builds new pools rather than
+	// restyling a map. A style that fails to load fails here, so a worker
+	// on a bad style never starts and the pool build reports it.
 	return w.setStyle(startupCtx, w.pool.cfg.styleURL)
 }
 
-// styleFailure is a style load failure and the map generation that
-// reported it.
-type styleFailure struct {
-	generation uint64
-	message    string
-}
-
-// styleErr reports whether the current style failed to load.
-func (w *goWorker) styleErr() error {
-	if f := w.styleFailed.Load(); f != nil && f.generation > w.styleGen {
-		return fmt.Errorf("renderer: style failed to load: %s", f.message)
-	}
-	return nil
-}
-
-// setStyle submits a style URL and waits for the command to commit (a
-// command that fails or is cancelled returns an error from Await). It
-// commits once the map adopts the URL, before the style loads, so the
-// wait is brief; a command that did not apply would otherwise leave the
-// worker on its old style with nothing reported. Recording the commit
-// generation retires any failure of the previous style.
+// setStyle submits a style URL and waits for its command, which
+// completes once the style document has loaded and parsed, and fails on
+// a parse error or a missing file. Sprites, glyphs and tiles load later,
+// for the first still.
 func (w *goWorker) setStyle(ctx context.Context, url string) error {
 	f, err := w.m.SetStyleURL(url)
 	if err != nil {
@@ -1215,7 +1188,6 @@ func (w *goWorker) setStyle(ctx context.Context, url string) error {
 		return fmt.Errorf("renderer: set style url: %w", err)
 	}
 	w.styleGen = cc.Generation
-	w.styleURL = url
 	if serviceTrace {
 		fmt.Fprintf(os.Stderr, "TRACE style committed gen=%d\n", cc.Generation)
 	}
@@ -1266,11 +1238,6 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 	if vp.Width <= 0 || vp.Height <= 0 {
 		return nil, fmt.Errorf("renderer: invalid dimensions %dx%d", vp.Width, vp.Height)
 	}
-	// A still on a style that failed to load would never complete.
-	if err := w.styleErr(); err != nil {
-		return nil, err
-	}
-
 	wantW := uint32(vp.Width)
 	wantH := uint32(vp.Height)
 	var resize *maplibre.Future[maplibre.CommandCompletion]
@@ -1382,14 +1349,8 @@ func (w *goWorker) awaitCommitted(ctx context.Context, f *maplibre.Future[maplib
 // There is no cancel for a pending still and the map refuses a second
 // one, but the request submits its own frame demands, so it settles by
 // itself once the map has loaded what it shows.
-//
-// A still on a failed style is the exception. mbgl fails the still
-// pending when a style load fails, but the failure event can reach us
-// after renderOne checked for it and before the request ran, leaving a
-// still that waits for a style that never loads. Loading the style
-// again fails it the same way, which fails that still. A worker whose
-// still does not settle within the budget is poisoned and retired by the
-// pool.
+// A worker whose still does not settle within the budget is poisoned
+// and retired by the pool.
 func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 	select {
 	case <-still.Done():
@@ -1400,25 +1361,12 @@ func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), w.pool.cfg.settleTimeout)
 	defer cancel()
-	reloaded := false
-	for {
-		if !reloaded && w.styleErr() != nil {
-			reloaded = true
-			if err := w.setStyle(ctx, w.styleURL); err != nil {
-				slog.Warn("renderer: reloading a failed style to settle a still failed",
-					"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "error", err)
-			}
-		}
-		select {
-		case <-still.Done():
-			return
-		case <-w.wake: // a frame result or a style failure; recheck
-		case <-ctx.Done():
-			w.poisoned = true
-			slog.Warn("renderer worker retired: abandoned still-image request did not settle",
-				"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout, "styleError", w.styleErr())
-			return
-		}
+	select {
+	case <-still.Done():
+	case <-ctx.Done():
+		w.poisoned = true
+		slog.Warn("renderer worker retired: abandoned still-image request did not settle",
+			"style", w.pool.cfg.styleID, "scale", w.pool.cfg.scaleLabel, "timeout", w.pool.cfg.settleTimeout)
 	}
 }
 
@@ -1427,20 +1375,13 @@ func (w *goWorker) settleAbandonedStill(still *maplibre.Future[struct{}]) {
 var serviceTrace = os.Getenv("RENDERER_SERVICE_TRACE") != ""
 
 // handleEvents is the runtime event handler. It runs on the runtime's
-// native thread, so it never blocks. A style failure is recorded, then
-// the wake is nudged so a parked await sees it. A render error is a
+// native thread, so it never blocks. A render error is a
 // non-blocking send: one already pending is kept and later ones are
 // dropped, since the await fails on the first. The events are the
 // binding's copy.
 func (w *goWorker) handleEvents(events []maplibre.RuntimeEvent) {
 	for _, ev := range events {
 		switch ev.Type {
-		case maplibre.RuntimeEventTypeMapLoadingFailed:
-			w.styleFailed.Store(&styleFailure{generation: ev.Generation, message: ev.Message})
-			select {
-			case w.wake <- struct{}{}:
-			default:
-			}
 		case maplibre.RuntimeEventTypeMapRenderError:
 			select {
 			case w.mapErr <- fmt.Errorf("renderer: map render error: %s", ev.Message):
@@ -1602,11 +1543,6 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 	case <-w.mapErr:
 	default:
 	}
-	// The flushed wake may have carried a style failure that landed after
-	// renderOne checked; nothing would wake the loop for it again.
-	if err := w.styleErr(); err != nil {
-		return err
-	}
 	// A glyph failure whose event trailed the render it failed: this map
 	// will never finish a still that needs the range.
 	if r := w.resourceErr(); r != nil && r.glyphs {
@@ -1637,17 +1573,6 @@ func (w *goWorker) awaitStill(ctx context.Context, still *maplibre.Future[struct
 			frames += n
 			if err != nil {
 				return err
-			}
-			// A style that failed after this still was requested leaves it
-			// pending for good: mbgl failed only a still already pending.
-			// A still it did fail is done; let that case report it.
-			if err := w.styleErr(); err != nil {
-				select {
-				case <-still.Done():
-					continue
-				default:
-					return err
-				}
 			}
 		case err := <-w.mapErr:
 			return err
