@@ -28,10 +28,10 @@ import (
 
 	"github.com/lenisko/rampardos/internal/fileutil"
 	"github.com/lenisko/rampardos/internal/services"
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sync/singleflight"
+	"maplibre.org/maplibre-native-ffi/bindings/go/maplibre"
 )
 
 // Ensure GoPoolRenderer satisfies the Renderer interface.
@@ -54,6 +54,10 @@ type GoPoolRenderer struct {
 	// of a native MBTilesFileSource per worker runtime. Nil when
 	// RENDERER_TILE_PROVIDER=off (falls back to mbtiles:// sources).
 	store *TileStore
+
+	// device is the offscreen graphics device every worker's session
+	// renders on. It outlives every pool: released by Close only.
+	device *maplibre.OffscreenDeviceHandle
 
 	// ambientCacheBytes is each worker runtime's mbgl ambient cache
 	// budget; negative leaves mbgl's default.
@@ -109,8 +113,8 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	}
 
 	// Catch a wrong-variant FFI at process start, not at first render.
-	if !maplibre.SupportedRenderBackendMask().Has(maplibre.RenderBackendFlagOpenGl) {
-		return nil, fmt.Errorf("renderer: linked FFI does not advertise OpenGL backend; check Dockerfile MISE_ENV variant (expected linux-<arch>-egl)")
+	if !maplibre.SupportedRenderBackendMask().Has(maplibre.RenderBackendFlagOpenGL) {
+		return nil, fmt.Errorf("renderer: linked FFI does not advertise OpenGL backend; expected the linux-gnu-<arch>-egl preset (see native_linux.go)")
 	}
 
 	if _, err := cfg.DiscoverStyles(); err != nil {
@@ -155,7 +159,21 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 		ambientCacheBytes = int64(v) << 20
 	}
 
+	// One offscreen device serves every worker: the library creates its
+	// EGL display (surfaceless Mesa first) and gives each session its own
+	// context. Desktop GL rather than the EGL default of GLES, which was
+	// slower under llvmpipe.
+	gl := maplibre.OpenGLClientAPIGL
+	device, err := maplibre.NewOffscreenDevice(&maplibre.OffscreenDeviceOptions{ClientAPI: &gl})
+	if err != nil {
+		if store != nil {
+			store.Close()
+		}
+		return nil, fmt.Errorf("renderer: offscreen device: %w", err)
+	}
+
 	r := &GoPoolRenderer{
+		device:            device,
 		cfg:               cfg,
 		sem:               semaphore.NewWeighted(int64(cfg.PoolSize)),
 		store:             store,
@@ -297,6 +315,7 @@ func (r *GoPoolRenderer) loadPool(rcfg Config, gen uint64, id string, ratio int)
 
 	cfg := goStylePoolConfig{
 		store:             r.store,
+		device:            r.device,
 		ambientCacheBytes: r.ambientCacheBytes,
 		styleID:           id,
 		scaleLabel:        strconv.Itoa(ratio),
@@ -512,6 +531,11 @@ func (r *GoPoolRenderer) Close() error {
 	for _, pool := range pools {
 		pool.close()
 	}
+	// Sessions keep working until they detach, so the device may go even
+	// if a worker is still tearing down.
+	if err := r.device.Release(); err != nil {
+		slog.Warn("renderer: release offscreen device", "error", err)
+	}
 	if r.store != nil {
 		r.store.Close()
 	}
@@ -521,7 +545,8 @@ func (r *GoPoolRenderer) Close() error {
 // goStylePoolConfig captures the per-pool parameters. Pool members are
 // scale-segregated; ratio is therefore baked in at pool construction.
 type goStylePoolConfig struct {
-	store *TileStore // shared tile provider; nil = native mbtiles path
+	store  *TileStore                      // shared tile provider; nil = native mbtiles path
+	device *maplibre.OffscreenDeviceHandle // renderer-wide; sessions attach to it
 	// ambientCacheBytes is the runtime's mbgl ambient cache budget;
 	// negative leaves mbgl's default.
 	ambientCacheBytes int64
@@ -540,7 +565,7 @@ type goStylePoolConfig struct {
 
 // goStylePool owns N worker goroutines (one per pool slot). Each worker
 // is OS-thread-pinned and holds its own RuntimeHandle + MapHandle +
-// RenderSessionHandle for its lifetime; the eglDisplay is process-wide.
+// RenderSessionHandle for its lifetime; the offscreen device is renderer-wide.
 type goStylePool struct {
 	cfg goStylePoolConfig
 
@@ -929,7 +954,6 @@ type goWorker struct {
 	rt   *maplibre.RuntimeHandle
 	m    *maplibre.MapHandle
 	sess *maplibre.RenderSessionHandle
-	egl  *eglDisplay
 
 	// wake is fed by the session's FrameWake callback, which native
 	// invokes (from any thread, calls may coalesce) whenever a frame result
@@ -969,9 +993,8 @@ type goWorker struct {
 	styleGen uint64
 	styleURL string
 
-	curW     uint32
-	curH     uint32
-	curScale float64
+	curW uint32
+	curH uint32
 
 	// poisoned is set when an abandoned still-image request could not be
 	// settled, or a glyph range failed (see resourceFailed). The map
@@ -1049,15 +1072,10 @@ func (w *goWorker) loop() {
 
 func (w *goWorker) init() error {
 	var err error
-	w.egl, err = newEGLDisplay()
-	if err != nil {
-		return err
-	}
-
 	w.wake = make(chan struct{}, 1)
 	w.mapErr = make(chan error, 1)
 
-	w.rt, err = maplibre.NewRuntime(maplibre.RuntimeOptions{})
+	w.rt, err = maplibre.NewRuntime(nil)
 	if err != nil {
 		return fmt.Errorf("renderer: new runtime: %w", err)
 	}
@@ -1104,14 +1122,14 @@ func (w *goWorker) init() error {
 	// styleFailed), and a render error ends no still. Glyph and sprite
 	// failures do fail the still, but with no reason; their events name
 	// the resource (see resourceFailed).
-	w.curW, w.curH, w.curScale = 256, 256, float64(w.pool.cfg.ratio)
+	w.curW, w.curH = 256, 256
 	events := maplibre.RuntimeEventFlagMapLoadingFailed | maplibre.RuntimeEventFlagMapRenderError |
 		maplibre.RuntimeEventFlagMapGlyphsError | maplibre.RuntimeEventFlagMapSpriteError
 	m, ready, err := w.rt.CreateMap(maplibre.MapOptions{
 		InitialExtent: maplibre.LogicalExtent{
 			Width:       w.curW,
 			Height:      w.curH,
-			ScaleFactor: w.curScale,
+			ScaleFactor: float64(w.pool.cfg.ratio),
 		},
 		MapMode:   maplibre.MapModeStatic,
 		EventMask: &events,
@@ -1124,34 +1142,28 @@ func (w *goWorker) init() error {
 		return fmt.Errorf("renderer: new map: %w", err)
 	}
 
-	// Core-worker driver with a dedicated (private) EGL context: the
-	// native session worker creates and owns the context from our
-	// display+config and needs no host graphics service. The FrameWake
-	// callback only schedules (non-blocking channel send) per the wake
-	// contract; the await drains the frame queue itself. A private target
-	// grants one texture slot whatever the ring depth asks for.
+	// Offscreen session on the renderer's device, driven by the core
+	// worker: the session gets its own context from the device and needs
+	// no host graphics service. It renders at the map's scale factor,
+	// fixed for the pool. The FrameWake callback only schedules
+	// (non-blocking channel send) per the wake contract; the await drains
+	// the frame queue itself.
 	wakeCallback := func() {
 		select {
 		case w.wake <- struct{}{}:
 		default:
 		}
 	}
-	sess, attached, err := w.m.AttachOpenGlOwnedTexture(
-		maplibre.OpenGlOwnedTextureDescriptor{
-			Extent: maplibre.LogicalExtent{
-				Width:       w.curW,
-				Height:      w.curH,
-				ScaleFactor: w.curScale,
-			},
-			Context: w.egl.descriptor(),
-		},
+	sess, attached, err := w.m.AttachOffscreen(
+		maplibre.OffscreenDescriptor{LogicalSize: maplibre.LogicalSize{Width: w.curW, Height: w.curH}},
 		maplibre.RenderSessionAttachOptions{
 			Driver:    maplibre.RenderDriverKindCoreWorker,
 			FrameWake: maplibre.Wake{Callback: wakeCallback},
 		},
+		w.pool.cfg.device,
 	)
 	if err != nil {
-		return fmt.Errorf("renderer: attach OpenGL owned texture render target: %w", err)
+		return fmt.Errorf("renderer: attach offscreen render target: %w", err)
 	}
 	w.sess = sess
 	if _, err := attached.Await(startupCtx); err != nil {
@@ -1194,7 +1206,7 @@ func (w *goWorker) styleErr() error {
 // worker on its old style with nothing reported. Recording the commit
 // generation retires any failure of the previous style.
 func (w *goWorker) setStyle(ctx context.Context, url string) error {
-	f, err := w.m.SetStyleUrl(url)
+	f, err := w.m.SetStyleURL(url)
 	if err != nil {
 		return fmt.Errorf("renderer: set style url: %w", err)
 	}
@@ -1213,33 +1225,35 @@ func (w *goWorker) setStyle(ctx context.Context, url string) error {
 func (w *goWorker) cleanup() {
 	settleCtx, cancel := context.WithTimeout(context.Background(), w.pool.cfg.settleTimeout)
 	defer cancel()
-	if w.sess != nil {
-		// Detach completes on the core worker; Abandon is the
-		// no-graphics-work fallback that quarantines resources instead.
-		detached := false
-		if f, err := w.sess.Detach(); err == nil {
-			if _, err := f.Await(settleCtx); err == nil {
-				detached = true
+	// Release waits, and needs what it owns released first: the session
+	// (which detaches itself), then the map, then the runtime. Once one
+	// fails or overruns the settle budget, it and everything after it are
+	// disposed instead, which works in any state and finishes in the
+	// background. The device is renderer-wide and outlives the worker.
+	released := true
+	release := func(h interface {
+		Release() (*maplibre.Future[struct{}], error)
+		Dispose() error
+	}) {
+		if released {
+			if f, err := h.Release(); err == nil {
+				if _, err := f.Await(settleCtx); err == nil {
+					return
+				}
 			}
+			released = false
 		}
-		if !detached {
-			_, _ = w.sess.Abandon()
-		}
-		if f, err := w.sess.Close(); err == nil {
-			_, _ = f.Await(settleCtx)
-		}
+		_ = h.Dispose()
+	}
+	if w.sess != nil {
+		release(w.sess)
 	}
 	if w.m != nil {
-		if f, err := w.m.Close(); err == nil {
-			_, _ = f.Await(settleCtx)
-		}
+		release(w.m)
 	}
 	if w.rt != nil {
-		if f, err := w.rt.Close(); err == nil {
-			_, _ = f.Await(settleCtx)
-		}
+		release(w.rt)
 	}
-	// w.egl is the process-wide display; it outlives every worker.
 	releaseNativeMemory()
 	if w.heldSlot != nil {
 		w.heldSlot()
@@ -1259,19 +1273,14 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 
 	wantW := uint32(vp.Width)
 	wantH := uint32(vp.Height)
-	wantScale := float64(scale)
 	var resize *maplibre.Future[maplibre.CommandCompletion]
-	if wantW != w.curW || wantH != w.curH || wantScale != w.curScale {
+	if wantW != w.curW || wantH != w.curH {
 		// Resize applies the extent and updates the map viewport. On a
 		// static map the driver applies it without waiting for a map
 		// update, and the next still renders at the new extent; session
 		// operations are ordered ahead of the still's frames, so it is
 		// started here and its completion checked after the still.
-		f, err := w.sess.Resize(maplibre.LogicalExtent{
-			Width:       wantW,
-			Height:      wantH,
-			ScaleFactor: wantScale,
-		})
+		f, err := w.sess.Resize(maplibre.LogicalSize{Width: wantW, Height: wantH})
 		if err != nil {
 			return nil, fmt.Errorf("renderer: resize: %w", err)
 		}
@@ -1280,7 +1289,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		// track the extent from here. Leaving the old one recorded when a
 		// render fails would let the next request at the old size skip its
 		// resize and read back a frame at the size the session now has.
-		w.curW, w.curH, w.curScale = wantW, wantH, wantScale
+		w.curW, w.curH = wantW, wantH
 	}
 
 	zoom, bearing, pitch := vp.Zoom, vp.Bearing, vp.Pitch
@@ -1474,9 +1483,9 @@ func (w *goWorker) reportResourceError(ev maplibre.RuntimeEvent) {
 		kind = "glyphs"
 		detail = fmt.Sprintf("%s %d-%d", strings.Join(p.Value.FontStack, ","), p.Value.First, p.Value.Last)
 	case maplibre.RuntimeEventPayloadSpriteVariant:
-		detail = p.Value.Url
+		detail = p.Value.URL
 		if detail == "" {
-			detail = p.Value.Id
+			detail = p.Value.ID
 		}
 	default:
 		if ev.Type == maplibre.RuntimeEventTypeMapGlyphsError {
@@ -1536,8 +1545,13 @@ func (w *goWorker) drainFrames(start time.Time) (int, error) {
 			fmt.Fprintf(os.Stderr, "TRACE +%6dus frame disp=%d update=%d\n", time.Since(start).Microseconds(), res.Disposition, res.MapUpdateGeneration)
 		}
 		w.countFrameResult(res)
-		if res.Disposition == maplibre.RenderResultTargetNotReady {
+		switch res.Disposition {
+		case maplibre.RenderResultTargetNotReady:
 			return len(results), fmt.Errorf("renderer: still image: render target not ready")
+		case maplibre.RenderResultFailed:
+			// The session failed; no still on it will render.
+			reason, _ := w.sess.GetFailure()
+			return len(results), fmt.Errorf("renderer: still image: render session failed: %s", reason)
 		}
 	}
 	return len(results), nil
@@ -1655,6 +1669,8 @@ func dispositionLabel(d maplibre.RenderResult) string {
 		return "target_not_ready"
 	case maplibre.RenderResultSuperseded:
 		return "superseded"
+	case maplibre.RenderResultFailed:
+		return "failed"
 	default:
 		return "other"
 	}

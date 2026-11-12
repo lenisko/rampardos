@@ -15,7 +15,7 @@
 set -euo pipefail
 
 MLN_FFI_DIR_HOST="${MLN_FFI_DIR_HOST:-$HOME/dev/maplibre-native-ffi}"
-MLN_FFI_VERSION="${MLN_FFI_VERSION:-0.202610.3}"
+MLN_FFI_VERSION="${MLN_FFI_VERSION:-0.202611.0}"
 
 case "$(uname -s)-$(uname -m)" in
     Linux-aarch64|Linux-arm64) VARIANT=linux-gnu-arm64-egl ;;

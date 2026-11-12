@@ -100,7 +100,7 @@ build-go-renderer:
 	cd $(GO_DIR) && \
 	  PKG_CONFIG_PATH=$(MLN_FFI_DIR_HOST)/install/share/pkgconfig \
 	  CGO_ENABLED=1 \
-	  $(GOBUILD) -trimpath $(LDFLAGS) -tags nodynamic -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
+	  $(GOBUILD) -trimpath $(LDFLAGS) -tags nodynamic,mln_pkgconfig -o ../$(BUILD_DIR)/$(BINARY_NAME) ./cmd/server
 
 ## clean-ffi: Remove the host FFI build directory ($MLN_FFI_DIR_HOST)
 clean-ffi:

@@ -37,6 +37,7 @@ func TestStyleFailureFailsStillFast(t *testing.T) {
 	newPool := func(styleFile string) *goStylePool {
 		t.Helper()
 		p, err := newGoStylePool(goStylePoolConfig{
+			device:            newTestDevice(t),
 			ambientCacheBytes: -1,
 			styleID:           "fail",
 			scaleLabel:        "1",
@@ -131,6 +132,7 @@ func TestMissingResourcesReport(t *testing.T) {
 				t.Fatal(err)
 			}
 			p, err := newGoStylePool(goStylePoolConfig{
+				device:            newTestDevice(t),
 				ambientCacheBytes: -1,
 				styleID:           "missing-" + tc.kind,
 				scaleLabel:        "1",
@@ -207,6 +209,7 @@ func TestGlyphRetirementDoesNotStrandWaitingRenders(t *testing.T) {
 	}
 	const renderTimeout = 10 * time.Second
 	p, err := newGoStylePool(goStylePoolConfig{
+		device:            newTestDevice(t),
 		ambientCacheBytes: -1,
 		styleID:           "strand",
 		scaleLabel:        "1",

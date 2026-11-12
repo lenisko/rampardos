@@ -32,8 +32,8 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 	"github.com/lenisko/rampardos/internal/services"
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
 	_ "github.com/mattn/go-sqlite3"
+	"maplibre.org/maplibre-native-ffi/bindings/go/maplibre"
 )
 
 // tileURLPrefix is the custom scheme styleprep templates into prepared
@@ -388,7 +388,7 @@ func parseTileURL(u string) (z, x, y uint32, ok bool) {
 // any provider).
 func (s *TileStore) provider() maplibre.ResourceProvider {
 	return maplibre.ResourceProvider{
-		Routes:   []maplibre.ResourceRoute{{Flags: maplibre.UrlMatchFlagGlob, Url: tileURLPrefix + "**"}},
+		Routes:   []maplibre.ResourceRoute{{Flags: maplibre.URLMatchFlagGlob, URL: tileURLPrefix + "**"}},
 		Callback: s.Provide,
 	}
 }
@@ -396,9 +396,9 @@ func (s *TileStore) provider() maplibre.ResourceProvider {
 // Provide is the binding resource-provider callback. Answering a request
 // consumes its handle.
 func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.ResourceRequestHandle) {
-	u := req.RequestedUrl
+	u := req.RequestedURL
 	if !strings.HasPrefix(u, tileURLPrefix) {
-		u = req.ResolvedUrl
+		u = req.ResolvedURL
 	}
 	z, x, y, ok := parseTileURL(u)
 	if !ok {
@@ -407,9 +407,8 @@ func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.Resour
 		if services.GlobalMetrics != nil {
 			services.GlobalMetrics.RecordTileProviderRequest("passthrough", 0)
 		}
-		if err := h.PassThrough(); err != nil {
-			_ = h.Close()
-		}
+		// Answering ends the handle whatever it returns.
+		_ = h.PassThrough()
 		return
 	}
 
@@ -428,10 +427,11 @@ func (s *TileStore) Provide(req maplibre.ResourceRequestInfo, h *maplibre.Resour
 		expires := time.Now().Add(tileExpiry).UnixMilli()
 		response.ExpiresUnixMs = &expires
 	}
+	// Answering ends the handle whatever it returns; a refused answer
+	// fails the request.
 	if err := h.Complete(response); err != nil {
 		if services.GlobalMetrics != nil {
 			services.GlobalMetrics.RecordTileProviderRequest("error", 0)
 		}
-		_ = h.Close() // a refused answer leaves the handle ours to release
 	}
 }

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	maplibre "github.com/maplibre/maplibre-native-ffi/bindings/go/maplibre"
+	"maplibre.org/maplibre-native-ffi/bindings/go/maplibre"
 )
 
 // TestHandleEventsForwardsFirstRenderErrorOnly guards the runtime event

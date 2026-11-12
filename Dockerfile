@@ -3,7 +3,7 @@
 # maplibre-native-ffi release the native library is fetched from. The Go
 # binding pinned in go.mod must be the same release, and the
 # rampardos-build stage asserts that.
-ARG MLN_FFI_VERSION=0.202610.3
+ARG MLN_FFI_VERSION=0.202611.0
 
 # ================================
 # Get Git commit SHA
@@ -97,11 +97,20 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 # To bump: set MLN_FFI_VERSION, copy the two linux-gnu-*-egl sums from
 # the release's SHA256SUMS, and `go get` the matching binding tag (the
 # rampardos-build stage asserts it).
+#
+# The release also publishes the library as static archives in preset Go
+# modules, but Go rejects them: libmln_ffi_platform.a carries LLVM bitcode
+# (.llvmbc), and since 1.26.11/1.27.4 cmd/go refuses any cgo linker input
+# with an LTO section, with no override. The binding's mln_pkgconfig tag
+# links the release's library through pkg-config instead, which Go does
+# not inspect. Every go build, vet and test of the renderer needs the tag:
+# GOFLAGS below carries it, and a command that passes its own -tags
+# replaces GOFLAGS', so it must list mln_pkgconfig too.
 # ================================
 FROM alpine:3.20 AS mln-ffi-build
 ARG MLN_FFI_VERSION
-ARG MLN_FFI_SHA256_AMD64=8543931826fec23e3650913b7e7922ed678dd5ac866e08233e806f5e369a091f
-ARG MLN_FFI_SHA256_ARM64=2d5e2c88b9ee582e51234f3ad6a4ff05b74ca6c56cd01d111c1e68a2ba89ebb5
+ARG MLN_FFI_SHA256_AMD64=6de4757fc6b2af8ba1d03e7696831708c8128745bd4cf12aba9981412dfda032
+ARG MLN_FFI_SHA256_ARM64=32267eceaf5d781ded53057f5825855cc2fbf06ace231486852df38a91913d04
 ARG TARGETARCH
 RUN apk add --no-cache curl
 RUN set -eu; \
@@ -140,14 +149,13 @@ RUN set -eu; \
 # ================================
 FROM golang:1.26 AS rampardos-build
 ENV DEBIAN_FRONTEND=noninteractive
-# pkg-config is required by BOTH cgo consumers here: egl_linux.go declares
-# `#cgo linux pkg-config: egl` (from libegl1-mesa-dev), and the upstream Go
-# binding declares `#cgo pkg-config: maplibre-native-c` — the latter is why
-# PKG_CONFIG_PATH below points at the FFI's installed .pc. A cgo pkg-config
-# directive still runs even when CGO_CFLAGS/CGO_LDFLAGS are set, so the .pc
-# has to be findable; CGO_LDFLAGS only adds the runtime rpath on top.
+ENV GOFLAGS=-tags=mln_pkgconfig
+# pkg-config finds the FFI's installed .pc for the binding's
+# `#cgo pkg-config: maplibre-native-c` (mln_pkgconfig tag). A cgo pkg-config directive runs
+# even when CGO_LDFLAGS is set, so the .pc has to be findable;
+# CGO_LDFLAGS only adds the runtime rpath on top.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config libegl1-mesa-dev \
+ && apt-get install -y --no-install-recommends pkg-config \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=mln-ffi-build /ffi/install/ /ffi/install/
 WORKDIR /src
@@ -159,10 +167,10 @@ COPY rampardos/go.mod rampardos/go.sum ./
 # bumped together.
 RUN set -eu; \
     want="v$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' /ffi/install/share/maplibre-native-c/artifact.json)"; \
-    got="$(go list -m -f '{{.Version}}' github.com/maplibre/maplibre-native-ffi/bindings/go)"; \
+    got="$(go list -m -f '{{.Version}}' maplibre.org/maplibre-native-ffi)"; \
     if [ "$want" != "$got" ]; then \
       echo "binding/ABI mismatch: go.mod has $got, native library is $want" >&2; \
-      echo "run: cd rampardos && go get github.com/maplibre/maplibre-native-ffi/bindings/go@$want" >&2; \
+      echo "run: cd rampardos && go get maplibre.org/maplibre-native-ffi@$want" >&2; \
       exit 1; \
     fi; \
     echo "binding matches native library at $got"
@@ -172,7 +180,7 @@ RUN GIT_COMMIT=$(cat /git-commit.txt) && \
     PKG_CONFIG_PATH=/ffi/install/share/pkgconfig \
     CGO_LDFLAGS="-Wl,-rpath,/opt/rampardos/lib" \
     CGO_ENABLED=1 \
-    go build -trimpath -tags nodynamic \
+    go build -trimpath -tags nodynamic,mln_pkgconfig \
     -ldflags="-s -w -X github.com/lenisko/rampardos/internal/version.gitCommitFromLdflags=${GIT_COMMIT}" \
     -o /out/rampardos ./cmd/server
 
@@ -211,8 +219,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates \
     # maplibre-native (Go binding via FFI) runtime deps — Mesa EGL with
-    # the llvmpipe software DRI driver for fully headless render. EGL
-    # surfaceless platform is selected via EGL_PLATFORM=surfaceless below.
+    # the llvmpipe software DRI driver for fully headless render.
     # libgles2 provides libGLESv2.so.2: upstream's EGL build links it
     # directly (DT_NEEDED on libmaplibre-native-c.so), where the previous
     # fork build did not — without it the binary fails at load with
@@ -266,11 +273,9 @@ RUN mkdir -p Cache/Tile Cache/Static Cache/StaticMulti Cache/Marker Cache/Regene
 # Software rasterisation via Mesa llvmpipe — there is no GPU on the host.
 ENV LIBGL_ALWAYS_SOFTWARE=1
 ENV MESA_GL_VERSION_OVERRIDE=3.3
-# EGL surfaceless platform selects Mesa's headless EGL implementation, so
-# egl_linux.go creates its context with no display server at all. This is
-# why the image no longer needs Xvfb or DISPLAY: those existed only for
-# the Node binding, which required an X display for its GL context.
-ENV EGL_PLATFORM=surfaceless
+# No display server: the library's offscreen device opens Mesa's
+# surfaceless EGL platform itself, so neither Xvfb, DISPLAY nor
+# EGL_PLATFORM is needed.
 # Every renderer thread (mbgl's, llvmpipe's, ~100 in all) allocates
 # through glibc malloc. Two arenas held RSS flat under worker churn but
 # made renders contend on malloc even one at a time: p50 ~11% and p99
