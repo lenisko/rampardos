@@ -3,9 +3,12 @@ package renderer
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/lenisko/rampardos/internal/services"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -21,7 +24,10 @@ func TestGlobalSlotHeldUntilRenderEnds(t *testing.T) {
 	// then end it the way the real loop does.
 	finish := make(chan struct{})
 	taken := make(chan struct{})
+	ended := make(chan struct{})
+	t.Cleanup(func() { <-ended })
 	go func() {
+		defer close(ended)
 		cmd := <-p.cmds
 		close(taken)
 		<-finish
@@ -58,5 +64,54 @@ func TestGlobalSlotHeldUntilRenderEnds(t *testing.T) {
 			t.Fatal("global slot not freed after the render ended")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// globalInFlightMax reads the rampardos_renderer_global_in_flight_max
+// gauge.
+func globalInFlightMax(t *testing.T) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() == "rampardos_renderer_global_in_flight_max" {
+			return f.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	t.Fatal("rampardos_renderer_global_in_flight_max not registered")
+	return 0
+}
+
+// The in-flight high-water mark is read against the cap to size
+// RENDERER_POOL_SIZE. Freeing the slot before lowering the count let the
+// next render count itself first, so prod showed 9 renders in flight
+// under a cap of 8.
+func TestGlobalInFlightNeverExceedsCapacity(t *testing.T) {
+	services.InitMetrics()
+	if peak := globalInFlightMax(t); peak > 1 {
+		t.Skipf("an earlier test already raised the in-flight peak to %v", peak)
+	}
+	r := &GoPoolRenderer{sem: semaphore.NewWeighted(1)}
+
+	const iterations = 100000
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				if err := r.acquireGlobal(context.Background()); err != nil {
+					t.Error(err)
+					return
+				}
+				r.releaseGlobal()
+			}
+		}()
+	}
+	wg.Wait()
+	if peak := globalInFlightMax(t); peak > 1 {
+		t.Fatalf("in-flight peak reached %v under a capacity of 1", peak)
 	}
 }

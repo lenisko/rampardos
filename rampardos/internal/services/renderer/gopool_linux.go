@@ -197,11 +197,14 @@ func (r *GoPoolRenderer) acquireGlobal(ctx context.Context) error {
 	return nil
 }
 
+// releaseGlobal lowers the in-flight count before freeing the slot, so
+// the next render cannot count itself first and push the high-water
+// mark past the cap.
 func (r *GoPoolRenderer) releaseGlobal() {
-	r.sem.Release(1)
 	if services.GlobalMetrics != nil {
 		services.GlobalMetrics.DecRendererGlobalInFlight()
 	}
+	r.sem.Release(1)
 }
 
 func (r *GoPoolRenderer) Render(ctx context.Context, req Request) ([]byte, error) {
