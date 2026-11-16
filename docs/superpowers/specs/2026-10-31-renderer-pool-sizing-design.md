@@ -1,6 +1,6 @@
 # Renderer pool sizing from burst history
 
-Date: 2026-10-31. Status: design, not yet planned.
+Date: 2026-10-31. Status: on hold since 2026-11-16; see *Baseline results*.
 
 ## Why
 
@@ -91,6 +91,46 @@ designs.
 
 Deploy on the large install and collect at least a full day (all pools through
 a daytime, an overnight and the hourly spikes). That is the baseline.
+
+## Baseline results (2026-11-16)
+
+Two `/metrics` scrapes of one process on the large install, 21.3 h apart
+(build `7b1ba3a`, FFI 0.202611.0, `STYLE_POOL_SIZE=3`, global cap 8). Values
+are the difference between the scrapes.
+
+| Pool | Renders | Warm render | First render | Startup | Grow/shrink | Wait mean / p99 |
+|---|---|---|---|---|---|---|
+| osm-bright x2 | 431,046 | 33.2 ms | 70.8 ms | 15.3 ms | 55 / 55 | 2.4 / 53 ms |
+| carto-voyager x2 | 20,562 | 19.1 ms | 55.8 ms | 18.3 ms | 26 / 26 | 8.6 / 62 ms |
+| osm-bright x1 | 10,980 | 39.7 ms | 83.3 ms | 15.1 ms | 62 / 61 | 0.4 / 16 ms |
+| klokantech-basic x2 | 7,616 | 24.0 ms | 55.1 ms | 15.1 ms | 23 / 23 | 7.9 / 74 ms |
+| dark-matter x2 | 1,914 | 21.5 ms | 59.7 ms | 15.1 ms | 35 / 35 | 6.3 / 68 ms |
+| carto-positron x2 | 1,615 | 24.5 ms | 58.9 ms | 16.1 ms | 37 / 37 | 6.1 / 61 ms |
+
+What this changes:
+
+- **A worker starts cheaply.** Startup plus the first render's excess is
+  about 50 ms in every pool, so the growth threshold would be about 50 ms,
+  and a grow that overshoots or a churn cycle costs little latency. The
+  request that triggers growth does not wait for the new worker. Only the
+  first render after a process start is expensive (osm-bright x2: 257 ms in
+  the first hour), which pool sizing does not address. A warm-up render when
+  a pool is built would.
+- **Latency gives no reason to build phase 2.** No osm-bright x2 wait passed
+  150 ms. The tile pools' waits come from their 3-worker ceiling during
+  dozen-tile pans, which sizing below the ceiling cannot change, and the
+  worst waits (66 over 250 ms) are at the global cap.
+- **The memory case still stands, but is unmeasured.** Every pool held 3
+  workers at both scrapes, carto-positron included, for 1,615 renders a day.
+  The scrapes cannot give mean workers or memory per worker (RSS 2.91 GB,
+  then 2.59 GB, with 19 workers both times).
+- **Half of each request is spent outside the renderer** (static map 70.4 ms
+  against 35.7 ms in the renderer; tiles 62–81 ms against about 30 ms). That
+  is the larger latency target.
+
+Phase 2 waits on the memory a worker costs, which the bench can measure
+without a deploy. If retiring idle workers would free little, keep the
+current policy.
 
 ## Phase 2: burst-history sizing (new branch off PR 19)
 
