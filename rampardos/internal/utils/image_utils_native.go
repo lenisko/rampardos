@@ -764,9 +764,10 @@ func EncodeImage(img image.Image, pathExt string) ([]byte, error) {
 			return nil, err
 		}
 	default:
-		encoder := &png.Encoder{CompressionLevel: png.BestSpeed, BufferPool: &pngBufferPool}
+		encoder := &png.Encoder{CompressionLevel: png.BestSpeed, Filter: png.FilterUp, BufferPool: &pngBufferPool}
 		if services.GlobalImageSettings != nil {
 			encoder.CompressionLevel = services.GlobalImageSettings.PNGCompressionLevel
+			encoder.Filter = services.GlobalImageSettings.PNGFilter
 		}
 		if err := encoder.Encode(&buf, img); err != nil {
 			return nil, err

@@ -43,7 +43,7 @@ type TileResult struct {
 	Cached bool
 }
 
-// Get handles GET /tile/:style/:z/:x/:y/:scale/:format
+// Get handles GET /tile/:style/:z/:x/:y/:scale/:format[?tileSize=256|512]
 func (h *TileHandler) Get(w http.ResponseWriter, r *http.Request) {
 	style := chi.URLParam(r, "style")
 	zStr := chi.URLParam(r, "z")
@@ -97,14 +97,54 @@ func (h *TileHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.generateTileAndResponse(w, r, style, z, x, y, uint8(scale), format)
+	tileSize, err := parseTileSize(r.URL.Query().Get("tileSize"))
+	if err != nil {
+		services.GlobalMetrics.RecordValidationError("tile", "tileSize")
+		http.Error(w, "Invalid tileSize parameter (must be 256 or 512)", http.StatusBadRequest)
+		return
+	}
+	// External styles are proxied, not rendered: we can't change the
+	// size of whatever the upstream provider returns.
+	if tileSize != renderer.TileSizePx && h.stylesController.GetExternalStyle(style) != nil {
+		services.GlobalMetrics.RecordValidationError("tile", "tileSize")
+		http.Error(w, "tileSize is only supported for local styles", http.StatusBadRequest)
+		return
+	}
+
+	h.generateTileAndResponse(w, r, style, z, x, y, uint8(scale), format, tileSize)
+}
+
+// parseTileSize accepts an empty value (the 512 default), "512" or "256".
+func parseTileSize(s string) (int, error) {
+	switch s {
+	case "", strconv.Itoa(renderer.TileSizePx):
+		return renderer.TileSizePx, nil
+	case strconv.Itoa(renderer.SmallTileSizePx):
+		return renderer.SmallTileSizePx, nil
+	}
+	return 0, fmt.Errorf("unsupported tile size %q", s)
+}
+
+// tileCachePath returns the on-disk cache path for a tile. 512 tiles
+// keep the historical style-z-x-y-scale.format name so existing caches
+// stay valid (and static_map.go / image_utils_native.go parse that
+// shape); other sizes get a -<size> suffix. Static maps only ever
+// stitch 512 tiles, so those parsers never see a suffixed name.
+func tileCachePath(style string, z, x, y int, scale uint8, format models.ImageFormat, tileSize int) string {
+	if tileSize == renderer.TileSizePx {
+		return fmt.Sprintf("Cache/Tile/%s-%d-%d-%d-%d.%s", style, z, x, y, scale, format)
+	}
+	return fmt.Sprintf("Cache/Tile/%s-%d-%d-%d-%d-%d.%s", style, z, x, y, scale, tileSize, format)
 }
 
 // GenerateTile generates a tile and returns the result. Concurrent
 // requests for the same tile are deduplicated via singleflight: only
 // one goroutine downloads/renders, the rest wait for its result.
-func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y int, scale uint8, format models.ImageFormat) (*TileResult, error) {
-	path := fmt.Sprintf("Cache/Tile/%s-%d-%d-%d-%d.%s", style, z, x, y, scale, format)
+// tileSize is renderer.TileSizePx or renderer.SmallTileSizePx; only
+// local styles honour the latter.
+func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y int, scale uint8, format models.ImageFormat, tileSize int) (*TileResult, error) {
+	tileSize = renderer.NormalizeTileSize(tileSize)
+	path := tileCachePath(style, z, x, y, scale, format, tileSize)
 
 	start := time.Now()
 	if _, err := os.Stat(path); err == nil {
@@ -150,8 +190,9 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 		encoded, err := h.renderer.Render(ctx, renderer.Request{
 			StyleID: style,
 			Z:       z, X: x, Y: y,
-			Scale:  scale,
-			Format: format,
+			Scale:    scale,
+			Format:   format,
+			TileSize: tileSize,
 		})
 		if err != nil {
 			return nil, err
@@ -170,12 +211,12 @@ func (h *TileHandler) GenerateTile(ctx context.Context, style string, z, x, y in
 	return &TileResult{Path: path, Cached: false}, nil
 }
 
-func (h *TileHandler) generateTileAndResponse(w http.ResponseWriter, r *http.Request, style string, z, x, y int, scale uint8, format models.ImageFormat) {
+func (h *TileHandler) generateTileAndResponse(w http.ResponseWriter, r *http.Request, style string, z, x, y int, scale uint8, format models.ImageFormat, tileSize int) {
 	startTime := time.Now()
 	services.GlobalMetrics.IncrementInFlight("tile")
 	defer services.GlobalMetrics.DecrementInFlight("tile")
 
-	result, err := h.GenerateTile(r.Context(), style, z, x, y, scale, format)
+	result, err := h.GenerateTile(r.Context(), style, z, x, y, scale, format, tileSize)
 	if err != nil {
 		// Client disconnects shouldn't be reported as server errors.
 		if errors.Is(err, context.Canceled) {

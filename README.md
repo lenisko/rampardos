@@ -6,8 +6,8 @@ own maplibre-native renderer (no external tileserver-gl required).
 
 ## Features
 
-- Vector tile rendering from local mbtiles, in-process via a Node
-  worker pool (maplibre-native under the hood)
+- Vector tile rendering from local mbtiles, in-process through
+  maplibre-native's C API (no Node, no X server)
 - Static map generation with markers, polygons, and circles
 - Multi-static maps (grids of composed static maps)
 - Template system with variable substitution
@@ -124,39 +124,83 @@ centre. Full reference: `rampardos/internal/config/config.go`.
 | `DEFAULT_IMAGE_FORMAT` | `png`, `jpeg`, or `webp` | `png` |
 | `OVERRIDE_CLIENT_FORMAT` | Ignore client `format` param, force `DEFAULT_IMAGE_FORMAT` | `false` |
 | `PNG_COMPRESSION_LEVEL` | `fast`, `default`, `best`, `none` | `fast` |
+| `PNG_FILTER` | PNG row filter: `up`, `paeth`, or `adaptive` (see *PNG output* below) | `up` |
 | `IMAGE_QUALITY` | JPEG/WebP quality 1–100 | `90` |
 | `TILE_CACHE_MAX_AGE_MINUTES` | TTL for external tile disk cache | `10080` (7 days) |
 | `STATIC_CACHE_MAX_AGE_MINUTES` | TTL for static map cache | `10080` |
 | `STATIC_MULTI_CACHE_MAX_AGE_MINUTES` | TTL for multi-static-map cache | `60` |
 | `MARKER_CACHE_MAX_AGE_MINUTES` | TTL for marker image cache | `1440` (1 day) |
 | `MARKER_IMAGE_CACHE_SIZE` | Resized marker images cached in RAM | `2000` |
-| `TILE_IMAGE_CACHE_SIZE` | Decoded tile images cached in RAM | `500` |
-| `COMPOSITE_IMAGE_CACHE_MB` | RAM budget (decoded pixels) for base, staticmap and multistaticmap images | `256` |
+| `TILE_IMAGE_CACHE_MB` | RAM budget (decoded pixels) for tile images used to stitch external-style maps | `128` |
+| `TILE_IMAGE_CACHE_SIZE` | Secondary cap on the number of those images | `500` |
+| `COMPOSITE_IMAGE_CACHE_MB` | RAM budget (decoded pixels) for base, staticmap and multistaticmap images | `128` |
 | `COMPOSITE_IMAGE_CACHE_SIZE` | Secondary cap on the number of those images | `1000` |
 | `TILE_URL_<name>` | External XYZ tile URL template (e.g. `TILE_URL_MY_TILES=https://...`) | — |
-| `RENDERER_POOL_SIZE` | Renderer worker count per style (0 = NumCPU) | `0` |
-| `STYLE_POOL_SIZE` | Max styles kept live at once (0 = unbounded) | `0` |
+| `RENDERER_POOL_SIZE` | Global cap on concurrent renders across all styles and scales (0 = GOMAXPROCS) | `0` |
+| `STYLE_POOL_SIZE` | Max renderer workers per (style, scale) pool; each worker holds its own map, ~100 MB native (0 = `RENDERER_POOL_SIZE`) | `0` |
+| `STYLE_POOL_MIN` | Workers each pool keeps when idle | `1` |
+| `STYLE_POOL_IDLE_SECONDS` | Quiet interval after which a pool retires one worker above `STYLE_POOL_MIN` | `600` |
+| `RENDERER_TIMEOUT_SECONDS` | Deadline for a single render | `15` |
+| `RENDERER_TILE_PROVIDER` | `off` makes the renderer read the mbtiles natively instead of through the shared tile store (slower; for troubleshooting) | — |
+| `RENDERER_TILE_CACHE_MB` | RAM budget for decompressed vector tiles shared by all renderer workers | `64` |
+| `RENDERER_AMBIENT_CACHE_MB` | Per-worker maplibre resource cache. Leave unset unless a local style pulls remote (non-mbtiles) sources | `0` while the tile store is active |
 | `EXPERIMENTAL_G_SAT` | Register a built-in Google Satellite external style | `true` |
 | `PPROF_ENABLED` | Mount `/debug/pprof` for live profiling | `false` |
+
+The image also sets `MALLOC_ARENA_MAX=64` and `GOMEMLIMIT=1GiB`. Fewer
+malloc arenas slow rendering, because every renderer thread allocates
+through them. Raise `GOMEMLIMIT` if you raise the image cache budgets well
+above their defaults.
 
 Each cache class also accepts a matching `*_DELAY_SECONDS` (cleaner
 sweep interval) and `*_DROP_AFTER_MINUTES` (force-evict regardless of
 mtime) variable; see the config source for the full set.
 
+### PNG output
+
+A poracle static map took about 11 ms to encode against a 33 ms render,
+and two-thirds of the encode was stdlib choosing a filter for each row.
+`PNG_FILTER` uses one filter for every row instead. Measured on real outputs at the
+default `PNG_COMPRESSION_LEVEL=fast` (arm64):
+
+| Image | `adaptive` | `up` (default) | `paeth` |
+| --- | --- | --- | --- |
+| Static map, 500×250 at scale 2 | 10.4 ms, 184 KB | 4.0 ms, 181 KB | 6.7 ms, 183 KB |
+| Poracle multi-map with satellite | 18.8 ms, 502 KB | 8.0 ms, 516 KB | 12.0 ms, 501 KB |
+| Satellite static map | 6.2 ms, 248 KB | 2.3 ms, 235 KB | 3.6 ms, 244 KB |
+| Vector tile, 512 at scale 2 | 19.6 ms, 282 KB | 7.4 ms, 303 KB | 12.3 ms, 283 KB |
+
+`up` suits poracle's mostly static-map traffic: 2.5–3× faster, with
+files about the same size, though multi-maps are about 3% and vector
+tiles about 8% larger. `paeth` keeps every size within 1% of `adaptive`
+at about 1.6× faster. Don't skip filtering altogether: unfiltered rows
+compress well on vector maps but make satellite imagery 35–50% larger.
+
 ## Building from source
 
 For development. Production users should pull the docker image.
 
+The renderer is Linux-only: it links upstream's prebuilt
+`libmaplibre-native-c.so` through cgo and pkg-config (the binding's
+`mln_pkgconfig` build tag; Go rejects the release's static preset
+modules for the LLVM bitcode they carry). On Linux:
+
 ```bash
-cd rampardos
-go mod tidy
-go build -o rampardos ./cmd/server
+make fetch-ffi          # download the maplibre-native-ffi release
+make build-go-renderer  # build rampardos against it
 ```
+
+On other platforms `go build ./cmd/server` compiles but cannot
+render; build and test in Docker instead
+(`docker build --target rampardos-test .`, or
+`scripts/rtest.sh <tag> -tags renderer_integration,mln_pkgconfig ./internal/services/renderer/`
+for the renderer integration tests).
 
 Runtime dependencies (bundled inside the docker image):
 
-- Node + the render worker (`render-worker/render-worker.js`) and its
-  maplibre-native FFI shared libraries
+- `libmaplibre-native-c.so` from
+  [maplibre-native-ffi](https://github.com/maplibre/maplibre-native-ffi)
+- Mesa's EGL and llvmpipe software renderer (no GPU or display needed)
 - `tippecanoe`'s `tile-join` for combining mbtiles
 - `build-glyphs` (from `fontnik`) — only needed if uploading fonts via
   the admin UI
@@ -176,6 +220,12 @@ Runtime dependencies (bundled inside the docker image):
 | GET / POST | `/multistaticmap/{template}` | Render a multi-static-map from a template |
 | GET | `/multistaticmap/pregenerated/{id}` | Serve a pregenerated multi-static map |
 | GET | `/metrics` | Prometheus metrics |
+
+Tiles are 512×512 logical pixels by default (`{scale}` multiplies
+that). Clients that expect 256-px tiles — Leaflet, OpenLayers, etc. —
+either set `tileSize: 512, zoomOffset: -1`, or request
+`?tileSize=256` to get a 256×256 tile (512×512 at `scale=2`) with
+labels sized for a 256-px slot. `tileSize=256` is local styles only.
 
 ### Admin (basic auth)
 

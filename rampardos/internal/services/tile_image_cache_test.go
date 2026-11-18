@@ -12,7 +12,7 @@ func makeTestImage(w, h int) image.Image {
 // TestTileImageCacheRoundTrip pins the basic contract: Add + Get
 // returns the exact image pointer.
 func TestTileImageCacheRoundTrip(t *testing.T) {
-	c := NewTileImageCache(4)
+	c := NewTileImageCache(4, 1<<30)
 	img := makeTestImage(2, 2)
 	c.Add("a", img)
 
@@ -27,7 +27,7 @@ func TestTileImageCacheRoundTrip(t *testing.T) {
 
 // TestTileImageCacheMiss returns (nil, false) and nothing panics.
 func TestTileImageCacheMiss(t *testing.T) {
-	c := NewTileImageCache(4)
+	c := NewTileImageCache(4, 1<<30)
 	got, ok := c.Get("missing")
 	if ok {
 		t.Fatal("expected miss")
@@ -41,7 +41,7 @@ func TestTileImageCacheMiss(t *testing.T) {
 // is reached, the least-recently-used entry is dropped first. Accessing
 // "a" before inserting the 5th entry keeps it alive and pushes "b" out.
 func TestTileImageCacheEvictsOldest(t *testing.T) {
-	c := NewTileImageCache(3)
+	c := NewTileImageCache(3, 1<<30)
 	c.Add("a", makeTestImage(1, 1))
 	c.Add("b", makeTestImage(1, 1))
 	c.Add("c", makeTestImage(1, 1))
@@ -66,7 +66,7 @@ func TestTileImageCacheEvictsOldest(t *testing.T) {
 // TestTileImageCacheReAddMovesToFront ensures re-adding an existing
 // key doesn't grow the LRU and refreshes its recency.
 func TestTileImageCacheReAddMovesToFront(t *testing.T) {
-	c := NewTileImageCache(2)
+	c := NewTileImageCache(2, 1<<30)
 	c.Add("a", makeTestImage(1, 1))
 	c.Add("b", makeTestImage(1, 1))
 
@@ -86,7 +86,7 @@ func TestTileImageCacheReAddMovesToFront(t *testing.T) {
 // TestTileImageCacheSetSizeShrinks pins dynamic resizing: shrinking
 // below current length must evict the tail immediately.
 func TestTileImageCacheSetSizeShrinks(t *testing.T) {
-	c := NewTileImageCache(5)
+	c := NewTileImageCache(5, 1<<30)
 	for _, k := range []string{"a", "b", "c", "d", "e"} {
 		c.Add(k, makeTestImage(1, 1))
 	}
@@ -111,9 +111,56 @@ func TestTileImageCacheSetSizeShrinks(t *testing.T) {
 // turn the cache off via env without wiring conditional code
 // everywhere.
 func TestTileImageCacheDisabledWhenSizeZero(t *testing.T) {
-	c := NewTileImageCache(0)
+	c := NewTileImageCache(0, 1<<30)
 	c.Add("a", makeTestImage(1, 1))
 	if _, ok := c.Get("a"); ok {
 		t.Fatal("zero-size cache should never hit")
+	}
+}
+
+// TestTileImageCacheByteBound: the byte budget evicts from the tail
+// even when the entry count has room — a 512 px tile is four times a
+// 256 px one, so the count alone does not bound memory.
+func TestTileImageCacheByteBound(t *testing.T) {
+	c := NewTileImageCache(100, 3*16) // three 2x2 NRGBA images
+	for _, k := range []string{"a", "b", "c", "d"} {
+		c.Add(k, makeTestImage(2, 2))
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("a should have been evicted by the byte budget")
+	}
+	for _, k := range []string{"b", "c", "d"} {
+		if _, ok := c.Get(k); !ok {
+			t.Fatalf("%s should still be cached", k)
+		}
+	}
+	if got := c.Bytes(); got != 3*16 {
+		t.Fatalf("Bytes() = %d, want %d", got, 3*16)
+	}
+
+	// Re-adding a key replaces its bytes rather than double-counting.
+	c.Add("d", makeTestImage(2, 2))
+	if got := c.Bytes(); got != 3*16 {
+		t.Fatalf("after re-add Bytes() = %d, want %d", got, 3*16)
+	}
+
+	// An image bigger than the whole budget is not cached and does
+	// not flush the rest.
+	c.Add("huge", makeTestImage(8, 8))
+	if _, ok := c.Get("huge"); ok {
+		t.Fatal("over-budget image should not be cached")
+	}
+	if _, ok := c.Get("b"); !ok {
+		t.Fatal("over-budget add must not flush other entries")
+	}
+}
+
+// TestTileImageCacheDisabledWhenBytesZero mirrors the size-zero case
+// for the byte budget.
+func TestTileImageCacheDisabledWhenBytesZero(t *testing.T) {
+	c := NewTileImageCache(10, 0)
+	c.Add("a", makeTestImage(1, 1))
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("zero-byte cache should never hit")
 	}
 }

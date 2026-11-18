@@ -24,6 +24,9 @@
 //
 //   - package name: png → pngfast
 //   - import: "compress/zlib" → "github.com/klauspost/compress/zlib"
+//   - Encoder.Filter: a fixed up or Paeth filter for every row instead
+//     of stdlib's adaptive choice (golang/go#62009). Adaptive spent more
+//     time choosing filters than compressing; the zero value keeps it.
 //
 // reader.go is included for the constants and types it defines that
 // writer.go references (cbG8 / ctGrayscale / nFilter / UnsupportedError

@@ -49,7 +49,7 @@ func TestTileToViewport(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := TileToViewport(tc.z, tc.x, tc.y, tc.scale)
+			got := TileToViewport(tc.z, tc.x, tc.y, tc.scale, 0)
 			if got.Zoom != tc.wantZoom {
 				t.Errorf("zoom: got %v, want %v", got.Zoom, tc.wantZoom)
 			}
@@ -74,5 +74,26 @@ func TestTileToViewport(t *testing.T) {
 				t.Errorf("tile renders must be zero-rotation")
 			}
 		})
+	}
+}
+
+func TestTileToViewportSmallTile(t *testing.T) {
+	big := TileToViewport(14, 8188, 5448, 2, TileSizePx)
+	small := TileToViewport(14, 8188, 5448, 2, SmallTileSizePx)
+
+	if small.Width != SmallTileSizePx || small.Height != SmallTileSizePx {
+		t.Errorf("width/height: got %dx%d, want %dx%d",
+			small.Width, small.Height, SmallTileSizePx, SmallTileSizePx)
+	}
+	// Half the pixels at one zoom lower covers the same extent.
+	if small.Zoom != big.Zoom-1 {
+		t.Errorf("zoom: got %v, want %v", small.Zoom, big.Zoom-1)
+	}
+	if small.Longitude != big.Longitude || small.Latitude != big.Latitude {
+		t.Errorf("centre moved: got (%v,%v), want (%v,%v)",
+			small.Longitude, small.Latitude, big.Longitude, big.Latitude)
+	}
+	if small.Scale != 2 {
+		t.Errorf("scale: got %d, want 2", small.Scale)
 	}
 }

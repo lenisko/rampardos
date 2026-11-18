@@ -81,8 +81,8 @@ func (tc *TemplatesController) SaveTemplate(name, oldName, content string) error
 
 	path := filepath.Join(tc.folder, sanitized+".json")
 
-	// Create backup of existing file before saving
-	// A failed backup must not fail the save — the user asked to write the
+	// Create backup of existing file before saving. A failed backup must
+	// not fail the save — the user asked to write the
 	// template, not to keep a copy — but it does need to be visible, because
 	// silently skipping it leaves them believing a recovery point exists.
 	if existingContent, err := os.ReadFile(path); err == nil {

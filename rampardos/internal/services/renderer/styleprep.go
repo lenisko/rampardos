@@ -151,7 +151,18 @@ func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 			// references, etc.
 			srcType, _ := src["type"].(string)
 			if srcType == "vector" || srcType == "" {
-				src["url"] = "mbtiles://" + cfg.MbtilesFile
+				if cfg.TileJSON != nil {
+					// Inline the provider-backed TileJSON: tiles on the
+					// provider scheme, zoom range and bounds from the
+					// dataset. No url means the native mbtiles source
+					// never engages.
+					delete(src, "url")
+					for k, v := range cfg.TileJSON {
+						src[k] = v
+					}
+				} else {
+					src["url"] = "mbtiles://" + cfg.MbtilesFile
+				}
 			}
 		}
 	}
@@ -161,4 +172,17 @@ func PrepareStyle(id string, src []byte, cfg Config) ([]byte, error) {
 
 func isHTTP(url string) bool {
 	return strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://")
+}
+
+// usesLocalGlyphs reports whether PrepareStyle points the style's glyphs
+// at the local fonts directory: it rewrites every glyphs URL but an
+// http(s) one.
+func usesLocalGlyphs(styleJSON []byte) bool {
+	var style struct {
+		Glyphs string `json:"glyphs"`
+	}
+	if err := json.Unmarshal(styleJSON, &style); err != nil {
+		return false
+	}
+	return style.Glyphs != "" && !isHTTP(style.Glyphs)
 }

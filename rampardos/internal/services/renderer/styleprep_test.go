@@ -236,3 +236,61 @@ func TestStyleZoomOffset(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepareStyleInlinesTileJSONWhenProviderActive(t *testing.T) {
+	style := `{"version":8,"sources":{"openmaptiles":{"type":"vector","url":"mbtiles://{v3}"}},"layers":[]}`
+	cfg := Config{
+		StylesDir:   "/abs/styles",
+		FontsDir:    "/abs/fonts",
+		MbtilesFile: "/abs/data/Combined.mbtiles",
+		TileJSON: map[string]any{
+			"type":    "vector",
+			"tiles":   []any{"rampardos://tile/{z}/{x}/{y}.pbf"},
+			"minzoom": 0,
+			"maxzoom": 14,
+		},
+	}
+	out, err := PrepareStyle("test", []byte(style), cfg)
+	if err != nil {
+		t.Fatalf("PrepareStyle: %v", err)
+	}
+	var prepared map[string]any
+	if err := json.Unmarshal(out, &prepared); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	src := prepared["sources"].(map[string]any)["openmaptiles"].(map[string]any)
+	if _, hasURL := src["url"]; hasURL {
+		t.Fatalf("source url should be removed, got %v", src["url"])
+	}
+	tiles, ok := src["tiles"].([]any)
+	if !ok || len(tiles) != 1 || tiles[0] != "rampardos://tile/{z}/{x}/{y}.pbf" {
+		t.Fatalf("tiles = %v", src["tiles"])
+	}
+	if src["maxzoom"] != float64(14) {
+		t.Fatalf("maxzoom = %v (%T)", src["maxzoom"], src["maxzoom"])
+	}
+	if src["type"] != "vector" {
+		t.Fatalf("type = %v", src["type"])
+	}
+}
+
+func TestPrepareStyleKeepsMbtilesURLWithoutTileJSON(t *testing.T) {
+	style := `{"version":8,"sources":{"openmaptiles":{"type":"vector","url":"mbtiles://{v3}"}},"layers":[]}`
+	cfg := Config{
+		StylesDir:   "/abs/styles",
+		FontsDir:    "/abs/fonts",
+		MbtilesFile: "/abs/data/Combined.mbtiles",
+	}
+	out, err := PrepareStyle("test", []byte(style), cfg)
+	if err != nil {
+		t.Fatalf("PrepareStyle: %v", err)
+	}
+	var prepared map[string]any
+	if err := json.Unmarshal(out, &prepared); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	src := prepared["sources"].(map[string]any)["openmaptiles"].(map[string]any)
+	if src["url"] != "mbtiles:///abs/data/Combined.mbtiles" {
+		t.Fatalf("url = %v, want mbtiles fallback", src["url"])
+	}
+}

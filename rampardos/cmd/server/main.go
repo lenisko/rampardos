@@ -92,19 +92,17 @@ func main() {
 	fontsController := services.NewFontsController("TileServer/Fonts")
 	stylesController := services.NewStylesController(externalStyles, "TileServer/Styles", fontsController)
 
-	// Initialize the renderer (spawns Node worker pools).
+	// Initialize the renderer (lazily creates in-process worker pools).
 	rendererCfg := renderer.Config{
-		Backend:        cfg.RendererBackend,
-		NodeBinary:     cfg.RendererNodeBinary,
-		WorkerScript:   cfg.RendererWorkerScript,
-		PoolSize:       cfg.RendererPoolSize,
-		StylePoolSize:  cfg.RendererStylePoolSize,
-		RenderTimeout:  cfg.RendererRenderTimeout,
-		WorkerLifetime: cfg.RendererWorkerLifetime,
-		StartupTimeout: cfg.RendererStartupTimeout,
-		StylesDir:      absPath("TileServer/Styles"),
-		FontsDir:       absPath("TileServer/Fonts"),
-		MbtilesFile:    absPath("TileServer/Datasets/Combined.mbtiles"),
+		PoolSize:         cfg.RendererPoolSize,
+		StylePoolSize:    cfg.RendererStylePoolSize,
+		StylePoolMin:     cfg.RendererStylePoolMin,
+		StylePoolIdleTTL: cfg.RendererStylePoolIdle,
+		RenderTimeout:    cfg.RendererRenderTimeout,
+		StartupTimeout:   cfg.RendererStartupTimeout,
+		StylesDir:        absPath("TileServer/Styles"),
+		FontsDir:         absPath("TileServer/Fonts"),
+		MbtilesFile:      absPath("TileServer/Datasets/Combined.mbtiles"),
 		// DiscoverStyles re-scans the disk each time it's called, so
 		// new style directories added after startup are picked up on
 		// ReloadStyles (admin "Reload Styles" button or dataset change).
@@ -113,7 +111,11 @@ func main() {
 		},
 	}
 	localStyleIDs, _ := rendererCfg.DiscoverStyles()
-	renderEngine, err := renderer.NewNodePoolRenderer(rendererCfg, renderer.DefaultSpawnFactory(rendererCfg))
+
+	// The in-process Go renderer is the only backend. It requires a
+	// Linux build with CGO and libmaplibre-native-c.so; elsewhere the
+	// stub returns a clear error rather than silently degrading.
+	renderEngine, err := renderer.NewGoPoolRenderer(rendererCfg)
 	if err != nil {
 		slog.Error("Failed to initialise renderer", "error", err)
 		os.Exit(1)
@@ -166,8 +168,9 @@ func main() {
 	}
 
 	// Skip the PNG decode on every base-map stitch — pprof showed
-	// image.Decode at 54% of CPU before this cache existed.
-	services.InitGlobalTileImageCache(cfg.TileImageCacheSize)
+	// image.Decode at 54% of CPU before this cache existed. Bounded by
+	// bytes; the entry count is a secondary cap.
+	services.InitGlobalTileImageCache(cfg.TileImageCacheSize, int64(cfg.TileImageCacheMB)<<20)
 
 	// Cross-request burst-sharing cache for base renders, final
 	// staticmap outputs and multistaticmap composites. Replaces the
@@ -436,22 +439,23 @@ func main() {
 	signal.Stop(hupCh)
 	cancelHup()
 	<-hupDone
-	if err := renderEngine.Close(); err != nil {
-		slog.Error("Renderer shutdown", "error", err)
-	}
 
-	// Stop background services first to drain goroutines.
-	if pyroscopeProfiler != nil {
-		if err := pyroscopeProfiler.Stop(); err != nil {
-			slog.Warn("Pyroscope stop error", "error", err)
-		}
-	}
-
-	// Drain in-flight HTTP requests with a bounded grace period.
+	// Drain in-flight HTTP requests with a bounded grace period before
+	// closing the renderer, so the requests finish their renders rather
+	// than fail against a closed one.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Warn("Server shutdown error", "error", err)
+	}
+	if err := renderEngine.Close(); err != nil {
+		slog.Error("Renderer shutdown", "error", err)
+	}
+
+	if pyroscopeProfiler != nil {
+		if err := pyroscopeProfiler.Stop(); err != nil {
+			slog.Warn("Pyroscope stop error", "error", err)
+		}
 	}
 	slog.Info("Server stopped")
 }
@@ -489,9 +493,8 @@ func initCacheCleaners(cfg *config.Config) {
 }
 
 // absPath converts a relative path to absolute based on the process's
-// working directory. The renderer passes these paths to Node worker
-// subprocesses via CLI args and style.json rewriting, so they must be
-// absolute — relative paths would break if the worker's cwd differs.
+// working directory. These paths are baked into the prepared style.json
+// that maplibre-native loads, so they must be absolute.
 func absPath(rel string) string {
 	abs, err := filepath.Abs(rel)
 	if err != nil {
