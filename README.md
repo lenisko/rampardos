@@ -124,6 +124,7 @@ centre. Full reference: `rampardos/internal/config/config.go`.
 | `DEFAULT_IMAGE_FORMAT` | `png`, `jpeg`, or `webp` | `png` |
 | `OVERRIDE_CLIENT_FORMAT` | Ignore client `format` param, force `DEFAULT_IMAGE_FORMAT` | `false` |
 | `PNG_COMPRESSION_LEVEL` | `fast`, `default`, `best`, `none` | `fast` |
+| `PNG_FILTER` | PNG row filter: `up`, `paeth`, or `adaptive` (see *PNG output* below) | `up` |
 | `IMAGE_QUALITY` | JPEG/WebP quality 1–100 | `90` |
 | `TILE_CACHE_MAX_AGE_MINUTES` | TTL for external tile disk cache | `10080` (7 days) |
 | `STATIC_CACHE_MAX_AGE_MINUTES` | TTL for static map cache | `10080` |
@@ -154,6 +155,26 @@ above their defaults.
 Each cache class also accepts a matching `*_DELAY_SECONDS` (cleaner
 sweep interval) and `*_DROP_AFTER_MINUTES` (force-evict regardless of
 mtime) variable; see the config source for the full set.
+
+### PNG output
+
+A poracle static map took about 11 ms to encode against a 33 ms render,
+and two-thirds of the encode was stdlib choosing a filter for each row.
+`PNG_FILTER` uses one filter for every row instead. Measured on real outputs at the
+default `PNG_COMPRESSION_LEVEL=fast` (arm64):
+
+| Image | `adaptive` | `up` (default) | `paeth` |
+| --- | --- | --- | --- |
+| Static map, 500×250 at scale 2 | 10.4 ms, 184 KB | 4.0 ms, 181 KB | 6.7 ms, 183 KB |
+| Poracle multi-map with satellite | 18.8 ms, 502 KB | 8.0 ms, 516 KB | 12.0 ms, 501 KB |
+| Satellite static map | 6.2 ms, 248 KB | 2.3 ms, 235 KB | 3.6 ms, 244 KB |
+| Vector tile, 512 at scale 2 | 19.6 ms, 282 KB | 7.4 ms, 303 KB | 12.3 ms, 283 KB |
+
+`up` suits poracle's mostly static-map traffic: 2.5–3× faster, with
+files about the same size, though multi-maps are about 3% and vector
+tiles about 8% larger. `paeth` keeps every size within 1% of `adaptive`
+at about 1.6× faster. Don't skip filtering altogether: unfiltered rows
+compress well on vector maps but make satellite imagery 35–50% larger.
 
 ## Building from source
 

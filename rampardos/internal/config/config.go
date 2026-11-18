@@ -47,6 +47,7 @@ type Config struct {
 	DefaultImageFormat      string // "png", "jpeg", or "webp" (default: png)
 	OverrideClientFormat    bool   // If true, ignore client format and use DefaultImageFormat
 	PNGCompressionLevel     string // "fast", "default", "best", or "none" (default: fast — flate level 9 is ~4-6x slower for ~25% size saving on map tiles)
+	PNGFilter               string // "up", "paeth", or "adaptive" (default: up — see services.InitImageSettings)
 	ImageQuality            int    // JPEG/WebP quality 1-100 (default: 90)
 	MarkerImageCacheSize    int    // Max resized marker images to cache (default: 2000). Entry size varies by marker dimensions; a typical 40×40 NRGBA ≈ 6.4 KB; 2000 ≈ 12 MB.
 	TileImageCacheSize      int    // Secondary cap on decoded tile images cached in memory (default: 500, 0 disables).
@@ -113,6 +114,7 @@ func Load() *Config {
 		DefaultImageFormat:      getEnv("DEFAULT_IMAGE_FORMAT", "png"),
 		OverrideClientFormat:    getEnvBool("OVERRIDE_CLIENT_FORMAT", false),
 		PNGCompressionLevel:     getEnv("PNG_COMPRESSION_LEVEL", "fast"),
+		PNGFilter:               getEnv("PNG_FILTER", "up"),
 		ImageQuality:            getEnvInt("IMAGE_QUALITY", 90),
 		MarkerImageCacheSize:    getEnvInt("MARKER_IMAGE_CACHE_SIZE", 2000),
 		TileImageCacheSize:      getEnvInt("TILE_IMAGE_CACHE_SIZE", 500),
