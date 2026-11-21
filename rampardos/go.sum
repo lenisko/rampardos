@@ -79,3 +79,5 @@ gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
 maplibre.org/maplibre-native-ffi v0.202611.0 h1:cut00I1fio563JphFXz5O1LIHbOBuinE8sXAQEuydHI=
 maplibre.org/maplibre-native-ffi v0.202611.0/go.mod h1:5vHU0HKv7i2XScEMJzH/nWC5qhwaN3d/drKhijN4W0U=
+maplibre.org/maplibre-native-ffi v0.202611.1-0.20261115051201-d62ed4cbbb5e h1:BzYuFcP2IzDNg+mTWaLJ3W9sfgcKYY9IjqUr7htMlW0=
+maplibre.org/maplibre-native-ffi v0.202611.1-0.20261115051201-d62ed4cbbb5e/go.mod h1:5vHU0HKv7i2XScEMJzH/nWC5qhwaN3d/drKhijN4W0U=

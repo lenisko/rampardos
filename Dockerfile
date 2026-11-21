@@ -109,26 +109,17 @@ RUN cp /usr/bin/node /node-stripped && strip /node-stripped
 # replaces GOFLAGS', so it must list mln_pkgconfig too.
 # ================================
 FROM alpine:3.20 AS mln-ffi-build
-ARG MLN_FFI_VERSION
-ARG MLN_FFI_SHA256_AMD64=6de4757fc6b2af8ba1d03e7696831708c8128745bd4cf12aba9981412dfda032
-ARG MLN_FFI_SHA256_ARM64=32267eceaf5d781ded53057f5825855cc2fbf06ace231486852df38a91913d04
+# SPIKE: the mln-rs build from maplibre-native-ffi main CI (d62ed4c),
+# downloaded into .mlnrs/ by hand; there is no release yet.
 ARG TARGETARCH
-RUN apk add --no-cache curl
+COPY .mlnrs/ /tmp/mlnrs/
 RUN set -eu; \
-    case "$TARGETARCH" in \
-        arm64) MLN_ARCH=arm64; SUM="$MLN_FFI_SHA256_ARM64";; \
-        amd64) MLN_ARCH=x64;   SUM="$MLN_FFI_SHA256_AMD64";; \
-        *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1;; \
-    esac; \
-    ASSET="maplibre-native-c-linux-gnu-${MLN_ARCH}-egl.tar.gz"; \
-    curl -fsSL "https://github.com/maplibre/maplibre-native-ffi/releases/download/v${MLN_FFI_VERSION}/${ASSET}" -o "/tmp/${ASSET}"; \
-    echo "${SUM}  /tmp/${ASSET}" | sha256sum -c -; \
+    case "$TARGETARCH" in arm64) A=arm64;; amd64) A=x64;; *) exit 1;; esac; \
     mkdir -p /ffi/install; \
-    tar -xzf "/tmp/${ASSET}" --strip-components=1 -C /ffi/install; \
-    rm "/tmp/${ASSET}"; \
+    tar -xzf /tmp/mlnrs/$A/maplibre-native-c-linux-gnu-$A.tar.gz --strip-components=1 -C /ffi/install; \
+    rm -rf /tmp/mlnrs; \
     test -f /ffi/install/lib/libmaplibre-native-c.so; \
-    test -f /ffi/install/share/pkgconfig/maplibre-native-c.pc; \
-    grep -q "\"version\": \"${MLN_FFI_VERSION}\"" /ffi/install/share/maplibre-native-c/artifact.json
+    grep -q '"commit": "d62ed4c' /ffi/install/share/maplibre-native-c/artifact.json
 
 # ================================
 # Build Go binary
@@ -162,19 +153,10 @@ COPY --from=mln-ffi-build /ffi/install/ /ffi/install/
 WORKDIR /src
 COPY --from=git-info /git-commit.txt /git-commit.txt
 COPY rampardos/go.mod rampardos/go.sum ./
-# The Go binding and the C ABI it calls must come from the same release.
-# Compare go.mod's binding version against the version the installed
-# library's artifact.json records, rather than trusting the two to be
-# bumped together.
+# SPIKE: binding pseudo-version must name the library's commit.
 RUN set -eu; \
-    want="v$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' /ffi/install/share/maplibre-native-c/artifact.json)"; \
-    got="$(go list -m -f '{{.Version}}' maplibre.org/maplibre-native-ffi)"; \
-    if [ "$want" != "$got" ]; then \
-      echo "binding/ABI mismatch: go.mod has $got, native library is $want" >&2; \
-      echo "run: cd rampardos && go get maplibre.org/maplibre-native-ffi@$want" >&2; \
-      exit 1; \
-    fi; \
-    echo "binding matches native library at $got"
+    c="$(sed -n 's/.*"commit": *"\([0-9a-f]\{12\}\).*/\1/p' /ffi/install/share/maplibre-native-c/artifact.json)"; \
+    go list -m -f '{{.Version}}' maplibre.org/maplibre-native-ffi | grep -q "$c"
 RUN go mod download
 COPY rampardos/ ./
 RUN GIT_COMMIT=$(cat /git-commit.txt) && \
@@ -230,6 +212,8 @@ RUN apt-get update \
     # build-glyphs needs only libc/libstdc++, so no image or network
     # libraries are installed for either.
     libegl1 libegl-mesa0 libgl1-mesa-dri libgles2 \
+    # SPIKE: lavapipe, for RENDERER_GPU_BACKEND=vulkan benchmarking
+    mesa-vulkan-drivers libvulkan1 \
     # SQLite — mbgl's mbtiles file source reads the dataset directly
     libsqlite3-0 \
  && rm -rf /var/lib/apt/lists/*

@@ -14,10 +14,9 @@ import (
 // newTestDevice creates the offscreen device NewGoPoolRenderer would, for
 // tests that build a pool directly: without one each session would make
 // its own GLES device, unlike production.
-func newTestDevice(t *testing.T) *maplibre.OffscreenDeviceHandle {
+func newTestDevice(t *testing.T) *maplibre.GPUDeviceHandle {
 	t.Helper()
-	gl := maplibre.OpenGLClientAPIGL
-	d, err := maplibre.NewOffscreenDevice(&maplibre.OffscreenDeviceOptions{ClientAPI: &gl})
+	d, err := maplibre.NewGPUDevice(gpuDeviceOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

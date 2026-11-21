@@ -57,7 +57,7 @@ type GoPoolRenderer struct {
 
 	// device is the offscreen graphics device every worker's session
 	// renders on. It outlives every pool: released by Close only.
-	device *maplibre.OffscreenDeviceHandle
+	device *maplibre.GPUDeviceHandle
 
 	// ambientCacheBytes is each worker runtime's mbgl ambient cache
 	// budget; negative leaves mbgl's default.
@@ -163,8 +163,7 @@ func NewGoPoolRenderer(cfg Config) (Renderer, error) {
 	// EGL display (surfaceless Mesa first) and gives each session its own
 	// context. Desktop GL rather than the EGL default of GLES, which was
 	// slower under llvmpipe.
-	gl := maplibre.OpenGLClientAPIGL
-	device, err := maplibre.NewOffscreenDevice(&maplibre.OffscreenDeviceOptions{ClientAPI: &gl})
+	device, err := maplibre.NewGPUDevice(gpuDeviceOptions())
 	if err != nil {
 		if store != nil {
 			store.Close()
@@ -549,7 +548,7 @@ func (r *GoPoolRenderer) Close() error {
 // scale-segregated; ratio is therefore baked in at pool construction.
 type goStylePoolConfig struct {
 	store  *TileStore                      // shared tile provider; nil = native mbtiles path
-	device *maplibre.OffscreenDeviceHandle // renderer-wide; sessions attach to it
+	device *maplibre.GPUDeviceHandle // renderer-wide; sessions attach to it
 	// ambientCacheBytes is the runtime's mbgl ambient cache budget;
 	// negative leaves mbgl's default.
 	ambientCacheBytes int64
@@ -1142,13 +1141,13 @@ func (w *goWorker) init() error {
 		default:
 		}
 	}
-	sess, attached, err := w.m.AttachOffscreen(
-		maplibre.OffscreenDescriptor{LogicalSize: maplibre.LogicalSize{Width: w.curW, Height: w.curH}},
+	sess, attached, err := w.m.Attach(
+		maplibre.RenderTargetOffscreenVariant{Value: maplibre.OffscreenTarget{LogicalSize: maplibre.LogicalSize{Width: w.curW, Height: w.curH}}},
+		w.pool.cfg.device,
 		maplibre.RenderSessionAttachOptions{
 			Driver:    maplibre.RenderDriverKindCoreWorker,
 			FrameWake: maplibre.Wake{Callback: wakeCallback},
 		},
-		w.pool.cfg.device,
 	)
 	if err != nil {
 		return fmt.Errorf("renderer: attach offscreen render target: %w", err)
@@ -1240,7 +1239,7 @@ func (w *goWorker) renderOne(ctx context.Context, vp ViewportRequest, scale int)
 		// update, and the next still renders at the new extent; session
 		// operations are ordered ahead of the still's frames, so it is
 		// started here and its completion checked after the still.
-		f, err := w.sess.Resize(maplibre.LogicalSize{Width: wantW, Height: wantH})
+		f, err := w.sess.Resize(maplibre.LogicalExtent{Width: wantW, Height: wantH, ScaleFactor: float64(w.pool.cfg.ratio)})
 		if err != nil {
 			return nil, fmt.Errorf("renderer: resize: %w", err)
 		}

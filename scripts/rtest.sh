@@ -9,4 +9,4 @@ set -e
 tag=$1; shift
 cd "$(dirname "$0")/.."
 docker build -q --target rampardos-test -t "$tag" . >/dev/null
-docker run --rm "$tag" bash -o pipefail -c "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends libegl1 libegl-mesa0 libgl1-mesa-dri libgles2 sqlite3 >/dev/null 2>&1 && PKG_CONFIG_PATH=/ffi/install/share/pkgconfig CGO_ENABLED=1 go test -count=1 $* 2>&1 | grep -vE '^time='"
+docker run --rm -e RENDERER_GPU_BACKEND "$tag" bash -o pipefail -c "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends libegl1 libegl-mesa0 libgl1-mesa-dri libgles2 mesa-vulkan-drivers libvulkan1 sqlite3 >/dev/null 2>&1 && PKG_CONFIG_PATH=/ffi/install/share/pkgconfig CGO_ENABLED=1 go test -count=1 $* 2>&1 | grep -vE '^time='"

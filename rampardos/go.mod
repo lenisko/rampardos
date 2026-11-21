@@ -14,7 +14,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/image v0.34.0
 	golang.org/x/sync v0.20.0
-	maplibre.org/maplibre-native-ffi v0.202611.0
+	maplibre.org/maplibre-native-ffi v0.202611.1-0.20261115051201-d62ed4cbbb5e
 )
 
 require (
